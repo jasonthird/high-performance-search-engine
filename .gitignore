@@ -1,0 +1,25 @@
+# Build artifacts
+/target
+
+# Local OS/editor/tool state
+.DS_Store
+.claude/
+
+# Index output directories — built artifacts, never committed.
+/index
+/index-*
+
+# Corpus data is large and regenerable: ignore everything under data/ by
+# default, then whitelist only the small query/sample files the tests and
+# examples depend on. This makes it impossible for a multi-GB dump or a
+# generated JSONL corpus to be committed by `git add -A`, regardless of
+# extension.
+/data/*
+!/data/sample_docs.jsonl
+!/data/queries.txt
+!/data/home_queries.txt
+!/data/wiki_queries.txt
+!/data/enwiki_queries.txt
+
+# Logs
+*.log
