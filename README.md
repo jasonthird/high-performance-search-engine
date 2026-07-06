@@ -12,6 +12,8 @@ JSONL docs ──index──▶ inverted index + block metadata ──search─�
                       (compressed, mmap'd, immutable)            (Block-Max WAND)
 ```
 
+![Searching all of English Wikipedia (7.1M articles) in under a millisecond](demo.gif)
+
 The theory and original papers behind every algorithm used here are
 documented in [docs/THEORY.md](docs/THEORY.md).
 
