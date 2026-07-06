@@ -433,9 +433,6 @@ merge removes them. `search`/`serve` open both layouts transparently;
 - no semantic search
 - no highlighting
 - no relevance tuning beyond BM25
-- compression is scalar binary packing — solid but not the last word (real
-  engines use SIMD-accelerated codecs like SIMD-BP128 or partitioned
-  Elias-Fano for another ~1.5-2x and faster decode)
 
 ## License
 
