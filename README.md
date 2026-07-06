@@ -22,8 +22,6 @@ Elasticsearch replacement. It is useful for learning how modern lexical search
 works end to end: indexing, compression, memory-mapped storage, exact dynamic
 pruning, batch updates, benchmarking, and a small HTTP API.
 
-License: MIT. See [LICENSE](LICENSE).
-
 ## Requirements
 
 - Rust stable, edition 2021.
@@ -199,7 +197,7 @@ bisection, minimizes the estimated compressed size; slower to build).
 Reordering is a pure renumbering and never changes search results.
 
 There is also an experimental `bp-gpu` strategy (build with
-`--features gpu`, macOS only on this branch) that runs BP's gain
+`--features gpu`, macOS only) that runs BP's gain
 computation as a hand-written Metal kernel via objc2-metal with **true
 zero-copy buffers**: every array the GPU touches is page-aligned host
 memory wrapped with `newBufferWithBytesNoCopy`, so nothing is ever
@@ -230,7 +228,7 @@ at rank 1 in 0.6ms, scoring 0.3% of the corpus.
 
 ### On-disk format: compressed + memory-mapped
 
-The index directory holds two files:
+The index directory holds three files:
 
 - `meta.bin` — the slim RAM-resident core: document lengths, the sorted
   term dictionary (one concatenated string, binary searched), per-term
@@ -322,7 +320,7 @@ engine is not scanning the corpus:
   terms' own posting lists actually decoded (the rest was skipped).
 
 Measured on **all of English Wikipedia** (7,110,635 articles, 22.2M terms,
-1.85B postings; 8-core M-series laptop, 24GB RAM):
+1.85B postings; 8-core M3 MacBook Air 13-inch, 24GB RAM):
 
 | Metric | Value |
 |---|---|
@@ -385,7 +383,7 @@ Low `num_docs_scored` relative to `num_docs_total`, and high
   compressed blocks (`postings.bin`, memory-mapped at load).
 - `unsafe` is confined to two audited areas: the `mmap` call in storage
   (standard accepted risk, same as Lucene's MMapDirectory) and, behind the
-  `gpu` feature on this branch, the zero-copy Metal interop in
+  `gpu` feature, the zero-copy Metal interop in
   `src/reorder/gpu.rs` (page-aligned shared allocations, no-copy buffer
   wrapping, and disjoint parallel writes — each with its invariant
   documented at the call site).
