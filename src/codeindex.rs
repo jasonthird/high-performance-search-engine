@@ -38,6 +38,11 @@ pub struct Manifest {
     /// Chunks encoded on this build, and chunks served from the cache.
     pub encoded: usize,
     pub cached: usize,
+    /// Fingerprint of the walked file list (path, size, mtime) the index
+    /// was built from. A rebuild that walks to the same fingerprint skips
+    /// tokenizing, embedding, and installing entirely.
+    #[serde(default)]
+    pub tree_fingerprint: u64,
 }
 
 impl Manifest {
@@ -236,6 +241,23 @@ impl RepoIndexer {
         let mut timer = PhaseTimer::new();
         let files = repo::walk(&self.root)?;
         timer.mark("walk");
+        // Byte-identical tree: nothing downstream can change, so the only
+        // cost of an up-to-date `index-repo` is the walk itself.
+        let tree_fingerprint = repo::fingerprint(&files);
+        if !retrain {
+            if let Ok(existing) = Manifest::load(&self.index_dir) {
+                if existing.tree_fingerprint == tree_fingerprint
+                    && existing.tree_fingerprint != 0
+                    && existing.embedded == self.opts.embed
+                {
+                    self.log(format!(
+                        "index up to date ({} chunks, fingerprint unchanged)",
+                        existing.num_docs
+                    ));
+                    return Ok(existing);
+                }
+            }
+        }
         let docs = repo::docs_from_chunks(repo::chunk_files(&files))?;
         timer.mark("chunk");
         anyhow::ensure!(
@@ -280,6 +302,7 @@ impl RepoIndexer {
             build_secs: start.elapsed().as_secs_f64(),
             encoded,
             cached,
+            tree_fingerprint,
         };
         manifest.save(&staging)?;
         self.install(&staging)?;

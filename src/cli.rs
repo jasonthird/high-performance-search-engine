@@ -137,6 +137,25 @@ enum Command {
         #[arg(long)]
         retrain: bool,
     },
+    /// Generate a CodeSearchNet-style eval set from a source tree: each
+    /// documented declaration becomes (query = its doc comment, relevant
+    /// doc = the code with the comment stripped). Writes corpus.jsonl,
+    /// queries.tsv, qrels.tsv, queries.txt into --out.
+    EvalGen {
+        /// Repository root to mine.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Output directory for the eval files.
+        #[arg(long)]
+        out: PathBuf,
+        /// Maximum queries to emit (0 = all documented declarations).
+        #[arg(long, default_value_t = 0)]
+        max_queries: usize,
+        /// Minimum words in a doc comment for it to become a query;
+        /// one-liners like "Returns x." carry no retrieval signal.
+        #[arg(long, default_value_t = 6)]
+        min_words: usize,
+    },
     /// Run the Model Context Protocol server over stdio, exposing code
     /// search to an MCP client such as Claude Code.
     Mcp {
@@ -391,6 +410,12 @@ pub fn run() -> anyhow::Result<()> {
             ivf_clusters,
             retrain,
         ),
+        Command::EvalGen {
+            root,
+            out,
+            max_queries,
+            min_words,
+        } => cmd_eval_gen(&root, &out, max_queries, min_words),
         Command::Mcp {
             root,
             index,
@@ -890,6 +915,82 @@ fn cmd_index_repo(
         "search it: hips search --root {} --query '...'{}",
         root.display(),
         if manifest.embedded { " --mode hybrid" } else { "" }
+    );
+    Ok(())
+}
+
+/// Mine a source tree for (doc comment, code) pairs and write an eval set.
+fn cmd_eval_gen(
+    root: &Path,
+    out: &Path,
+    max_queries: usize,
+    min_words: usize,
+) -> anyhow::Result<()> {
+    let chunks = crate::repo::collect_chunks(root)?;
+    anyhow::ensure!(!chunks.is_empty(), "no source chunks under {}", root.display());
+    fs::create_dir_all(out)?;
+
+    let mut corpus = String::new();
+    let mut queries_tsv = String::new();
+    let mut queries_txt = String::new();
+    let mut qrels = String::new();
+    let mut n_queries = 0usize;
+    for chunk in &chunks {
+        let id = chunk.id();
+        let title = chunk.title();
+        // Every chunk goes into the corpus; documented ones are indexed
+        // with the doc comment stripped so queries cannot match their own
+        // text, mirroring CodeSearchNet's docstring-removal protocol.
+        // Only named declarations become queries: whole-file chunks of
+        // config or markdown start with comments too, but "THIS FILE IS
+        // AUTOMATICALLY GENERATED" is not a retrieval query.
+        let split = chunk
+            .name
+            .as_ref()
+            .and_then(|_| crate::repo::split_doc_comment(&chunk.body));
+        let body = split.as_ref().map(|s| s.code.as_str()).unwrap_or(&chunk.body);
+        corpus.push_str(&serde_json::to_string(
+            &serde_json::json!({"id": id, "title": title, "body": body}),
+        )?);
+        corpus.push('\n');
+
+        if let Some(split) = split {
+            let words = split.doc.split_whitespace().count();
+            if words < min_words || (max_queries > 0 && n_queries >= max_queries) {
+                continue;
+            }
+            let qid = format!("q{n_queries}");
+            // TSV: tabs/newlines in doc text would corrupt the format.
+            let clean = split.doc.replace(['\t', '\n'], " ");
+            queries_tsv.push_str(&format!("{qid}\t{clean}\n"));
+            queries_txt.push_str(&clean);
+            queries_txt.push('\n');
+            qrels.push_str(&format!("{qid}\t0\t{id}\t1\n"));
+            n_queries += 1;
+        }
+    }
+    anyhow::ensure!(
+        n_queries > 0,
+        "no documented declarations with >= {min_words}-word summaries found"
+    );
+    fs::write(out.join("corpus.jsonl"), corpus)?;
+    fs::write(out.join("queries.tsv"), queries_tsv)?;
+    fs::write(out.join("queries.txt"), queries_txt)?;
+    fs::write(out.join("qrels.tsv"), qrels)?;
+    println!(
+        "eval set: {} corpus chunks, {} queries -> {}",
+        chunks.len(),
+        n_queries,
+        out.display()
+    );
+    println!(
+        "next: hips index --input {}/corpus.jsonl --out <idx> --code --embed",
+        out.display()
+    );
+    println!(
+        "then: hips eval-code --index <idx> --queries {}/queries.tsv --qrels {}/qrels.tsv",
+        out.display(),
+        out.display()
     );
     Ok(())
 }

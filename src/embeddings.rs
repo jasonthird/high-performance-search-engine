@@ -102,10 +102,22 @@ impl EmbeddingStore {
         if self.dtype == DTYPE_F16 {
             let start = HEADER_LEN + doc_id as usize * dim * 2;
             let bytes = &self.mmap[start..start + dim * 2];
-            let mut acc = 0.0f32;
-            for i in 0..dim {
-                let h = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                acc += f16_to_f32(h) * query[i];
+            // Four accumulators: FP addition is not associative, so a single
+            // accumulator chains every add and blocks vectorization. Split
+            // lanes so LLVM can keep 4 sums in flight and SIMD the decode.
+            let (mut a0, mut a1, mut a2, mut a3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let mut lanes = bytes.chunks_exact(8);
+            let mut qs = query.chunks_exact(4);
+            for (lane, q) in (&mut lanes).zip(&mut qs) {
+                a0 += f16_to_f32_fast(u16::from_le_bytes([lane[0], lane[1]])) * q[0];
+                a1 += f16_to_f32_fast(u16::from_le_bytes([lane[2], lane[3]])) * q[1];
+                a2 += f16_to_f32_fast(u16::from_le_bytes([lane[4], lane[5]])) * q[2];
+                a3 += f16_to_f32_fast(u16::from_le_bytes([lane[6], lane[7]])) * q[3];
+            }
+            let mut acc = (a0 + a2) + (a1 + a3);
+            for (i, pair) in lanes.remainder().chunks_exact(2).enumerate() {
+                let h = u16::from_le_bytes([pair[0], pair[1]]);
+                acc += f16_to_f32_fast(h) * qs.remainder()[i];
             }
             acc
         } else {
@@ -159,6 +171,20 @@ fn u32_le(b: &[u8]) -> u32 {
 }
 
 /// IEEE 754 binary16 -> f32. Enough for L2-normalized embedding coordinates.
+/// Branch-free half-to-single conversion for hot loops.
+///
+/// Sign and magnitude are shifted into f32 field positions, then one
+/// multiply by 2^112 rescales the exponent bias (15 -> 127). Exact for
+/// every finite half including subnormals; Inf/NaN would come out as large
+/// finite values, but L2-normalized embeddings contain neither. The branchy
+/// [`f16_to_f32`] stays the general-purpose converter.
+#[inline(always)]
+pub fn f16_to_f32_fast(h: u16) -> f32 {
+    let scale = f32::from_bits(0x7780_0000); // 2^112
+    let bits = ((h as u32 & 0x8000) << 16) | ((h as u32 & 0x7fff) << 13);
+    f32::from_bits(bits) * scale
+}
+
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = (h >> 15) & 1;
     let exp = (h >> 10) & 0x1f;
@@ -253,6 +279,22 @@ pub fn write_f16(dir: &Path, dim: u32, vectors: &[Vec<f32>]) -> anyhow::Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_decode_matches_exact_for_all_finite_halfs() {
+        for h in 0..=u16::MAX {
+            let exp = (h >> 10) & 0x1f;
+            if exp == 31 {
+                continue; // Inf/NaN: fast path deliberately diverges
+            }
+            let exact = f16_to_f32(h);
+            let fast = f16_to_f32_fast(h);
+            assert!(
+                exact == fast || (exact.is_nan() && fast.is_nan()),
+                "h={h:#06x}: exact {exact} vs fast {fast}"
+            );
+        }
+    }
 
     #[test]
     fn f16_roundtrip_unit_range() {

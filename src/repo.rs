@@ -285,6 +285,10 @@ pub struct SourceFile {
     pub rel: String,
     pub abs: PathBuf,
     pub len: u64,
+    /// Modification time in nanoseconds since the epoch (0 if unavailable).
+    /// Together with `len` this fingerprints the file cheaply: a rebuild
+    /// whose walk fingerprint matches the manifest can skip everything.
+    pub mtime_ns: u128,
 }
 
 /// Walk `root`, returning indexable source files in a deterministic order.
@@ -337,10 +341,17 @@ fn walk_dir(
             if meta.len() == 0 || meta.len() > MAX_FILE_BYTES {
                 continue;
             }
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             out.push(SourceFile {
                 rel,
                 abs: entry.path(),
                 len: meta.len(),
+                mtime_ns,
             });
         }
     }
@@ -360,6 +371,106 @@ fn is_source(name: &str) -> bool {
         Some((_, ext)) => SOURCE_EXTS.contains(&ext),
         None => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// doc-comment extraction (self-supervised eval data)
+// ---------------------------------------------------------------------------
+
+/// A chunk's leading documentation, separated from its code.
+///
+/// This exists for CodeSearchNet-style evaluation: the doc comment becomes a
+/// natural-language *query* and the code it documents becomes the *relevant
+/// document*. The comment must be stripped from the indexed body, or lexical
+/// retrieval trivially matches the query against its own text and every
+/// score inflates.
+#[derive(Debug, Clone)]
+pub struct SplitDoc {
+    /// The doc-comment text, comment markers removed.
+    pub doc: String,
+    /// The chunk body with the leading doc comment removed.
+    pub code: String,
+}
+
+/// Split a chunk body into its leading doc comment and the remaining code.
+/// Returns `None` when there is no leading documentation.
+///
+/// Recognized: `///` and `//!` (Rust), `/** ... */` (JS/TS/Java/C++),
+/// `#` comment blocks immediately preceding code (Python/Ruby/shell), and
+/// Python docstrings are deliberately *not* handled here — they follow the
+/// `def`, not precede it, and stripping them is a per-language job for the
+/// tree-sitter chunker (roadmap phase 3).
+pub fn split_doc_comment(body: &str) -> Option<SplitDoc> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut doc_lines: Vec<String> = Vec::new();
+    let mut idx = 0;
+
+    // Block comment form: /** ... */ or /* ... */ at the top.
+    if lines.first().map_or(false, |l| l.trim_start().starts_with("/*")) {
+        let mut closed = false;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            let cleaned = t
+                .trim_start_matches("/**")
+                .trim_start_matches("/*")
+                .trim_end_matches("*/")
+                .trim_start_matches('*')
+                .trim();
+            if !cleaned.is_empty() {
+                doc_lines.push(cleaned.to_string());
+            }
+            if t.ends_with("*/") {
+                idx = i + 1;
+                closed = true;
+                break;
+            }
+        }
+        if !closed {
+            return None;
+        }
+    } else {
+        // Line-comment form: a run of ///, //!, or # lines at the top.
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            let stripped = if let Some(r) = t.strip_prefix("///") {
+                Some(r)
+            } else if let Some(r) = t.strip_prefix("//!") {
+                Some(r)
+            } else if t.starts_with("#!") || t.starts_with("#[") {
+                // Shebang or Rust attribute, not documentation.
+                None
+            } else {
+                t.strip_prefix('#')
+            };
+            match stripped {
+                Some(text) => doc_lines.push(text.trim().to_string()),
+                None => {
+                    idx = i;
+                    break;
+                }
+            }
+            idx = i + 1;
+        }
+    }
+    if doc_lines.is_empty() || idx >= lines.len() {
+        return None;
+    }
+    // First paragraph only: that is the summary sentence CodeSearchNet uses;
+    // later paragraphs are examples, arguments, and errata.
+    let first_para: Vec<&String> = doc_lines
+        .iter()
+        .take_while(|l| !l.is_empty())
+        .collect();
+    let doc = first_para
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let code = lines[idx..].join("\n");
+    if code.trim().is_empty() {
+        return None;
+    }
+    Some(SplitDoc { doc, code })
 }
 
 // ---------------------------------------------------------------------------
@@ -470,19 +581,46 @@ pub fn chunk_text(rel: &str, text: &str) -> Vec<Chunk> {
         push_split(&mut chunks, rel, &lines, 0, lines.len(), None);
         return chunks;
     }
+    // A declaration's doc comment sits *above* it, so each chunk start is
+    // pulled upward over contiguous comment/attribute lines. Without this
+    // the documentation lands at the tail of the previous chunk — the one
+    // place it helps neither retrieval nor the reader.
+    let mut adj: Vec<(usize, String)> = Vec::with_capacity(starts.len());
+    let mut floor = 0usize;
+    for (i, (start, name)) in starts.iter().enumerate() {
+        let mut at = *start;
+        while at > floor && is_doc_or_attr(lines[at - 1]) {
+            at -= 1;
+        }
+        adj.push((at, name.clone()));
+        floor = starts.get(i).map(|(s, _)| *s).unwrap_or(at).max(at);
+    }
     // Everything before the first declaration (imports, module docs) is its
     // own chunk: it is where `use`/`import` lines live and is searchable.
-    if starts[0].0 > 0 {
-        push_split(&mut chunks, rel, &lines, 0, starts[0].0, None);
+    if adj[0].0 > 0 {
+        push_split(&mut chunks, rel, &lines, 0, adj[0].0, None);
     }
-    for (idx, (start, name)) in starts.iter().enumerate() {
-        let end = starts
+    for (idx, (start, name)) in adj.iter().enumerate() {
+        let end = adj
             .get(idx + 1)
             .map(|(s, _)| *s)
             .unwrap_or_else(|| lines.len());
         push_split(&mut chunks, rel, &lines, *start, end, Some(name.clone()));
     }
     chunks
+}
+
+/// Lines that document or annotate the declaration below them.
+fn is_doc_or_attr(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("///")
+        || t.starts_with("//!")
+        || t.starts_with("//")
+        || t.starts_with('*')
+        || t.starts_with("/*")
+        || t.starts_with("#[")
+        || t.starts_with('@')
+        || (t.starts_with('#') && !t.starts_with("#!"))
 }
 
 /// Append `lines[start..end]` as one or more chunks, splitting overlong runs.
@@ -520,6 +658,26 @@ fn push_split(
         }
         at = stop;
     }
+}
+
+/// Order-sensitive fingerprint of a walked file list: any added, removed,
+/// renamed, resized, or touched file changes it. `walk` returns files
+/// sorted, so the same tree always fingerprints the same.
+pub fn fingerprint(files: &[SourceFile]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    for f in files {
+        feed(f.rel.as_bytes());
+        feed(&f.len.to_le_bytes());
+        feed(&f.mtime_ns.to_le_bytes());
+        feed(&[0xFE]);
+    }
+    h
 }
 
 /// Read and chunk every source file under `root`.
@@ -587,6 +745,23 @@ mod tests {
     }
 
     #[test]
+    fn doc_comment_travels_with_its_declaration() {
+        let text = "use std::fs;\n\n/// Adds one.\n#[inline]\nfn alpha(x: u32) -> u32 {\n    x + 1\n}\n";
+        let chunks = chunk_text("src/x.rs", text);
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert!(!chunks[0].body.contains("Adds one"), "doc stuck in preamble");
+        let alpha = &chunks[1];
+        assert_eq!(alpha.name.as_deref(), Some("alpha"));
+        assert!(alpha.body.starts_with("/// Adds one."), "{}", alpha.body);
+        assert_eq!(alpha.start_line, 3);
+        // And split_doc_comment can now lift it back out.
+        let split = split_doc_comment(&alpha.body).unwrap();
+        assert_eq!(split.doc, "Adds one.");
+        assert!(split.code.contains("fn alpha"));
+        assert!(!split.code.contains("#[inline]") || split.code.starts_with("#["));
+    }
+
+    #[test]
     fn parallel_chunking_preserves_file_order() {
         // doc_ids are assigned in chunk order, and the embedding sidecar is
         // keyed positionally by doc_id, so this ordering is load-bearing.
@@ -634,6 +809,25 @@ mod tests {
         );
         assert_eq!(declaration_name("// fn commented()"), None);
         assert_eq!(declaration_name("let x = 1;"), None);
+    }
+
+    #[test]
+    fn splits_doc_comments_from_code() {
+        let rust = "/// Compute the retry backoff.\n///\n/// Doubles each attempt.\npub fn backoff(n: u32) -> u64 {\n    1 << n\n}\n";
+        let split = split_doc_comment(rust).unwrap();
+        assert_eq!(split.doc, "Compute the retry backoff.");
+        assert!(split.code.starts_with("pub fn backoff"));
+        assert!(!split.code.contains("Doubles"), "comment must be stripped");
+
+        let block = "/** Parse a header value. */\nfunction parse(h) {}\n";
+        let split = split_doc_comment(block).unwrap();
+        assert_eq!(split.doc, "Parse a header value.");
+        assert!(split.code.starts_with("function parse"));
+
+        assert!(split_doc_comment("fn plain() {}\n").is_none());
+        assert!(split_doc_comment("#!/bin/sh\necho hi\n").is_none());
+        // Comment with no code after it documents nothing.
+        assert!(split_doc_comment("/// orphan comment\n").is_none());
     }
 
     #[test]

@@ -25,19 +25,20 @@ pub const PQ_FILE: &str = "pq.bin";
 /// by corpus size directly.
 ///
 /// Measured on an M-series laptop (`cargo run --release --example
-/// pq_scoring_bench`), scoring 768-d vectors:
+/// pq_scoring_bench`), scoring 768-d vectors, after both paths were
+/// vectorized (branch-free f16 decode, multi-accumulator dots):
 ///
 /// ```text
-/// candidates   exact FP16   f32 ceiling      PQ/ADC
-///        100        118 us         65 us      462 us
-///      1 000        1.2 ms        631 us      441 us
-///     10 000       13.5 ms        6.8 ms      489 us
-///    200 000        298 ms        152 ms      1.9 ms
+/// candidates   exact FP16      PQ/ADC
+///        100         68 us      181 us
+///      1 000        646 us      155 us
+///     10 000        6.8 ms      278 us
+///    200 000        132 ms      1.9 ms
 /// ```
 ///
-/// That puts the break-even near 630 candidates. This threshold sits above
-/// it deliberately: below break-even PQ is pure loss (it costs recall and
-/// saves nothing), so the safe error is to keep scoring exactly for a little
+/// That puts the break-even near 225 candidates. This threshold sits well
+/// above it deliberately: below break-even PQ is pure loss (it costs recall
+/// and saves nothing), so the safe error is to keep scoring exactly for
 /// longer than strictly necessary.
 pub const MIN_CANDIDATES: usize = 900;
 
@@ -148,17 +149,29 @@ impl PqIndex {
         let m = self.m as usize;
         let sub = self.subdim as usize;
         let mut table = vec![0.0f32; m * KS];
+        // This table build is the whole fixed cost of ADC scoring, so it is
+        // written to vectorize: branch-free f16 decode and four independent
+        // accumulators per centroid row (FP adds are not associative; one
+        // accumulator would chain them and block SIMD).
         for sm in 0..m {
-            let qsub = &query[sm * sub..(sm + 1) * sub.min(query.len() - sm * sub)];
+            let qlen = sub.min(query.len().saturating_sub(sm * sub));
+            let qsub = &query[sm * sub..sm * sub + qlen];
             for c in 0..KS {
-                let mut acc = 0.0f32;
                 let base = self.codebook_off + (sm * KS + c) * sub * 2;
-                for d in 0..sub.min(qsub.len()) {
-                    let h = u16::from_le_bytes([
-                        self.mmap[base + d * 2],
-                        self.mmap[base + d * 2 + 1],
-                    ]);
-                    acc += embeddings::f16_to_f32(h) * qsub[d];
+                let row = &self.mmap[base..base + qlen * 2];
+                let (mut a0, mut a1, mut a2, mut a3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                let mut lanes = row.chunks_exact(8);
+                let mut qs = qsub.chunks_exact(4);
+                for (lane, q) in (&mut lanes).zip(&mut qs) {
+                    a0 += embeddings::f16_to_f32_fast(u16::from_le_bytes([lane[0], lane[1]])) * q[0];
+                    a1 += embeddings::f16_to_f32_fast(u16::from_le_bytes([lane[2], lane[3]])) * q[1];
+                    a2 += embeddings::f16_to_f32_fast(u16::from_le_bytes([lane[4], lane[5]])) * q[2];
+                    a3 += embeddings::f16_to_f32_fast(u16::from_le_bytes([lane[6], lane[7]])) * q[3];
+                }
+                let mut acc = (a0 + a2) + (a1 + a3);
+                for (i, pair) in lanes.remainder().chunks_exact(2).enumerate() {
+                    let h = u16::from_le_bytes([pair[0], pair[1]]);
+                    acc += embeddings::f16_to_f32_fast(h) * qs.remainder()[i];
                 }
                 table[sm * KS + c] = acc;
             }
