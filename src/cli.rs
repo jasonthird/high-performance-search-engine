@@ -38,6 +38,14 @@ impl From<ReorderArg> for ReorderStrategy {
     }
 }
 
+// Fusion defaults (weighted, alpha 0.15) come from two eval sets over 31k
+// real code chunks (examples in `eval-gen`): R@10 on natural-language
+// doc-comment queries / on identifier queries —
+//   bm25 .255/.976   semantic .716/.974   rrf hybrid .569/.975
+//   weighted alpha=.15 hybrid: .696/.993 — best on identifiers, within 3%
+// of pure semantic on NL, and keeps a lexical anchor for text the encoder
+// cannot see (string literals, config files, tails of >512-token chunks).
+
 /// Whether ADC scoring is used. `Auto` defers to [`crate::pq::worth_using`]:
 /// below the break-even candidate count PQ costs recall and saves nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,9 +188,9 @@ enum Command {
         /// Pool size before fusion.
         #[arg(long, default_value_t = 200)]
         semantic_candidates: usize,
-        #[arg(long, value_enum, default_value_t = FusionArg::Rrf)]
+        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
         fusion: FusionArg,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.15)]
         alpha: f32,
         #[arg(long, default_value_t = 60.0)]
         rrf_k: f32,
@@ -225,10 +233,10 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         semantic_candidates: usize,
         /// Score fusion: min-max weighted mix, or reciprocal rank fusion.
-        #[arg(long, value_enum, default_value_t = FusionArg::Rrf)]
+        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
         fusion: FusionArg,
         /// BM25 weight for `--fusion weighted` (semantic weight is 1-alpha).
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.15)]
         alpha: f32,
         /// RRF constant k (Cormack et al.).
         #[arg(long, default_value_t = 60.0)]
@@ -265,9 +273,9 @@ enum Command {
         top_k: usize,
         #[arg(long, default_value_t = 200)]
         semantic_candidates: usize,
-        #[arg(long, value_enum, default_value_t = FusionArg::Rrf)]
+        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
         fusion: FusionArg,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.15)]
         alpha: f32,
         #[arg(long, default_value_t = 60.0)]
         rrf_k: f32,
@@ -357,9 +365,9 @@ enum Command {
         hybrid: bool,
         #[arg(long, default_value_t = 200)]
         semantic_candidates: usize,
-        #[arg(long, value_enum, default_value_t = FusionArg::Rrf)]
+        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
         fusion: FusionArg,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.15)]
         alpha: f32,
         #[arg(long, default_value_t = 60.0)]
         rrf_k: f32,
@@ -587,26 +595,17 @@ fn choose_pq<'a>(
     match opts.pq {
         PqMode::Off => None,
         PqMode::Force => Some(pq),
+        // Measured on 31k chunks of real code (examples/pq_tradeoff.rs):
+        // IVF-only semantic recall@10 was 0.677, IVF+PQ collapsed it to
+        // 0.143 — this PQ quantizes raw vectors (not residuals), and the
+        // reconstruction error swamps the score differences that matter.
+        // Meanwhile exact scoring of all 31k vectors costs ~16 ms with the
+        // vectorized f16 path. So ADC is never chosen automatically; it
+        // remains available via Force for benchmarks and future
+        // residual-quantization work.
         PqMode::Auto => {
-            let (clusters, nprobe) = match index.ivf() {
-                Some(ivf) => {
-                    let n = if opts.nprobe == 0 {
-                        ivf.auto_nprobe()
-                    } else {
-                        opts.nprobe
-                    };
-                    (ivf.num_clusters() as usize, n)
-                }
-                // No inverted file: the encoder scans everything.
-                None => (0, 0),
-            };
-            let candidates = crate::pq::estimated_candidates(
-                index.num_docs() as usize,
-                clusters,
-                nprobe,
-            )
-            .max(top_k);
-            crate::pq::worth_using(candidates).then_some(pq)
+            let _ = top_k;
+            None
         }
     }
 }
@@ -1371,10 +1370,15 @@ fn cmd_eval_code(
     top_k: usize,
     opts: SearchOpts,
 ) -> anyhow::Result<()> {
-    require_semantic()?;
     let queries = load_query_tsv(queries_path)?;
     let qrels = load_qrels(qrels_path)?;
     let index = searcher::AnyIndex::open(index_dir)?;
+    // Lexical-only eval works on any index and needs no model; the
+    // semantic modes additionally need embeddings.bin and the encoder.
+    let lexical_only = index.embeddings().is_none();
+    if !lexical_only {
+        require_semantic()?;
+    }
 
     let mut qrel_by_id: std::collections::HashMap<String, Vec<(String, u32)>> =
         std::collections::HashMap::new();
@@ -1382,18 +1386,26 @@ fn cmd_eval_code(
         qrel_by_id.entry(qid).or_default().push((doc, rel));
     }
 
-    let modes = [
-        RankMode::Bm25,
-        RankMode::Semantic,
-        RankMode::Rerank,
-        RankMode::Hybrid,
-    ];
+    let modes: Vec<RankMode> = if lexical_only {
+        vec![RankMode::Bm25]
+    } else {
+        vec![
+            RankMode::Bm25,
+            RankMode::Semantic,
+            RankMode::Rerank,
+            RankMode::Hybrid,
+        ]
+    };
     println!(
         "{:<10} {:>8} {:>10} {:>10} {:>10} {:>10}",
         "mode", "n", "MRR", "R@5", "R@10", "nDCG@10"
     );
     #[cfg(feature = "semantic")]
-    let embedder = crate::embedder::Embedder::load()?;
+    let embedder = if lexical_only {
+        None
+    } else {
+        Some(crate::embedder::Embedder::load()?)
+    };
     for mode in modes {
         let mut ranked: Vec<Vec<String>> = Vec::new();
         let mut rels: Vec<Vec<(String, u32)>> = Vec::new();
@@ -1410,7 +1422,10 @@ fn cmd_eval_code(
                 _ => {
                     #[cfg(feature = "semantic")]
                     {
-                        run_ranked_with(&index, &embedder, query, top_k, &run_opts)?
+                        let embedder = embedder
+                            .as_ref()
+                            .expect("semantic modes only run with an encoder");
+                        run_ranked_with(&index, embedder, query, top_k, &run_opts)?
                             .results
                             .into_iter()
                             .map(|r| r.id)

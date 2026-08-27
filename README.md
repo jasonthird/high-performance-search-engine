@@ -460,7 +460,11 @@ Three caches make a rebuild proportional to the edit rather than to the
 repository:
 
 - **Vectors.** `embcache.bin` keys FP16 embeddings by a hash of the chunk
-  text, so only chunks whose content changed are re-encoded (~65 ms each).
+  text, so only chunks whose content changed are re-encoded. Encoding
+  length-buckets each batch (sorting by size before batching): padding to
+  the batch's longest member wasted 41% of the encoder in file order, and
+  bucketing measured 73.4 -> 38.6 ms/chunk with vectors identical to within
+  F16 rerun noise (`examples/bucket_equiv.rs`).
 - **Quantization.** The IVF centroids and PQ codebooks are *trained once* and
   reused: k-means for IVF plus 16 x 256-centroid k-means for PQ costs ~1 s on
   a small repo and scales with the corpus, yet none of it depends on which
@@ -479,21 +483,48 @@ source cache (358k chunks, 15k files) — Apple M-series, 8 cores:
 ```
                                         this repo     crates.io cache
 first build (encodes every chunk)          ~60 s              (n/a)
-rebuild, nothing changed                   0.02 s             2.4 s
+rebuild, nothing changed                   0.02 s            0.30 s
 edit -> next query, in-server            55-95 ms              --
 steady-state hybrid query                   11 ms              --
 ```
+
+A byte-identical tree is detected from a fingerprint of the walked file
+list (path, size, mtime) stored in the manifest, so an up-to-date rebuild
+costs only the walk — 0.30 s even at 387k chunks.
 
 The 55-95 ms is everything: watcher wakeup, re-chunking the tree, encoding
 the one changed chunk on the GPU, re-quantizing it, rewriting the index, and
 running the search. Before the quantizer was made reusable this was ~1.1 s,
 essentially all of it retraining quantizers over unchanged data.
 
-At the crates.io scale the remaining 2.4 s is dominated by tokenizing all
-358k chunks (1.7 s), which a single-index layout has to redo in full; that is
-the price of keeping `embeddings.bin` positionally keyed. Real single repos
-sit at the left-hand column. `CSEARCH_TIMING=1` prints the per-phase
-breakdown.
+When a file *did* change, the crates.io-scale rebuild still re-tokenizes
+every chunk (~1.7 s of the build), which a single-index layout has to redo
+in full; that is the price of keeping `embeddings.bin` positionally keyed.
+Real single repos sit at the left-hand column. `CSEARCH_TIMING=1` prints
+the per-phase breakdown.
+
+**Retrieval quality is measured, not assumed.** `eval-gen` mines a
+CodeSearchNet-style benchmark from any repo's doc comments (query = the
+summary line, relevant doc = the code with the comment stripped), plus an
+identifier-query set. On 31k chunks of real crate source (4,567 NL queries,
+800 identifier queries), R@10:
+
+```
+                    NL queries   identifier queries
+bm25                   0.255          0.976
+semantic               0.716          0.974
+hybrid (default)       0.696          0.993
+```
+
+Three defaults were set from these measurements: fusion is min-max weighted
+with `alpha 0.15` (RRF at equal weight dragged hybrid to 0.569 on NL);
+`nprobe` defaults to half the IVF clusters (the old cap of 8 probes cost a
+third of semantic recall — see the curve in `IvfIndex::auto_nprobe`); and
+PQ/ADC scoring is no longer used automatically — measured on 31k chunks it
+collapsed IVF-only semantic recall from 0.677 to 0.143, while exact
+vectorized FP16 scoring of every vector costs ~16 ms. `pq.bin` is still
+built: its codebooks drive the incremental-rebuild cache, and `PqMode::Force`
+keeps ADC available for benchmarks.
 
 **Scoring path.** Product quantization is enabled per query rather than
 always-on, because it is a fixed cost (building `M x 256` lookup tables)
@@ -501,16 +532,18 @@ plus almost nothing per document, while exact scoring is a per-document dot
 product. Measured with `cargo run --release --example pq_scoring_bench`:
 
 ```
-candidates   exact FP16   f32 ceiling      PQ/ADC
-       100        118 us         65 us      462 us
-     1 000        1.2 ms        631 us      441 us
-    10 000       13.5 ms        6.8 ms      489 us
-   200 000        298 ms        152 ms      1.9 ms
+candidates   exact FP16      PQ/ADC
+       100         68 us      181 us
+     1 000        646 us      155 us
+    10 000        6.8 ms      278 us
+   200 000        132 ms      1.9 ms
 ```
 
-Break-even is near 630 candidates, so ADC is used only above
-`pq::MIN_CANDIDATES` (900, deliberately above break-even — below it PQ costs
-recall and saves nothing). A query's candidate count is estimated from the
+Both paths are written to vectorize (branch-free f16 decode, four-way
+accumulators); exact FP16 scoring runs at the plain-f32 ceiling. Break-even
+is near 225 candidates, so ADC is used only above `pq::MIN_CANDIDATES`
+(900, deliberately above break-even — below it PQ costs recall and saves
+nothing). A query's candidate count is estimated from the
 IVF geometry, `num_docs * nprobe / num_clusters`, which puts the switch-over
 around 20k chunks at the default `nprobe`. `--no-pq` forces exact scoring.
 

@@ -144,9 +144,24 @@ impl IvfIndex {
         u32_le(&self.mmap[off..off + 4])
     }
 
+    /// Default probe count, set from a measured recall curve rather than a
+    /// guess (`examples/nprobe_sweep.rs`, 31k real code chunks, semantic
+    /// mode, exact scores, ground truth = probing every cluster):
+    ///
+    /// ```text
+    /// nprobe    probed   recall@10   score ms
+    ///      8      3.1%       0.677       2.6      (old default)
+    ///     32     12.5%       0.817       2.5
+    ///     64     25.0%       0.893       5.6
+    ///    128     50.0%       0.977       8.6      (this default)
+    ///    256    100.0%       1.000      16.2
+    /// ```
+    ///
+    /// Half the clusters keeps ~98% of exact recall at half the exact
+    /// cost; the old cap of 8 probes silently gave up a third of recall.
     pub fn auto_nprobe(&self) -> usize {
         let k = self.num_clusters as usize;
-        (k / 4).clamp(1, 8).min(k)
+        (k / 2).max(1)
     }
 
     /// Nearest `nprobe` cluster ids (cosine vs L2-normalized centroids).
