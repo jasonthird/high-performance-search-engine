@@ -43,6 +43,20 @@ pub struct Manifest {
     /// tokenizing, embedding, and installing entirely.
     #[serde(default)]
     pub tree_fingerprint: u64,
+    /// Per-file state for segmented (incremental) indexes: which chunk ids
+    /// each file produced, so an edit can tombstone exactly the stale ids.
+    /// Empty for single-index (rebuild-the-world) layouts.
+    #[serde(default)]
+    pub files: Vec<FileRecord>,
+}
+
+/// One indexed file's identity and the chunk ids it produced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRecord {
+    pub path: String,
+    pub len: u64,
+    pub mtime_ns: u128,
+    pub chunk_ids: Vec<String>,
 }
 
 impl Manifest {
@@ -69,6 +83,11 @@ pub struct BuildOpts {
     pub ivf_clusters: usize,
     /// Retrain the IVF/PQ quantizer even if the installed one still fits.
     pub retrain: bool,
+    /// Segmented layout: edits tombstone stale chunks and append a new
+    /// segment instead of rebuilding the whole index, making reindex cost
+    /// O(changed) rather than O(corpus). Semantic scoring is exact
+    /// brute-force per segment (no IVF/PQ).
+    pub segmented: bool,
     /// Print progress to stderr (off for the MCP server, whose stdout is the
     /// protocol channel).
     pub quiet: bool,
@@ -82,9 +101,34 @@ impl Default for BuildOpts {
             reorder: ReorderStrategy::None,
             ivf_clusters: 0,
             retrain: false,
+            segmented: false,
             quiet: false,
         }
     }
+}
+
+/// Segments accumulated before a compaction merge. Each segment adds one
+/// brute-force scan and one BM25 pass per query, so this bounds per-query
+/// overhead while keeping merges rare.
+pub const MAX_SEGMENTS: usize = 12;
+
+/// `keys.bin`: one embcache key (u64 LE) per doc_id, per segment.
+pub fn write_keys(seg_dir: &Path, keys: &[u64]) -> anyhow::Result<()> {
+    let mut bytes = Vec::with_capacity(keys.len() * 8);
+    for key in keys {
+        bytes.extend_from_slice(&key.to_le_bytes());
+    }
+    std::fs::write(seg_dir.join("keys.bin"), bytes)?;
+    Ok(())
+}
+
+pub fn read_keys(seg_dir: &Path) -> anyhow::Result<Vec<u64>> {
+    let bytes = std::fs::read(seg_dir.join("keys.bin"))
+        .with_context(|| format!("no keys.bin in {}", seg_dir.display()))?;
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect())
 }
 
 /// Phase timing for rebuilds, printed when `CSEARCH_TIMING=1`.
@@ -237,6 +281,9 @@ impl RepoIndexer {
     /// Worth doing after the tree has changed substantially; a normal
     /// rebuild reuses it.
     pub fn build_with(&self, retrain: bool) -> anyhow::Result<Manifest> {
+        if self.opts.segmented {
+            return self.build_segmented();
+        }
         let start = Instant::now();
         let mut timer = PhaseTimer::new();
         let files = repo::walk(&self.root)?;
@@ -303,6 +350,7 @@ impl RepoIndexer {
             encoded,
             cached,
             tree_fingerprint,
+            files: Vec::new(),
         };
         manifest.save(&staging)?;
         self.install(&staging)?;
@@ -312,6 +360,299 @@ impl RepoIndexer {
             manifest.build_secs, manifest.num_docs, encoded, cached
         ));
         Ok(manifest)
+    }
+
+    /// Incremental segmented build: diff the tree against the manifest's
+    /// per-file records, tombstone stale chunks, append changed/new chunks
+    /// as one segment, and embed only that segment.
+    ///
+    /// Unlike the single-index path this never touches unchanged segments,
+    /// so cost tracks the edit, not the corpus. Vector search runs exact
+    /// brute-force per segment (no IVF/PQ — see the README measurements;
+    /// exact scoring wins on both recall and simplicity at repo scale).
+    fn build_segmented(&self) -> anyhow::Result<Manifest> {
+        use std::collections::{HashMap, HashSet};
+
+        let start = Instant::now();
+        let mut timer = PhaseTimer::new();
+        let files = repo::walk(&self.root)?;
+        timer.mark("walk");
+        let tree_fingerprint = repo::fingerprint(&files);
+        let previous = Manifest::load(&self.index_dir).ok();
+        if let Some(prev) = &previous {
+            if prev.tree_fingerprint == tree_fingerprint && prev.tree_fingerprint != 0 {
+                self.log(format!(
+                    "index up to date ({} chunks, fingerprint unchanged)",
+                    prev.num_docs
+                ));
+                return Ok(prev.clone());
+            }
+        }
+        let prev_files: HashMap<&str, &FileRecord> = previous
+            .as_ref()
+            .map(|m| m.files.iter().map(|f| (f.path.as_str(), f)).collect())
+            .unwrap_or_default();
+
+        // Diff by (len, mtime): identical identity means identical content
+        // for our purposes (same contract as the tree fingerprint).
+        let mut changed: Vec<&repo::SourceFile> = Vec::new();
+        let mut records: Vec<FileRecord> = Vec::new();
+        let current: HashSet<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        for file in &files {
+            match prev_files.get(file.rel.as_str()) {
+                Some(prev) if prev.len == file.len && prev.mtime_ns == file.mtime_ns => {
+                    records.push((*prev).clone());
+                }
+                _ => changed.push(file),
+            }
+        }
+        let removed: Vec<&FileRecord> = previous
+            .as_ref()
+            .map(|m| {
+                m.files
+                    .iter()
+                    .filter(|f| !current.contains(f.path.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        timer.mark("diff");
+
+        // Chunk only the changed files.
+        let changed_files: Vec<repo::SourceFile> = changed.iter().map(|f| (*f).clone()).collect();
+        let chunks = repo::chunk_files(&changed_files);
+        let mut docs_by_file: HashMap<String, Vec<crate::indexer::InputDoc>> = HashMap::new();
+        for chunk in chunks {
+            let path = chunk.path.clone();
+            docs_by_file.entry(path).or_default().push(chunk.into_doc());
+        }
+        timer.mark("chunk");
+
+        let mut writer = crate::segments::SegmentedWriter::open_or_create_ex(
+            &self.index_dir,
+            true,
+            self.opts.title_weight,
+            true, // code tokenizer, matching the single-index repo path
+        )?;
+        // 1. Tombstone chunks that no longer exist: every id a removed file
+        //    had, and every id of a changed file that its new chunking no
+        //    longer produces (line shifts rename ids).
+        let mut deleted = 0usize;
+        let mut upserts: Vec<crate::indexer::InputDoc> = Vec::new();
+        for file in &changed_files {
+            let new_docs = docs_by_file.remove(&file.rel).unwrap_or_default();
+            let new_ids: HashSet<&str> = new_docs.iter().map(|d| d.id.as_str()).collect();
+            if let Some(prev) = prev_files.get(file.rel.as_str()) {
+                for id in &prev.chunk_ids {
+                    if !new_ids.contains(id.as_str()) && writer.delete_document(id)? {
+                        deleted += 1;
+                    }
+                }
+            }
+            records.push(FileRecord {
+                path: file.rel.clone(),
+                len: file.len,
+                mtime_ns: file.mtime_ns,
+                chunk_ids: new_docs.iter().map(|d| d.id.clone()).collect(),
+            });
+            upserts.extend(new_docs);
+        }
+        for prev in &removed {
+            for id in &prev.chunk_ids {
+                if writer.delete_document(id)? {
+                    deleted += 1;
+                }
+            }
+        }
+        timer.mark("tombstone");
+
+        // 2. Append changed/new chunks as one segment.
+        let outcome = if upserts.is_empty() {
+            crate::segments::UpsertOutcome {
+                added: 0,
+                updated: 0,
+                unchanged: 0,
+                new_segment: None,
+            }
+        } else {
+            writer.upsert_documents_full(&upserts)?
+        };
+        timer.mark("upsert");
+
+        // 3. Embed only the new segment.
+        let (encoded, cached) = match (&outcome.new_segment, self.opts.embed) {
+            (Some((name, docs)), true) => {
+                self.embed_segment(&self.index_dir.join(name), docs)?
+            }
+            _ => (0, 0),
+        };
+        timer.mark("embed");
+
+        // 4. Merge when the segment count gets silly. Embeddings for the
+        //    merged segment come from the content cache via keys — no
+        //    re-encoding.
+        let seg_count = crate::segments::SegmentedIndex::open(&self.index_dir)
+            .map(|s| s.num_segments())
+            .unwrap_or(0);
+        if seg_count > MAX_SEGMENTS {
+            self.log(format!("merging {seg_count} segments"));
+            self.merge_segments(&mut writer)?;
+        }
+        timer.mark("merge");
+
+        let index = crate::segments::SegmentedIndex::open(&self.index_dir)?;
+        let manifest = Manifest {
+            root: self.root.to_string_lossy().to_string(),
+            num_docs: index.num_docs_live() as usize,
+            num_files: files.len(),
+            embedded: self.opts.embed,
+            build_secs: start.elapsed().as_secs_f64(),
+            encoded,
+            cached,
+            tree_fingerprint,
+            files: records,
+        };
+        manifest.save(&self.index_dir)?;
+        self.log(format!(
+            "segmented index ready in {:.2}s ({} live chunks, {} upserted, {} tombstoned, {} encoded, {} from cache)",
+            manifest.build_secs,
+            manifest.num_docs,
+            outcome.added + outcome.updated,
+            deleted,
+            encoded,
+            cached
+        ));
+        Ok(manifest)
+    }
+
+    /// Encode one segment's documents (cache-first) and write its
+    /// `embeddings.bin` plus `keys.bin` (the embcache key per doc, in
+    /// doc_id order) so a later merge can rebuild vectors without the
+    /// encoder.
+    #[cfg(feature = "semantic")]
+    fn embed_segment(
+        &self,
+        seg_dir: &Path,
+        docs: &[crate::indexer::InputDoc],
+    ) -> anyhow::Result<(usize, usize)> {
+        use crate::embcache::{key_for, EmbedCache};
+        use crate::embeddings::CODERANK_DIM;
+
+        let texts: Vec<String> = docs
+            .iter()
+            .map(|d| format!("{}
+{}", d.title, d.body))
+            .collect();
+        let keys: Vec<u64> = texts.iter().map(|t| key_for(t)).collect();
+        let mut cache = EmbedCache::load(&self.index_dir, CODERANK_DIM);
+        let misses: Vec<usize> = (0..texts.len())
+            .filter(|&i| !cache.contains(keys[i]))
+            .collect();
+        let encoded = misses.len();
+        let cached = texts.len() - encoded;
+        if encoded > 0 {
+            self.log(format!(
+                "encoding {encoded} changed chunks ({cached} unchanged, from cache)"
+            ));
+            let embedder = self.embedder()?;
+            for batch in misses.chunks(256) {
+                let refs: Vec<&str> = batch.iter().map(|&i| texts[i].as_str()).collect();
+                let vectors = embedder.embed_docs(&refs)?;
+                for (&i, vector) in batch.iter().zip(vectors.iter()) {
+                    cache.insert(keys[i], vector);
+                }
+            }
+        }
+        let mut vectors = Vec::with_capacity(texts.len());
+        for key in &keys {
+            vectors.push(cache.get(*key).context("vector missing after encode")?);
+        }
+        crate::embeddings::write_f16(seg_dir, CODERANK_DIM as u32, &vectors)?;
+        write_keys(seg_dir, &keys)?;
+        // NOTE: the cache is *not* pruned here — stale entries are trimmed
+        // at merge time, when the set of live keys is enumerated anyway.
+        cache.save(&self.index_dir)?;
+        Ok((encoded, cached))
+    }
+
+    #[cfg(not(feature = "semantic"))]
+    fn embed_segment(
+        &self,
+        _seg_dir: &Path,
+        _docs: &[crate::indexer::InputDoc],
+    ) -> anyhow::Result<(usize, usize)> {
+        anyhow::bail!("this binary was built without CodeRankEmbed")
+    }
+
+    /// Merge all segments, then rebuild the merged segment's embeddings
+    /// from the content cache: each merged doc's external id maps back to
+    /// its embcache key via the pre-merge `keys.bin` sidecars.
+    fn merge_segments(&self, writer: &mut crate::segments::SegmentedWriter) -> anyhow::Result<()> {
+        use std::collections::HashMap;
+
+        // Capture id -> key before the merge invalidates segment dirs.
+        let mut key_of: HashMap<String, u64> = HashMap::new();
+        if self.opts.embed {
+            let pre = crate::segments::SegmentedIndex::open(&self.index_dir)?;
+            for (si, name) in pre.segment_names().iter().enumerate() {
+                let keys = read_keys(&self.index_dir.join(name))?;
+                for doc_id in 0..pre.num_docs_in(si) {
+                    if pre.is_live(si, doc_id) {
+                        if let Some(&key) = keys.get(doc_id as usize) {
+                            key_of.insert(pre.doc_summary_in(si, doc_id).id, key);
+                        }
+                    }
+                }
+            }
+        }
+        writer.merge_all()?;
+        if !self.opts.embed {
+            return Ok(());
+        }
+        let post = crate::segments::SegmentedIndex::open(&self.index_dir)?;
+        let names = post.segment_names();
+        anyhow::ensure!(names.len() == 1, "merge left {} segments", names.len());
+        let seg_dir = self.index_dir.join(&names[0]);
+        let n = post.num_docs_in(0);
+        let mut keys = Vec::with_capacity(n as usize);
+        for doc_id in 0..n {
+            let id = post.doc_summary_in(0, doc_id).id;
+            keys.push(
+                *key_of
+                    .get(&id)
+                    .with_context(|| format!("no cached key for merged doc {id}"))?,
+            );
+        }
+        self.rebuild_segment_vectors(&seg_dir, &keys)
+    }
+
+    #[cfg(feature = "semantic")]
+    fn rebuild_segment_vectors(&self, seg_dir: &Path, keys: &[u64]) -> anyhow::Result<()> {
+        use std::collections::HashSet;
+
+        use crate::embcache::EmbedCache;
+        use crate::embeddings::CODERANK_DIM;
+
+        let mut cache = EmbedCache::load(&self.index_dir, CODERANK_DIM);
+        let mut vectors = Vec::with_capacity(keys.len());
+        for key in keys {
+            vectors.push(
+                cache
+                    .get(*key)
+                    .context("merged doc's vector missing from embcache")?,
+            );
+        }
+        crate::embeddings::write_f16(seg_dir, CODERANK_DIM as u32, &vectors)?;
+        write_keys(seg_dir, keys)?;
+        // The merged segment is the whole corpus: prune the cache to it.
+        let live: HashSet<u64> = keys.iter().copied().collect();
+        cache.retain_keys(&live);
+        cache.save(&self.index_dir)?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "semantic"))]
+    fn rebuild_segment_vectors(&self, _seg_dir: &Path, _keys: &[u64]) -> anyhow::Result<()> {
+        Ok(())
     }
 
     fn build_lexical(

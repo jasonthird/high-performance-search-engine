@@ -526,6 +526,29 @@ vectorized FP16 scoring of every vector costs ~16 ms. `pq.bin` is still
 built: its codebooks drive the incremental-rebuild cache, and `PqMode::Force`
 keeps ADC available for benchmarks.
 
+**Segmented mode: O(edit) reindex.** `index-repo --segmented` (and
+`mcp --segmented`) switches from rebuild-the-world to the same Lucene-style
+segment layout the lexical engine already used for `add`/`delete`/`merge`,
+now extended to vectors: each segment carries its own `embeddings.bin` plus
+a `keys.bin` of content-cache keys. An edit tombstones the stale chunks
+(the manifest remembers which chunk ids each file produced), appends the
+changed chunks as one new segment, and encodes only those; a compaction
+merge runs past `codeindex::MAX_SEGMENTS` and rebuilds the merged segment's
+vectors from the cache by key — no re-encoding. Semantic scoring is exact
+brute-force per segment (no IVF/PQ; see the measurements below for why
+exact wins at repo scale). Measured:
+
+```
+                                387k chunks (lexical)   this repo (embedded)
+first build                            3.8 s                  ~42 s
+one-file edit -> reindexed             0.15 s                 0.20 s
+  (non-segmented rebuild)             (2.4 s+)                  --
+```
+
+The 0.15 s is dominated by walking the tree (0.11 s); the index work itself
+is milliseconds. `tests/segmented_repo.rs` covers the lifecycle: edits,
+line-shift renames, file deletion, and merge-with-vector-rebuild.
+
 **Scoring path.** Product quantization is enabled per query rather than
 always-on, because it is a fixed cost (building `M x 256` lookup tables)
 plus almost nothing per document, while exact scoring is a per-document dot

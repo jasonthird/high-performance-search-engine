@@ -555,7 +555,20 @@ pub fn build_index_weighted(
     block_size: usize,
     reorder: ReorderStrategy,
 ) -> Index {
+    build_index_weighted_ex(docs, remove_stopwords, title_weight, block_size, reorder, false)
+}
+
+/// As [`build_index_weighted`], with the code-oriented tokenizer optional.
+pub fn build_index_weighted_ex(
+    docs: &[InputDoc],
+    remove_stopwords: bool,
+    title_weight: u32,
+    block_size: usize,
+    reorder: ReorderStrategy,
+    code_mode: bool,
+) -> Index {
     let mut builder = IndexBuilder::new(remove_stopwords, title_weight, block_size, reorder);
+    builder.set_code_mode(code_mode);
     for chunk in docs.chunks(INDEX_CHUNK_SIZE) {
         builder.add_documents(chunk);
     }

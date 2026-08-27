@@ -58,6 +58,9 @@ pub enum IndexKind {
 /// corrector for query-time typo correction.
 pub struct AnyIndex {
     kind: IndexKind,
+    /// Per-segment embedding stores for a segmented index (None entries
+    /// for segments without an embeddings sidecar).
+    seg_stores: Option<crate::hybrid::SegmentStores>,
     /// Built on the first query that contains an unmatched term; clean
     /// workloads never pay for it.
     spell: OnceLock<SpellCorrector>,
@@ -78,8 +81,23 @@ impl AnyIndex {
         let embeddings = crate::embeddings::EmbeddingStore::open(dir).ok();
         let ivf = crate::ivf::IvfIndex::open(dir).ok();
         let pq = crate::pq::PqIndex::open(dir).ok();
+        let seg_stores = match &kind {
+            IndexKind::Segmented(seg) => {
+                let stores = seg
+                    .segment_names()
+                    .iter()
+                    .map(|name| crate::embeddings::EmbeddingStore::open(&dir.join(name)).ok())
+                    .collect::<Vec<_>>();
+                stores
+                    .iter()
+                    .any(Option::is_some)
+                    .then_some(crate::hybrid::SegmentStores { stores })
+            }
+            IndexKind::Single(_) => None,
+        };
         Ok(Self {
             kind,
+            seg_stores,
             spell: OnceLock::new(),
             embeddings,
             ivf,
@@ -89,6 +107,18 @@ impl AnyIndex {
 
     pub fn embeddings(&self) -> Option<&crate::embeddings::EmbeddingStore> {
         self.embeddings.as_ref()
+    }
+
+    /// Per-segment embedding stores, present only for segmented indexes
+    /// that were built with embeddings.
+    pub fn segment_stores(&self) -> Option<&crate::hybrid::SegmentStores> {
+        self.seg_stores.as_ref()
+    }
+
+    /// True when some form of vector search is available (single-index
+    /// sidecar or per-segment stores).
+    pub fn has_vectors(&self) -> bool {
+        self.embeddings.is_some() || self.seg_stores.is_some()
     }
 
     pub fn ivf(&self) -> Option<&crate::ivf::IvfIndex> {

@@ -385,3 +385,178 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Hybrid retrieval over a segmented index
+// ---------------------------------------------------------------------------
+
+/// A hybrid hit addressed by (segment, segment-local doc_id).
+#[derive(Debug, Clone)]
+pub struct SegHybridHit {
+    pub segment: usize,
+    pub doc_id: u32,
+    pub score: f32,
+    pub bm25: f32,
+    pub semantic: f32,
+}
+
+/// Per-segment vector stores for a segmented index, in segment order.
+/// `None` for a segment whose embeddings sidecar is missing (it then
+/// contributes only BM25 signal).
+pub struct SegmentStores {
+    pub stores: Vec<Option<EmbeddingStore>>,
+}
+
+impl SegmentStores {
+    fn cosine(&self, segment: usize, doc_id: u32, query: &[f32]) -> f32 {
+        match self.stores.get(segment).and_then(|s| s.as_ref()) {
+            Some(store) => store.cosine(doc_id, query),
+            None => 0.0,
+        }
+    }
+}
+
+/// Semantic top-`pool` over every live document of every segment: an exact
+/// brute-force scan, in parallel across segments.
+///
+/// No IVF, deliberately. Segments stay small between merges, and the
+/// measured recall/latency trade at repo scale favors exact scoring — see
+/// the nprobe/PQ measurements in the README. IVF over the merged base
+/// segment can be layered back in when corpora outgrow brute force.
+pub fn segmented_semantic_pool(
+    stores: &SegmentStores,
+    live: &(dyn Fn(usize, u32) -> bool + Sync),
+    query: &[f32],
+    pool: usize,
+) -> Vec<SegHybridHit> {
+    use rayon::prelude::*;
+    let mut rows: Vec<SegHybridHit> = stores
+        .stores
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(si, store)| {
+            let store = store.as_ref();
+            let n = store.map(|s| s.num_docs()).unwrap_or(0);
+            let mut seg_rows = Vec::new();
+            if let Some(store) = store {
+                for doc_id in 0..n {
+                    if !live(si, doc_id) {
+                        continue;
+                    }
+                    let sem = store.cosine(doc_id, query);
+                    seg_rows.push(SegHybridHit {
+                        segment: si,
+                        doc_id,
+                        score: sem,
+                        bm25: 0.0,
+                        semantic: sem,
+                    });
+                }
+                // Keep only this segment's best `pool`; the global merge
+                // below cannot need more than that from one segment.
+                seg_rows.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+                seg_rows.truncate(pool);
+            }
+            seg_rows
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap()
+            .then(a.segment.cmp(&b.segment))
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    rows.truncate(pool);
+    rows
+}
+
+/// Fuse BM25 hits (as `(segment, doc_id, score)`) with the semantic pool.
+/// Same union/normalization semantics as [`merge_retrieve`], addressed by
+/// (segment, doc_id) instead of a single index's doc_id.
+pub fn segmented_fuse(
+    bm25_hits: &[(usize, u32, f32)],
+    sem_hits: Vec<SegHybridHit>,
+    stores: &SegmentStores,
+    query: &[f32],
+    fusion: Fusion,
+    k: usize,
+) -> Vec<SegHybridHit> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let key = |si: usize, doc: u32| ((si as u64) << 32) | doc as u64;
+    let mut by_id: std::collections::HashMap<u64, (SegHybridHit, usize, usize)> =
+        std::collections::HashMap::new();
+    for (rank, h) in sem_hits.into_iter().enumerate() {
+        by_id.insert(key(h.segment, h.doc_id), (h, 0, rank + 1));
+    }
+    for (rank, &(si, doc_id, score)) in bm25_hits.iter().enumerate() {
+        by_id
+            .entry(key(si, doc_id))
+            .and_modify(|(row, br, _)| {
+                row.bm25 = score;
+                *br = rank + 1;
+            })
+            .or_insert_with(|| {
+                (
+                    SegHybridHit {
+                        segment: si,
+                        doc_id,
+                        score: 0.0,
+                        bm25: score,
+                        semantic: stores.cosine(si, doc_id, query),
+                    },
+                    rank + 1,
+                    0,
+                )
+            });
+    }
+
+    let mut rows: Vec<SegHybridHit> = Vec::with_capacity(by_id.len());
+    let mut bm25_rank: Vec<usize> = Vec::with_capacity(by_id.len());
+    let mut sem_rank: Vec<usize> = Vec::with_capacity(by_id.len());
+    for (_, (hit, br, sr)) in by_id {
+        rows.push(hit);
+        bm25_rank.push(br);
+        sem_rank.push(sr);
+    }
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    match fusion {
+        Fusion::Weighted { alpha } => {
+            let (lo, hi) = min_max(rows.iter().filter(|r| r.bm25 > 0.0).map(|r| r.bm25));
+            let span = (hi - lo).max(1e-9);
+            for r in rows.iter_mut() {
+                let n = if r.bm25 <= 0.0 {
+                    0.0
+                } else {
+                    (r.bm25 - lo) / span
+                };
+                r.score = alpha * n + (1.0 - alpha) * r.semantic;
+            }
+        }
+        Fusion::Rrf { k: rrf_k } => {
+            for (i, r) in rows.iter_mut().enumerate() {
+                let mut score = 0.0;
+                if sem_rank[i] > 0 {
+                    score += 1.0 / (rrf_k + sem_rank[i] as f32);
+                }
+                if bm25_rank[i] > 0 {
+                    score += 1.0 / (rrf_k + bm25_rank[i] as f32);
+                }
+                r.score = score;
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap()
+            .then(a.segment.cmp(&b.segment))
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    rows.truncate(k);
+    rows
+}

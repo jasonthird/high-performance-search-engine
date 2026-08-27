@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::block_max_wand::{self, SearchStats};
-use crate::indexer::{build_index_weighted, DocSummary, InputDoc, SearchableIndex};
+use crate::indexer::{DocSummary, InputDoc, SearchableIndex};
 use crate::postings::{self, Posting, TermPostings, DEFAULT_BLOCK_SIZE};
 use crate::reorder::ReorderStrategy;
 use crate::searcher::{SearchOutcome, SearchResult};
@@ -63,6 +63,10 @@ struct Manifest {
     next_segment: u64,
     remove_stopwords: bool,
     title_weight: u32,
+    /// Code-oriented tokenizer (identifier splitting); must match between
+    /// build and query, and across every segment.
+    #[serde(default)]
+    code_mode: bool,
     segments: Vec<SegmentEntry>,
 }
 
@@ -255,9 +259,96 @@ impl SegmentedIndex {
     }
 
     /// Exact top-k search across all segments under global statistics.
+    /// Raw BM25 top-k as (segment, doc_id, score) triples, for callers
+    /// (hybrid fusion) that need scores joined with other per-document
+    /// signals before summaries are materialized.
+    pub fn search_hits_raw(&self, query: &str, k: usize) -> Vec<(usize, u32, f32)> {
+        let outcome_terms = {
+            let tokenizer = Tokenizer::with_flags(self.manifest.remove_stopwords, self.manifest.code_mode);
+            let mut terms: Vec<String> = Vec::new();
+            tokenizer.for_each_token(query, |t| {
+                if !terms.iter().any(|x| x == t) {
+                    terms.push(t.to_owned());
+                }
+            });
+            terms
+        };
+        let terms = outcome_terms;
+        let (num_docs_global, avg_doc_len_global) = self.global_stats();
+        let mut idfs: HashMap<String, f32> = HashMap::new();
+        for term in &terms {
+            let df: u64 = self
+                .segments
+                .iter()
+                .map(|s| s.index.term_df(term) as u64)
+                .sum();
+            if df > 0 {
+                idfs.insert(term.clone(), bm25::idf(num_docs_global, df as usize));
+            }
+        }
+        let per_segment: Vec<(usize, Vec<crate::block_max_wand::SearchHit>)> = self
+            .segments
+            .par_iter()
+            .enumerate()
+            .map(|(si, segment)| {
+                let view = SegmentView {
+                    segment,
+                    num_docs_global,
+                    avg_doc_len_global,
+                    idfs: &idfs,
+                    remove_stopwords: self.manifest.remove_stopwords,
+                };
+                let (hits, _) = if terms.len() >= MAXSCORE_MIN_TERMS {
+                    maxscore::search(&view, &terms, k)
+                } else {
+                    block_max_wand::search(&view, &terms, k)
+                };
+                (si, hits)
+            })
+            .collect();
+        let mut merged: Vec<(usize, u32, f32)> = Vec::new();
+        for (si, hits) in per_segment {
+            for hit in hits {
+                merged.push((si, hit.doc_id, hit.score));
+            }
+        }
+        merged.sort_unstable_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        merged.truncate(k);
+        merged
+    }
+
+    /// Per-segment directory names, in manifest (and doc-compaction) order.
+    pub fn segment_names(&self) -> Vec<String> {
+        self.manifest
+            .segments
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    /// Live (not tombstoned) check for one segment-local doc.
+    pub fn is_live(&self, segment: usize, doc_id: u32) -> bool {
+        self.segments
+            .get(segment)
+            .is_some_and(|s| !s.is_deleted(doc_id))
+    }
+
+    pub fn doc_summary_in(&self, segment: usize, doc_id: u32) -> DocSummary {
+        self.segments[segment].index.doc_summary(doc_id)
+    }
+
+    pub fn num_docs_in(&self, segment: usize) -> u32 {
+        self.segments[segment].entry.num_docs
+    }
+
     pub fn search(&self, query: &str, k: usize) -> SearchOutcome {
         let remove_stopwords = self.manifest.remove_stopwords;
-        let tokenizer = Tokenizer::new(remove_stopwords);
+        let tokenizer = Tokenizer::with_flags(remove_stopwords, self.manifest.code_mode);
         let mut terms: Vec<String> = Vec::new();
         tokenizer.for_each_token(query, |t| {
             if !terms.iter().any(|x| x == t) {
@@ -350,6 +441,19 @@ impl SegmentedIndex {
 }
 
 /// Mutating operations on a segmented index directory.
+/// Outcome of an upsert batch: counts, plus the segment the changed and
+/// new documents landed in (with those documents in the segment's doc_id
+/// order), so callers can build per-segment sidecars — embeddings, keys —
+/// for exactly the documents that moved.
+pub struct UpsertOutcome {
+    pub added: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    /// (segment name, documents in segment doc order), when anything was
+    /// written.
+    pub new_segment: Option<(String, Vec<InputDoc>)>,
+}
+
 pub struct SegmentedWriter {
     dir: PathBuf,
     manifest: Manifest,
@@ -361,6 +465,17 @@ impl SegmentedWriter {
         dir: &Path,
         remove_stopwords: bool,
         title_weight: u32,
+    ) -> anyhow::Result<Self> {
+        Self::open_or_create_ex(dir, remove_stopwords, title_weight, false)
+    }
+
+    /// As [`Self::open_or_create`], choosing the tokenizer. `code_mode` is
+    /// recorded at creation and must not change for the index's lifetime.
+    pub fn open_or_create_ex(
+        dir: &Path,
+        remove_stopwords: bool,
+        title_weight: u32,
+        code_mode: bool,
     ) -> anyhow::Result<Self> {
         fs::create_dir_all(dir)?;
         let manifest = if is_segmented(dir) {
@@ -377,6 +492,7 @@ impl SegmentedWriter {
                 next_segment: 0,
                 remove_stopwords,
                 title_weight,
+                code_mode,
                 segments: Vec::new(),
             };
             write_manifest(dir, &manifest)?;
@@ -392,12 +508,13 @@ impl SegmentedWriter {
     pub fn add_documents(&mut self, docs: &[InputDoc]) -> anyhow::Result<String> {
         anyhow::ensure!(!docs.is_empty(), "no documents to add");
         let name = format!("seg-{:06}", self.manifest.next_segment);
-        let index = build_index_weighted(
+        let index = crate::indexer::build_index_weighted_ex(
             docs,
             self.manifest.remove_stopwords,
             self.manifest.title_weight,
             DEFAULT_BLOCK_SIZE,
             ReorderStrategy::None,
+            self.manifest.code_mode,
         );
         storage::save_index(&index, &self.dir.join(&name))?;
         let total_len: u64 = index.docs().iter().map(|d| d.doc_len as u64).sum();
@@ -448,6 +565,12 @@ impl SegmentedWriter {
     /// and re-added; new documents are added. Re-feeding an unchanged
     /// corpus is a no-op. Returns (added, updated, unchanged).
     pub fn upsert_documents(&mut self, docs: &[InputDoc]) -> anyhow::Result<(usize, usize, usize)> {
+        let outcome = self.upsert_documents_full(docs)?;
+        Ok((outcome.added, outcome.updated, outcome.unchanged))
+    }
+
+    /// As [`Self::upsert_documents`], reporting the created segment too.
+    pub fn upsert_documents_full(&mut self, docs: &[InputDoc]) -> anyhow::Result<UpsertOutcome> {
         // Resolve against current live segments once.
         let segments: Vec<(String, DiskIndex, Vec<u64>, u32)> = self
             .manifest
@@ -492,10 +615,18 @@ impl SegmentedWriter {
                 }
             }
         }
-        if !to_add.is_empty() {
-            self.add_documents(&to_add)?;
-        }
-        Ok((added, updated, unchanged))
+        let new_segment = if to_add.is_empty() {
+            None
+        } else {
+            let name = self.add_documents(&to_add)?;
+            Some((name, to_add))
+        };
+        Ok(UpsertOutcome {
+            added,
+            updated,
+            unchanged,
+            new_segment,
+        })
     }
 
     /// Merge every segment into one, dropping tombstoned documents.

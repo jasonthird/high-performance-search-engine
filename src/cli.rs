@@ -144,6 +144,12 @@ enum Command {
         /// A normal rebuild reuses it, which is what makes small edits fast.
         #[arg(long)]
         retrain: bool,
+        /// Segmented (incrementally updatable) layout: edits append a
+        /// segment and tombstone stale chunks instead of rebuilding, so
+        /// reindex cost tracks the edit, not the corpus. Semantic scoring
+        /// is exact per segment (no IVF/PQ).
+        #[arg(long)]
+        segmented: bool,
     },
     /// Generate a CodeSearchNet-style eval set from a source tree: each
     /// documented declaration becomes (query = its doc comment, relevant
@@ -182,6 +188,9 @@ enum Command {
         /// Do not watch the tree; the index only changes on `reindex`.
         #[arg(long)]
         no_watch: bool,
+        /// Segmented layout (incremental edits; see `index-repo --segmented`).
+        #[arg(long)]
+        segmented: bool,
         /// Default number of results per search.
         #[arg(long, default_value_t = 10)]
         top_k: usize,
@@ -410,6 +419,7 @@ pub fn run() -> anyhow::Result<()> {
             title_weight,
             ivf_clusters,
             retrain,
+            segmented,
         } => cmd_index_repo(
             &root,
             index.as_deref(),
@@ -417,6 +427,7 @@ pub fn run() -> anyhow::Result<()> {
             title_weight,
             ivf_clusters,
             retrain,
+            segmented,
         ),
         Command::EvalGen {
             root,
@@ -430,6 +441,7 @@ pub fn run() -> anyhow::Result<()> {
             lexical,
             rebuild,
             no_watch,
+            segmented,
             top_k,
             semantic_candidates,
             fusion,
@@ -443,6 +455,7 @@ pub fn run() -> anyhow::Result<()> {
             !lexical,
             rebuild,
             !no_watch,
+            segmented,
             top_k,
             SearchOpts {
                 mode: RankMode::Hybrid,
@@ -581,7 +594,6 @@ pub struct SearchOpts {
     pub pq: PqMode,
 }
 
-#[allow(dead_code)]
 /// Pick the scoring path: ADC only when enough documents will be scored to
 /// amortize its table build. See [`crate::pq::MIN_CANDIDATES`] for the
 /// measurements behind the threshold.
@@ -876,6 +888,7 @@ fn cmd_index_repo(
     title_weight: u32,
     ivf_clusters: usize,
     retrain: bool,
+    segmented: bool,
 ) -> anyhow::Result<()> {
     let index_dir = match index {
         Some(dir) => dir.to_path_buf(),
@@ -887,6 +900,7 @@ fn cmd_index_repo(
         reorder: ReorderStrategy::None,
         ivf_clusters,
         retrain,
+        segmented,
         quiet: false,
     };
     let indexer = crate::codeindex::RepoIndexer::new(root, &index_dir, opts)?;
@@ -1001,6 +1015,7 @@ fn cmd_mcp(
     embed: bool,
     rebuild: bool,
     watch: bool,
+    segmented: bool,
     top_k: usize,
     search: SearchOpts,
 ) -> anyhow::Result<()> {
@@ -1018,6 +1033,7 @@ fn cmd_mcp(
             reorder: ReorderStrategy::None,
             ivf_clusters: 0,
             retrain: false,
+            segmented,
             // Build progress is useful during the first (slow) index; it
             // goes to stderr, since stdout carries the JSON-RPC frames.
             quiet: false,
@@ -1189,6 +1205,9 @@ pub fn run_ranked_with(
 ) -> anyhow::Result<RankedRun> {
     use crate::hybrid;
     use crate::indexer::SearchableIndex as _;
+    if index.as_single().is_none() {
+        return run_ranked_segmented(index, embedder, query, top_k, opts);
+    }
     let embeddings = index
         .embeddings()
         .context("no embeddings.bin — run `embed --index ... --input ...` first")?;
@@ -1270,6 +1289,96 @@ pub fn run_ranked_with(
     Ok(RankedRun {
         results,
         stats,
+        bm25_ms,
+        embed_ms,
+        score_ms,
+        total_ms: total.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Ranked retrieval over a segmented index: BM25 across segments plus an
+/// exact per-segment brute-force semantic pool, fused like the single-index
+/// path. No IVF/PQ — segments stay small between merges, and exact scoring
+/// measured better on both recall and simplicity at repo scale.
+#[cfg(feature = "semantic")]
+fn run_ranked_segmented(
+    index: &searcher::AnyIndex,
+    embedder: &crate::embedder::Embedder,
+    query: &str,
+    top_k: usize,
+    opts: &SearchOpts,
+) -> anyhow::Result<RankedRun> {
+    use crate::hybrid;
+
+    let seg = match index.kind() {
+        searcher::IndexKind::Segmented(seg) => seg,
+        searcher::IndexKind::Single(_) => unreachable!("caller checked"),
+    };
+    let stores = index
+        .segment_stores()
+        .context("segmented index has no embeddings; rebuild with --segmented (not --lexical)")?;
+
+    let total = Instant::now();
+    let pool = opts.semantic_candidates.max(top_k);
+
+    // Query embed and BM25 in parallel, mirroring the single-index path.
+    let (qvec, bm25_hits, embed_ms, bm25_ms) = std::thread::scope(|scope| {
+        let bm25 = scope.spawn(|| {
+            let t = Instant::now();
+            let hits = if opts.mode == RankMode::Semantic {
+                Vec::new()
+            } else {
+                seg.search_hits_raw(query, pool)
+            };
+            (hits, t.elapsed().as_secs_f64() * 1000.0)
+        });
+        let t = Instant::now();
+        let qvec = embedder.embed_query(query)?;
+        let embed_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let (hits, bm25_ms) = bm25
+            .join()
+            .map_err(|_| anyhow::anyhow!("BM25 helper thread panicked"))?;
+        Ok::<_, anyhow::Error>((qvec, hits, embed_ms, bm25_ms))
+    })?;
+
+    let t_score = Instant::now();
+    let live = |si: usize, doc: u32| seg.is_live(si, doc);
+    let hits = match opts.mode {
+        RankMode::Semantic => {
+            let mut sem = hybrid::segmented_semantic_pool(stores, &live, &qvec, top_k);
+            sem.truncate(top_k);
+            sem
+        }
+        RankMode::Rerank => {
+            // Cosine only on the BM25 candidates.
+            hybrid::segmented_fuse(&bm25_hits, Vec::new(), stores, &qvec, fusion_from(opts), top_k)
+        }
+        _ => {
+            let sem = hybrid::segmented_semantic_pool(stores, &live, &qvec, pool);
+            hybrid::segmented_fuse(&bm25_hits, sem, stores, &qvec, fusion_from(opts), top_k)
+        }
+    };
+    let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
+
+    let results = hits
+        .into_iter()
+        .map(|h| {
+            let summary = seg.doc_summary_in(h.segment, h.doc_id);
+            RankedHit {
+                id: summary.id,
+                title: summary.title,
+                score: h.score,
+                bm25: h.bm25,
+                semantic: h.semantic,
+            }
+        })
+        .collect();
+    Ok(RankedRun {
+        results,
+        stats: crate::block_max_wand::SearchStats {
+            num_docs_total: index.num_docs() as usize,
+            ..Default::default()
+        },
         bm25_ms,
         embed_ms,
         score_ms,
