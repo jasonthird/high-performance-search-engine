@@ -58,3 +58,12 @@ semantic = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
+
+# Optional: a local candle fork with fused Metal SDPA in NomicBert
+# attention (../candle, branch nomic-bert-fused-sdpa; measured +1-5%,
+# upstream PR candidate). Uncomment to use it; the default build works
+# from crates.io alone.
+# [patch.crates-io]
+# candle-core = { path = "../candle/candle-core" }
+# candle-nn = { path = "../candle/candle-nn" }
+# candle-transformers = { path = "../candle/candle-transformers" }
