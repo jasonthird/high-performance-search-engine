@@ -30,6 +30,10 @@ the maps, sort each list by doc_id, then attach block metadata. This is a
 simplified in-memory version of the classic blocked sort-based / merge-based
 indexing used when corpora exceed RAM.
 
+The hybrid experiment (§14) reuses this exact posting-list shape a second
+time, with **cluster ids** as the vocabulary: `cluster_id → (doc_id, tf=1)`.
+Both inverted files address the same `doc_id` space.
+
 ## 2. BM25 ranking
 
 **Where:** `src/bm25.rs`
@@ -247,6 +251,11 @@ The synergy with BMW + compression: a skipped block is never decoded, so its
 bytes are never touched, so its page is never read from disk. Logical
 skipping becomes physical I/O avoidance.
 
+The hybrid experiment (§14) adds three more mmap sidecars in the same
+directory — `embeddings.bin` (dense rows), `ivf.bin` (cluster posting
+lists, same block codec as `postings.bin`), `pq.bin` (product-quantized
+codes). The lexical evaluators never open them.
+
 ## 9. GPU offload experiment (CubeCL / wgpu / Metal)
 
 **Where:** `src/reorder/gpu.rs` (feature `gpu`, `--reorder bp-gpu`)
@@ -324,7 +333,9 @@ memory the transfer discipline matters as much as the kernel. The broader
 conclusion stands: lexical index construction is CPU-shaped, and GPU
 investment pays off mainly where dense math lives (embedding/vector
 retrieval, where kernel libraries like CubeK — matmul, reductions,
-quantization, attention on CubeCL — would slot in directly).
+quantization, attention on CubeCL — would slot in directly). That path is
+now §14: Candle on Metal runs the encoder; retrieval itself stays an
+inverted file plus (optional) product-quantized table lookups on the CPU.
 
 ## 10. Concurrency model
 
@@ -366,7 +377,83 @@ length, df summed across segments), so a document scores the same
 regardless of which segment holds it. The one deviation, shared with
 Lucene: df counts tombstoned documents until merge.
 
-## 12. Testing methodology: oracle testing
+## 12. Query typo correction: Symmetric Delete (SymSpell)
+
+**Where:** `src/spell.rs`, wired in `src/searcher.rs`
+
+A misspelled query term ("pizzza") has document frequency 0 and retrieves
+nothing. Before BM25 runs, a rewrite layer maps such terms to the nearest
+real vocabulary term. "Nearest" is **Damerau-Levenshtein distance** (the
+optimal string alignment variant): the fewest single-character insertions,
+deletions, substitutions, and *adjacent transpositions*. Transpositions
+matter because "teh" → "the" is the most common typo class, and plain
+Levenshtein charges it 2 edits where Damerau charges 1.
+
+The algorithm is Wolf Garbe's **Symmetric Delete** ("SymSpell", 2012),
+reimplemented here from the description — no crate. The naive alternatives
+both fail at scale: scanning the whole vocabulary is O(|vocab|) per lookup,
+and Norvig-style candidate generation multiplies by the alphabet size, giving
+~100k variants at edit distance 2 (and the "alphabet" is unbounded under
+Unicode).
+
+**The symmetry trick.** Deletes are alphabet-independent: a word of length n
+has only n distance-1 deletes and ~n²/2 distance-2 deletes, with no ×26
+blowup. Deletes alone can't express an insertion or substitution — unless
+*both sides* delete. The key claim: if a dictionary term `t` and a query `q`
+are within distance d, then some ≤d-delete of `t` **equals** some ≤d-delete of
+`q`. Each edit class meets in the middle (d = 1 shown; d = 2 composes):
+
+| query error | example | meeting point |
+|---|---|---|
+| insertion | "pizzza" (t + 1 char) | delete 1 from *q* → t |
+| deletion | "piza" (t − 1 char) | delete 1 from *t* → q |
+| substitution | "pizca" (1 char differs) | delete that char from *both* |
+| transposition | "piazz…" (2 adjacent swapped) | delete either from *both* |
+
+So we **precompute**, for every vocabulary term, the hashes of all its
+≤d-delete variants into a map `hash(delete) -> [term ids]`. At **lookup**, we
+generate the same delete variants of the query term and union the buckets they
+hit — the candidate superset.
+
+**Verification is mandatory.** A shared delete is necessary, not sufficient
+("bank" and "beak" both delete to "bak" but are distance 2 apart), and
+distinct deletes can hash-collide. So each candidate gets its true
+Damerau-Levenshtein distance computed against the query (an O(m·n) DP over two
+short words), those over budget are dropped, and survivors rank by *(distance
+ascending, then document frequency descending)*. That verify step is also what
+makes two memory optimizations provably safe — they can only *add* false
+candidates, never drop true ones: the **prefix optimization** (generate
+deletes from only the first 7 characters, bounding entries per term to
+1+7+21 = 29) and **hashing the delete strings** to `u64` keys instead of
+storing them.
+
+**Design choices specific to this engine:**
+
+- **The dictionary is the index's own vocabulary**, weighted by df — no
+  external word list. Every correction therefore points at a term that
+  actually retrieves something, and the on-disk index is never touched. The
+  full-vocabulary walk that seeds it is `DiskIndex::for_each_term`.
+- **Correction targets require df ≥ 3.** Corpus typos and OCR junk are
+  overwhelmingly df-1/2 terms; excluding them both improves correction quality
+  and shrinks the deletes map several-fold.
+- **Length-scaled budget**, mirroring Elasticsearch `fuzziness: AUTO`: words
+  under 3 chars are never corrected, 3–5 chars allow distance 1, longer allow
+  distance 2. (Correcting "cat" at distance 2 would match half the
+  dictionary.)
+- **Only terms with df = 0 are rewritten** — a term that matches even one
+  document is left alone. Clean queries pay one df lookup per term and never
+  build the corrector, which is constructed lazily on the first miss
+  (`OnceLock`). Rewrites are surfaced, not silent: `SearchOutcome.corrected`
+  carries the rewritten query to the CLI and HTTP responses.
+
+Cost: build is one vocabulary pass (~29 entries/term); on a full-Wikipedia
+vocabulary the map is order 1–2 GB after the df filter, which is why it is
+lazy and gated. The documented upgrade path when that hurts is an FST plus a
+Levenshtein automaton (the Lucene/Elasticsearch approach), which intersects
+the query automaton against a trie term dictionary and needs no precomputed
+deletes.
+
+## 13. Testing methodology: oracle testing
 
 **Where:** `tests/bmw_correctness.rs`, `tests/disk_and_reorder.rs`
 
@@ -385,3 +472,283 @@ replaces. So the tests pin them against oracles:
 - Property tests: every `block_max_score` ≥ every actual contribution in its
   block (the invariant that makes skipping safe), encode/decode round-trips,
   BP outputs a valid permutation and reduces measured log-gap cost.
+- Typo correction: unit tests in `src/spell.rs` pin the OSA distance
+  (including transpositions), the length-scaled budget, and df tie-breaking;
+  an integration test drives a real on-disk index end-to-end (typo →
+  corrected query → right documents; clean and below-threshold queries left
+  untouched).
+- Hybrid / IVF / PQ: unit tests pin fusion (weighted + RRF), that
+  encoder-first merge recovers a document BM25 never returned, that
+  spherical k-means separates orthogonal vectors onto different cluster
+  lists, and that `nprobe=1` does not open the orthogonal list. The
+  lexical oracle suite is unchanged — hybrid is approximate by construction
+  (unopened clusters, quantized codes) and is not claimed rank-safe.
+
+---
+
+## 14. Hybrid code search: one inverted file, two keys
+
+**Where:** `src/tokenizer.rs` (code analyzer), `src/embeddings.rs`,
+`src/embedder.rs`, `src/ivf.rs`, `src/pq.rs`, `src/hybrid.rs`,
+`src/eval.rs` (feature `semantic`)
+
+This is still **not** a vector database. There is no HNSW graph, no FAISS
+index, no Qdrant collection, and no second document-id space. The lexical
+engine of §§1–13 is unchanged. What the experiment adds is a second
+inverted file over the **same** `doc_id`s, plus a dense sidecar those
+lists select into.
+
+`index --code --embed` writes one directory:
+
+```
+postings.bin     term_id      →  compressed (doc_id, tf) blocks     BM25 / BMW
+embeddings.bin   doc_id       →  768-d FP16 row                     cosine
+ivf.bin          cluster_id   →  same compressed posting blocks     IVF probe
+pq.bin           doc_id       →  M-byte PQ code                     ADC
+```
+
+Row `i` of `embeddings.bin` / `pq.bin` **is** inverted-index `doc_id == i`.
+Cluster lists in `ivf.bin` are built with the same `PostingList::build`
+path as BM25 (delta + bit-pack, block skip tables, impact pairs). The
+vector analogue of "only read the query terms' postings" is "only read
+the `nprobe` nearest clusters' postings".
+
+That inverted-file view of vector search is the line from Sivic &
+Zisserman (*"Video Google: A Text Retrieval Approach to Object Matching
+in Videos"*, ICCV 2003) through Jégou, Douze & Schmid (*"Product
+Quantization for Nearest Neighbor Search"*, IEEE TPAMI 2011). A service
+like FAISS IVF-PQ or HNSW is the same *idea* with its own ids, quantizer,
+and (for HNSW) a proximity graph. Here both engines are posting lists
+in one process.
+
+### Query path: encoder first, BM25 as helper
+
+`--mode hybrid` is **embedding-first**. BM25 is a bonus signal on the
+union, not a gate.
+`--mode rerank` is the older BM25-then-cosine path, kept for comparison.
+`--mode semantic` is encoder-only through IVF (full mmap scan if
+`ivf.bin` is missing). `--mode bm25` is §§1–13 with no neural work.
+
+```
+query
+  ├─ CodeRankEmbed(query)  →  768-d, L2-normalized     (Metal, calling thread)
+  └─ BM25 / Block-Max WAND / MaxScore                  (CPU, overlapping thread)
+              ↓  join
+     nearest nprobe centroids                          (needs the query vector)
+     decode those cluster posting lists     (disjoint: clusters partition docs)
+     score survivors: FP16 dot  or  PQ-ADC
+     keep top `pool`  (default 200)
+              ↓
+     union by doc_id
+              ↓
+     weighted min-max  or  RRF
+              ↓
+            top k
+```
+
+BM25 does not need the query vector, so it overlaps with encode
+(`std::thread::scope` in `src/cli.rs`). The encoder stays on the calling
+thread because Metal is where the model was warmed up; WAND runs on a
+helper thread. IVF probe cannot start until encode returns. Wall time is
+`max(embed, bm25) + score`. `--mode rerank` overlaps the same way;
+`--mode semantic` has no BM25 side.
+
+Documents the encoder found that WAND never saw still compete
+(`bm25 = 0`). Documents WAND found that sit in an unopened cluster still
+compete after a point cosine against `embeddings.bin`. Fusion cannot
+hide a semantic hit behind a lexical miss, or a lexical hit behind an
+IVF miss. Hybrid currently requires a single (non-segmented) index.
+
+### Code tokenizer
+
+**Where:** `src/tokenizer.rs`, flag bit 1 of the `meta.bin` flags word
+(`flags |= 2`), so v4 indexes without the bit keep the default analyzer.
+
+Identifiers are stored **twice**: the full lowercased form
+(`getuserbyorganizationid`, `std.json.utf8parser`) and the camelCase /
+PascalCase / snake_case / SCREAMING_SNAKE / dotted pieces (`get`, `user`,
+`organization`, `id`, `utf`, `8`, `parser`). Digit boundaries split
+(`utf8Parser` → `utf` + `8` + `parser`); acronyms split before the last
+capital (`XMLHttpRequest` → `xml` + `http` + `request`). Exact-name
+queries still get a rare, high-idf term; natural-language queries can
+match the pieces. The original identifier is never stopword-dropped;
+split pieces are.
+
+Queries must use the same analyzer the index was built with
+(`Tokenizer::code(true)`).
+
+### Offline encoding (Candle / Metal)
+
+**Where:** `src/embedder.rs`, sidecar layout in `src/embeddings.rs`
+
+Behind `--features semantic`, Candle loads `nomic-ai/CodeRankEmbed`
+(137M NomicBert: RoPE + SwiGLU, no official ONNX export). Documents are
+encoded as raw code, in inverted-index `doc_id` order, batch 4, truncated
+at 512 tokens. Queries are prefixed with
+`Represent this query for searching relevant code: `; documents are not.
+Pooling is CLS, then L2-normalize — matching the model card and
+`1_Pooling/config.json`. L2-normalized cosine is a plain dot product.
+
+On macOS the device is Metal F16 (`HPS_EMBED_DEVICE=cpu|metal` overrides);
+elsewhere CPU F32 with Accelerate on Apple. Queries truncate RoPE at 64
+tokens; document indexing keeps 512. Candle's Metal NomicBert is a few
+hundred unfused kernel launches per forward — that, not FLOPs, is why a
+20-token query still costs ~10 ms. CPU+Accelerate was measured *slower*
+(~22 ms) on the same graph. A fused runtime (MLX, CoreML/ANE) is the
+actual encoder speedup; this crate does not ship one. The Metal backend
+implements `where_cond` for `(U8, F16)` but not `(U32, F16)`, so the
+attention mask is stored as U8. `Embedder::load` runs a dummy
+`embed_query("warmup")` so the first real query does not pay shader
+compile. Query encode is the dominant term in end-to-end hybrid latency.
+
+`embeddings.bin` is a 32-byte header (`HPSEMB01`) plus row-major FP16
+vectors, memory-mapped. 768-d costs 1.5 KB/doc. Nothing in the lexical
+files changes.
+
+fastembed-rs was not used because it ships mean-pooled
+`nomic-embed-text`, a different model. ORT was not used because there is
+no official ONNX export of this custom `nomic_bert`.
+
+### IVF: cluster ids as terms
+
+**Where:** `src/ivf.rs` (`HPSIVF01`)
+
+Spherical k-means over the stored embeddings: assignment is cosine to
+the current centroids, centroids are L2-normalized after each mean
+update, init is a deterministic LCG (no `rand` crate), 25 iterations.
+Default `K ≈ 2√N`, clamped to `[2, min(N/2, 256)]`. Each document is
+assigned to exactly one cluster, so the K posting lists **partition**
+the `doc_id` space.
+
+Each cluster is encoded as an ordinary posting list with `tf = 1` for
+every member — a "term" whose df is the cluster size — including the
+same impact pairs (`max_tf`, `min_len`) and block skip tables BM25 uses.
+A query:
+
+1. dots the (already L2-normalized) query against the K centroids
+   (cheap: K is tens to hundreds, not N);
+2. opens the `nprobe` nearest lists (`nprobe = 0` → `(K/4).clamp(1, 8)`);
+3. concatenates their decoded `doc_id`s — no merge sort, the lists are
+   disjoint.
+
+This is approximate: a document whose cluster is not among the nprobe
+nearest is **invisible to the encoder side**. On the 70-document labeled
+code-eval set, semantic-only Recall@10 dropped 1.0 → 0.906 versus a full
+scan; the hybrid union recovered the misses because BM25 still returned
+them.
+
+**WAND on cluster lists.** The on-disk layout is the same as BM25 so a
+future evaluator *could* skip inside a list. Today we do not, and for a
+good reason: a cluster query is a single "term" (or a tiny OR of nprobe
+terms) with uniform `tf = 1`. WAND's pivot math prunes documents that
+cannot beat θ given the *sum of several term upper bounds*; with one
+list there is nothing to pivot against, and the interesting skip is
+already "do not open the other K − nprobe lists". Scoring then walks
+every member of the opened lists (FP16 dot or PQ-ADC). Treating cluster
+ids as WAND query terms would reconstruct the disjoint concat
+`docs_in_clusters` already does.
+
+The sublinear claim is therefore the same one §1 makes for BM25: we do
+not scan documents outside the probed lists. It is **not** rank-safe —
+unlike Block-Max WAND on BM25, which never drops a document that could
+enter the top-k.
+
+On N = 70 the decode+score overhead lost to a full mmap scan of
+`embeddings.bin`. On 2 500 code chunks (100 clusters) vector scoring
+went 2.53 ms brute-force → 0.76 ms auto-nprobe → 0.31 ms `nprobe=1`.
+
+### Product quantization (ADC)
+
+**Where:** `src/pq.rs` (`HPSPQ001`)
+
+Jégou, Douze & Schmid, TPAMI 2011. Split each 768-d vector into `M = 16`
+subspaces of 48-d. Each subspace is 256-means (1 byte). A document
+becomes 16 bytes instead of 1 536 (FP16) or 3 072 (FP32). Codebooks live
+in the sidecar as FP16; codes are `num_docs × M` raw bytes, `doc_id`-aligned
+with `embeddings.bin`.
+
+Query scoring is **asymmetric distance computation (ADC)**: the query
+stays FP32 (no query quantization error), documents are codes. Per
+query, `prepare` fills `M × 256` tables of `q_sub[m] · codebook[m][c]`;
+scoring a document is 16 table lookups and a sum. That sum approximates
+the same L2-normalized dot `embeddings.cosine` would have computed.
+
+PQ is a *scoring* approximation on whatever IVF (or the full scan)
+already retrieved, not a second index. `--no-pq` falls back to FP16
+dots. This is **not** FAISS IVF-PQ: residuals versus the coarse centroid
+are not quantized, so ADC error is the full reconstruction error, not
+the residual.
+
+On the same 2 500-chunk index, ADC was about 15% *slower* than FP16
+dots (table build versus saved multiplies). End-to-end hybrid stayed
+~9–11 ms because the encoder (~9 ms after Metal warmup) dominates.
+IVF and PQ only start to matter once N is large enough that scanning
+every 768-d row costs more than encoding the query.
+
+#### Training versus assigning
+
+Both quantizers separate *training* (k-means over the corpus) from
+*assigning* (one pass over the resulting centroids per document). This is
+the same split FAISS draws between `train` and `add`, and it is what makes
+`hips`'s watch-driven rebuilds cheap: centroids and codebooks are trained
+once and then reused while the tree is edited, so a rebuild only assigns the
+chunks whose text changed. `ivf.bin` and `pq.bin` therefore double as the
+persisted quantizer — `read_centroids` / `read_codebooks` load them back,
+and `assign_one` / `encode_one` reproduce exactly what training assigned.
+
+Two details make that exactness hold:
+
+- Both k-means loops must end with an **assignment pass against the
+  centroids they return**. A loop that assigns and then updates returns an
+  assignment one step stale, so the stored codes are not the nearest
+  centroids of the stored codebooks and every ADC score is computed against
+  a centroid the encoder would not have picked.
+- `pq.bin` records how many of the 256 codes per subspace were actually
+  trained. With fewer than 256 documents, training fills only part of each
+  codebook, and an encoder that searched all 256 slots would select
+  untrained (all-zero) centroids that training never assigned.
+
+### Fusion
+
+**Where:** `src/hybrid.rs`
+
+Two combiners, both over the **union** of the encoder pool and the BM25
+helper list (ranks are 0 if a document is absent from one side):
+
+- **Weighted** — min-max normalize BM25 over the union (documents with
+  `bm25 = 0` stay 0), then
+  `α · n_bm25 + (1 − α) · cosine`. Cosine is already in `[-1, 1]`.
+- **RRF** — Cormack, Clarke & Buettcher, *"Reciprocal Rank Fusion
+  Outperforms Condorcet and Individual Rank Learning Methods"*, SIGIR
+  2009: `Σ 1 / (k + rank)` over the two lists. Default `k = 60`.
+
+RRF is the CLI default (`--fusion rrf`): it does not require comparable
+raw scores, which BM25 and cosine are not.
+
+### Evaluation
+
+**Where:** `src/eval.rs`, CLI `eval-code`
+
+Labeled metrics against graded qrels (`rel ∈ {3, 2, 1}`):
+
+- **MRR** — `1 / rank` of the first relevant hit (`rel > 0`).
+- **Recall@5 / Recall@10** — fraction of all relevant documents appearing
+  in the top k (ungraded: any `rel > 0` counts).
+- **nDCG@10** — DCG with gain `2^rel − 1` and discount `log2(rank + 1)`,
+  divided by the ideal DCG of the qrel sorted by gain.
+
+IVF and PQ are approximate, so semantic-only recall can drop versus a
+brute-force scan of `embeddings.bin`; hybrid's union is the intended
+backstop. The lexical BMW/MaxScore path remains exact and is still
+pinned against the naive BM25 oracle in the test suite.
+
+### What this is not
+
+- Not HNSW / DiskANN / a graph index. Neighbors are not walked.
+- Not a FAISS / Qdrant / LanceDB deployment. No separate vector service,
+  no residual IVF-PQ, no GPU GEMM over the inverted lists.
+- Not rank-safe on the encoder side. Unopened clusters and quantized
+  codes can change the top-k versus exhaustive cosine.
+- Not wired through segmented indexes or the HTTP API yet.
+- Not on by default: without `--features semantic` the binary is still
+  the lexical engine of §§1–13.

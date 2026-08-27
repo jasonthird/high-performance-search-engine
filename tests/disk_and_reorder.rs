@@ -151,6 +151,62 @@ fn disk_index_returns_identical_results_to_memory_index() {
 }
 
 #[test]
+fn typo_query_is_corrected_to_the_matching_document() {
+    // "pizza" appears in 3 docs (>= MIN_DF), so it is a correction target;
+    // "sushi" appears once and must not be.
+    let docs = vec![
+        InputDoc {
+            id: "d0".into(),
+            title: "Cheap pizza in Montreal".into(),
+            body: "the best pizza montreal has to offer".into(),
+        },
+        InputDoc {
+            id: "d1".into(),
+            title: "Pizza dough guide".into(),
+            body: "how to make pizza dough at home".into(),
+        },
+        InputDoc {
+            id: "d2".into(),
+            title: "Wood fired pizza".into(),
+            body: "a wood fired pizza oven".into(),
+        },
+        InputDoc {
+            id: "d3".into(),
+            title: "Sushi guide".into(),
+            body: "fresh sushi downtown".into(),
+        },
+    ];
+    let index = build_index(&docs, true, DEFAULT_BLOCK_SIZE, ReorderStrategy::None);
+    let dir = temp_dir("typo");
+    save_index(&index, &dir).unwrap();
+    let any = searcher::AnyIndex::open(&dir).unwrap();
+
+    // Misspelled query: rewritten to "pizza" and returns the pizza docs.
+    let outcome = any.search("pizzza", 10);
+    assert_eq!(outcome.corrected.as_deref(), Some("pizza"));
+    assert_eq!(outcome.results.len(), 3);
+    assert!(outcome.results.iter().all(|r| r.id != "d3"));
+
+    // Mixed query: only the misspelled term is rewritten; the in-vocab term
+    // ("montreal", df 2) passes through unchanged and both are re-joined.
+    let mixed = any.search("montreal pizzza", 10);
+    assert_eq!(mixed.corrected.as_deref(), Some("montreal pizza"));
+    assert_eq!(mixed.results[0].id, "d0"); // the doc with both terms ranks first
+
+    // Correctly-spelled query is left untouched.
+    let clean = any.search("pizza", 10);
+    assert_eq!(clean.corrected, None);
+    assert_eq!(clean.results.len(), 3);
+
+    // A typo of a below-MIN_DF term has no correction target: no rewrite.
+    let miss = any.search("sushii", 10);
+    assert_eq!(miss.corrected, None);
+    assert!(miss.results.is_empty());
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn compression_shrinks_postings() {
     let docs = clustered_docs(5000, 23);
     let index = build_index(&docs, true, DEFAULT_BLOCK_SIZE, ReorderStrategy::None);

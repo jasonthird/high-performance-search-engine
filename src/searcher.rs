@@ -3,11 +3,13 @@
 //! Block-Max WAND for short queries, MaxScore for long ones. Both return
 //! provably exact top-k; there is no approximate mode.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::block_max_wand::{self, SearchStats};
 use crate::indexer::SearchableIndex;
 use crate::maxscore;
+use crate::spell::SpellCorrector;
 use crate::tokenizer::Tokenizer;
 
 /// Queries with at least this many unique terms run MaxScore instead of
@@ -28,12 +30,14 @@ pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
     pub stats: SearchStats,
     pub took_ms: f64,
+    /// The rewritten query when typo correction changed it, else None.
+    pub corrected: Option<String>,
 }
 
 /// Tokenize a query and deduplicate terms, preserving first-seen order.
 /// Duplicate query terms would otherwise double-count BM25 contributions.
 pub fn query_terms<I: SearchableIndex + ?Sized>(index: &I, query: &str) -> Vec<String> {
-    let tokenizer = Tokenizer::new(index.remove_stopwords());
+    let tokenizer = Tokenizer::with_flags(index.remove_stopwords(), index.code_mode());
     let mut terms = Vec::new();
     for token in tokenizer.tokenize(query) {
         if !terms.contains(&token) {
@@ -43,50 +47,176 @@ pub fn query_terms<I: SearchableIndex + ?Sized>(index: &I, query: &str) -> Vec<S
     terms
 }
 
-/// A search handle over either layout: a single immutable index or a
-/// segmented (incrementally updatable) one.
-pub enum AnyIndex {
+/// The underlying index layout: a single immutable index or a segmented
+/// (incrementally updatable) one.
+pub enum IndexKind {
     Single(Box<crate::storage::DiskIndex>),
     Segmented(crate::segments::SegmentedIndex),
 }
 
+/// A search handle over either layout, with a lazily-built spelling
+/// corrector for query-time typo correction.
+pub struct AnyIndex {
+    kind: IndexKind,
+    /// Built on the first query that contains an unmatched term; clean
+    /// workloads never pay for it.
+    spell: OnceLock<SpellCorrector>,
+    /// Optional CodeRankEmbed sidecar; hybrid search no-ops without it.
+    embeddings: Option<crate::embeddings::EmbeddingStore>,
+    /// Optional IVF cluster inverted file (same doc_ids as postings).
+    ivf: Option<crate::ivf::IvfIndex>,
+    pq: Option<crate::pq::PqIndex>,
+}
+
 impl AnyIndex {
     pub fn open(dir: &std::path::Path) -> anyhow::Result<Self> {
-        if crate::segments::is_segmented(dir) {
-            Ok(Self::Segmented(crate::segments::SegmentedIndex::open(dir)?))
+        let kind = if crate::segments::is_segmented(dir) {
+            IndexKind::Segmented(crate::segments::SegmentedIndex::open(dir)?)
         } else {
-            Ok(Self::Single(Box::new(crate::storage::load_index(dir)?)))
+            IndexKind::Single(Box::new(crate::storage::load_index(dir)?))
+        };
+        let embeddings = crate::embeddings::EmbeddingStore::open(dir).ok();
+        let ivf = crate::ivf::IvfIndex::open(dir).ok();
+        let pq = crate::pq::PqIndex::open(dir).ok();
+        Ok(Self {
+            kind,
+            spell: OnceLock::new(),
+            embeddings,
+            ivf,
+            pq,
+        })
+    }
+
+    pub fn embeddings(&self) -> Option<&crate::embeddings::EmbeddingStore> {
+        self.embeddings.as_ref()
+    }
+
+    pub fn ivf(&self) -> Option<&crate::ivf::IvfIndex> {
+        self.ivf.as_ref()
+    }
+
+    pub fn pq(&self) -> Option<&crate::pq::PqIndex> {
+        self.pq.as_ref()
+    }
+
+    pub fn kind(&self) -> &IndexKind {
+        &self.kind
+    }
+
+    fn remove_stopwords(&self) -> bool {
+        match &self.kind {
+            IndexKind::Single(index) => index.remove_stopwords(),
+            IndexKind::Segmented(index) => index.remove_stopwords(),
         }
     }
 
+    fn code_mode(&self) -> bool {
+        match &self.kind {
+            IndexKind::Single(index) => {
+                use crate::indexer::SearchableIndex as _;
+                index.code_mode()
+            }
+            IndexKind::Segmented(_) => false,
+        }
+    }
+
+    /// Global document frequency of a term (0 if it matches nothing).
+    fn term_df(&self, term: &str) -> u32 {
+        match &self.kind {
+            IndexKind::Single(index) => index.term_df(term),
+            IndexKind::Segmented(index) => index.term_df(term),
+        }
+    }
+
+    /// The spelling corrector, built from the full vocabulary on first use.
+    fn corrector(&self) -> &SpellCorrector {
+        self.spell.get_or_init(|| {
+            let mut dfs: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            match &self.kind {
+                IndexKind::Single(index) => index.for_each_term(|t, df| {
+                    dfs.insert(t.to_owned(), df);
+                }),
+                // A term recurs once per segment; sum to the global df.
+                IndexKind::Segmented(index) => index.for_each_term(|t, df| {
+                    *dfs.entry(t.to_owned()).or_insert(0) += df;
+                }),
+            }
+            SpellCorrector::build(dfs)
+        })
+    }
+
     pub fn search(&self, query: &str, k: usize) -> SearchOutcome {
-        match self {
-            Self::Single(index) => search(index.as_ref(), query, k),
-            Self::Segmented(index) => index.search(query, k),
+        // Rewrite only terms that match nothing, correcting toward the
+        // closest known vocabulary term. Clean queries pay one df lookup
+        // per term and never build the corrector.
+        let tokenizer = Tokenizer::with_flags(self.remove_stopwords(), self.code_mode());
+        let mut terms: Vec<String> = Vec::new();
+        for token in tokenizer.tokenize(query) {
+            if !terms.contains(&token) {
+                terms.push(token);
+            }
+        }
+        let mut rewritten = Vec::with_capacity(terms.len());
+        let mut changed = false;
+        for term in &terms {
+            if self.term_df(term) == 0 {
+                if let Some(fix) = self.corrector().correct(term) {
+                    rewritten.push(fix.to_owned());
+                    changed = true;
+                    continue;
+                }
+            }
+            rewritten.push(term.clone());
+        }
+
+        if changed {
+            let new_query = rewritten.join(" ");
+            let mut outcome = self.search_raw(&new_query, k);
+            outcome.corrected = Some(new_query);
+            outcome
+        } else {
+            self.search_raw(query, k)
+        }
+    }
+
+    fn search_raw(&self, query: &str, k: usize) -> SearchOutcome {
+        match &self.kind {
+            IndexKind::Single(index) => search(index.as_ref(), query, k),
+            IndexKind::Segmented(index) => index.search(query, k),
         }
     }
 
     pub fn num_docs(&self) -> u64 {
-        match self {
-            Self::Single(index) => {
+        match &self.kind {
+            IndexKind::Single(index) => {
                 use crate::indexer::SearchableIndex as _;
                 index.num_docs() as u64
             }
-            Self::Segmented(index) => index.num_docs_live(),
+            IndexKind::Segmented(index) => index.num_docs_live(),
         }
     }
 
     pub fn size_bytes(&self) -> u64 {
-        match self {
-            Self::Single(index) => index.size_bytes(),
-            Self::Segmented(index) => index.size_bytes(),
+        match &self.kind {
+            IndexKind::Single(index) => index.size_bytes(),
+            IndexKind::Segmented(index) => index.size_bytes(),
+        }
+    }
+
+    pub fn as_single(&self) -> Option<&crate::storage::DiskIndex> {
+        match &self.kind {
+            IndexKind::Single(index) => Some(index.as_ref()),
+            IndexKind::Segmented(_) => None,
         }
     }
 }
 
-/// Run a query through Block-Max WAND and resolve internal doc_ids to
-/// external document metadata.
-pub fn search<I: SearchableIndex + ?Sized>(index: &I, query: &str, k: usize) -> SearchOutcome {
+/// Exact BM25 top-k as internal doc_ids (used by hybrid reranking).
+pub fn search_hits<I: SearchableIndex + ?Sized>(
+    index: &I,
+    query: &str,
+    k: usize,
+) -> (Vec<crate::block_max_wand::SearchHit>, SearchStats, f64) {
     let terms = query_terms(index, query);
     let start = Instant::now();
     let (hits, stats) = if terms.len() >= MAXSCORE_MIN_TERMS {
@@ -95,6 +225,13 @@ pub fn search<I: SearchableIndex + ?Sized>(index: &I, query: &str, k: usize) -> 
         block_max_wand::search(index, &terms, k)
     };
     let took_ms = start.elapsed().as_secs_f64() * 1000.0;
+    (hits, stats, took_ms)
+}
+
+/// Run a query through Block-Max WAND and resolve internal doc_ids to
+/// external document metadata.
+pub fn search<I: SearchableIndex + ?Sized>(index: &I, query: &str, k: usize) -> SearchOutcome {
+    let (hits, stats, took_ms) = search_hits(index, query, k);
 
     let results = hits
         .into_iter()
@@ -112,6 +249,7 @@ pub fn search<I: SearchableIndex + ?Sized>(index: &I, query: &str, k: usize) -> 
         results,
         stats,
         took_ms,
+        corrected: None,
     }
 }
 

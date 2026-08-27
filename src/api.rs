@@ -13,7 +13,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::searcher::AnyIndex;
+use crate::searcher::{AnyIndex, IndexKind};
 
 struct AppState {
     index: AnyIndex,
@@ -28,6 +28,8 @@ struct SearchParams {
 #[derive(Serialize)]
 struct SearchResponse {
     query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corrected: Option<String>,
     took_ms: f64,
     num_docs_total: usize,
     num_query_terms: usize,
@@ -71,6 +73,7 @@ async fn search_handler(
 
     Json(SearchResponse {
         query,
+        corrected: outcome.corrected.clone(),
         took_ms: outcome.took_ms,
         num_docs_total: outcome.stats.num_docs_total,
         num_query_terms: outcome.stats.num_query_terms,
@@ -91,12 +94,12 @@ async fn search_handler(
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
-    let (num_terms, avg_doc_len) = match &state.index {
-        AnyIndex::Single(index) => {
+    let (num_terms, avg_doc_len) = match state.index.kind() {
+        IndexKind::Single(index) => {
             use crate::indexer::SearchableIndex as _;
             (index.num_terms(), index.avg_doc_len())
         }
-        AnyIndex::Segmented(_) => (0, 0.0),
+        IndexKind::Segmented(_) => (0, 0.0),
     };
     Json(StatsResponse {
         num_docs: state.index.num_docs() as usize,

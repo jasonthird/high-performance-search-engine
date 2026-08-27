@@ -20,6 +20,8 @@
 !/data/home_queries.txt
 !/data/wiki_queries.txt
 !/data/enwiki_queries.txt
+!/data/code_eval/
+!/data/code_eval/**
 
 # Logs
 *.log

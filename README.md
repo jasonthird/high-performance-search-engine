@@ -1,7 +1,7 @@
 # High-Performance Search Engine
 
-A single-node, Elasticsearch-like **full-text search engine written in Rust
-from scratch** — no Tantivy, Lucene, or any other search-engine crate. It indexes
+A single-node **full-text search engine written in Rust from scratch** — no
+Tantivy, Lucene, or any other search-engine crate. It indexes
 JSONL documents into an inverted index and answers top-k queries with **BM25
 scoring executed by exact Block-Max WAND**, over **compressed
 (delta + bit-packed), memory-mapped posting lists** with optional
@@ -19,10 +19,10 @@ documented in [docs/THEORY.md](docs/THEORY.md).
 
 ## Status
 
-This is an educational and experimental search engine, not a drop-in
-Elasticsearch replacement. It is useful for learning how modern lexical search
-works end to end: indexing, compression, memory-mapped storage, exact dynamic
-pruning, batch updates, benchmarking, and a small HTTP API.
+This is an educational and experimental search engine, not a production
+search service. It is useful for learning how modern lexical search works end
+to end: indexing, compression, memory-mapped storage, exact dynamic pruning,
+batch updates, benchmarking, and a small HTTP API.
 
 ## Requirements
 
@@ -55,8 +55,8 @@ cargo run --release -- repl --index ./index --top-k 10
 
 ## Project layout
 
-- `src/cli.rs` - command routing for `index`, `search`, `repl`, `serve`,
-  `bench`, `add`, `delete`, `merge`, and `migrate`.
+- `src/cli.rs` - command routing for `index`, `index-repo`, `search`, `mcp`,
+  `repl`, `serve`, `bench`, `add`, `delete`, `merge`, and `migrate`.
 - `src/indexer.rs`, `src/postings.rs`, `src/compress.rs` - JSONL ingestion,
   inverted-index construction, block metadata, and bit-packed postings.
 - `src/searcher.rs`, `src/block_max_wand.rs`, `src/maxscore.rs`,
@@ -64,6 +64,10 @@ cargo run --release -- repl --index ./index --top-k 10
 - `src/storage.rs`, `src/segments.rs`, `src/external.rs` - on-disk format,
   memory mapping, segmented updates, and sharded external builds.
 - `src/api.rs` - Axum HTTP API.
+- `src/repo.rs`, `src/codeindex.rs` - source-tree ingestion: gitignore-aware
+  walking, declaration chunking with line numbers, and atomic rebuilds.
+- `src/mcp.rs`, `src/watch.rs`, `src/embcache.rs` - MCP server over stdio,
+  filesystem watching, and the content-keyed embedding cache.
 - `docs/THEORY.md` - algorithm notes and paper references.
 - `tests/` - correctness checks against naive BM25 oracles and persistence
   tests.
@@ -188,6 +192,10 @@ Input is JSONL, one document per line:
 Indexing is multithreaded: documents are parsed and tokenized in parallel,
 partial inverted indexes are built per worker chunk, then merged; final
 posting lists are sorted by `doc_id` and block metadata is computed last.
+
+`--code` enables a code-oriented tokenizer: each identifier is stored as
+a whole (so `getUserByOrganizationId` still matches exactly) and also
+split on camelCase, snake_case, SCREAMING_SNAKE_CASE, and dotted paths.
 
 `--title-weight N` (default 2) applies BM25F-lite field weighting: each
 title occurrence of a term counts as N occurrences in the folded tf, so
@@ -345,6 +353,173 @@ And on a 108k-document corpus (a crawled home directory, 679 MB of text,
 | Index size | 104 MB total (32 MB postings = 1.67 B/posting, 25 MB metadata, 46 MB doc store) |
 | Index load | ~20 ms; search process RSS ~43 MB (postings + docs mmap'd) |
 
+### Experimental: hybrid code search (BM25 + CodeRankEmbed)
+
+The lexical engine is unchanged. Behind `--features semantic` you can
+precompute one [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed)
+vector per document (Candle on Metal/CPU, no Python) and rerank the BM25 candidate
+list. `--mode hybrid` is **embedding-first**: the encoder probes `ivf.bin`
+cluster posting lists (same inverted-file layout and `doc_id`s as BM25),
+then BM25 is a helper on the union. `--nprobe` controls how many
+clusters to open. `--mode rerank` is BM25-then-cosine. `--mode semantic`
+is encoder-only through IVF (full scan if `ivf.bin` is missing).
+
+```sh
+cargo build --release --features semantic
+
+# 1. one index directory: inverted postings + CodeRankEmbed vectors
+#    (same internal doc_ids; downloads ~550 MB of weights on first run)
+./target/release/hips index \
+  --input data/code_eval/corpus.jsonl --out ./index-code --code --embed
+
+# 2. search
+./target/release/hips search \
+  --index ./index-code --query "retry failed HTTP requests" \
+  --mode hybrid --semantic-candidates 200 --fusion rrf --top-k 10
+
+# 3. labeled eval (BM25 vs semantic-only vs hybrid)
+./target/release/hips eval-code \
+  --index ./index-code \
+  --queries data/code_eval/queries.tsv \
+  --qrels data/code_eval/qrels.tsv
+
+# 4. latency breakdown (candidate sweep)
+./target/release/hips bench \
+  --index ./index-code --queries data/code_eval/queries.txt \
+  --mode hybrid --candidate-sweep 50,100,200,500,1000
+```
+
+Queries use the model's required prefix (`Represent this query for
+searching relevant code: `) inside the embedder; documents are encoded
+as raw code. Vectors are stored as memory-mapped FP16, 768-d,
+L2-normalized. Score fusion is either min-max weighted BM25+cosine
+(`--fusion weighted --alpha 0.5`) or reciprocal rank fusion
+(`--fusion rrf`).
+
+To index a real source tree, use `index-repo` (below) rather than
+`scripts/code_to_jsonl.py` — the script is kept only for reproducing the
+eval corpus, and its ids carry no line numbers.
+
+### Code search in a codebase: `index-repo` and the MCP server
+
+`index-repo` walks a repository the way git does — honouring nested
+`.gitignore` files, skipping `target/`, `node_modules/`, symlinks, and
+non-source files — and splits each file into declaration-sized chunks that
+**keep their line numbers**. A document id is therefore a location:
+`src/searcher.rs:120-165`.
+
+```sh
+cargo build --release --features semantic
+cargo install --path . --features semantic   # installs `hips`
+
+# Index the current repository. Hybrid by default; --lexical skips the
+# model download and builds in seconds instead of a minute. A binary built
+# without `--features semantic` falls back to lexical with a warning.
+hips index-repo --root .
+```
+
+The index is written under `~/.cache/csearch/<repo>-<hash>/`, never into the
+repository being indexed (`--index` overrides, `CSEARCH_CACHE_DIR` moves the
+cache root).
+
+Search it without knowing where the index went — `--root` resolves to the
+same per-repo location `index-repo` used:
+
+```sh
+hips search --root . --query "where do we validate auth tokens" --mode hybrid
+```
+
+`hips mcp` serves that index to an MCP client over stdio, exposing three
+tools: `search_code` (ranked chunks with `path:line` locations, an optional
+`path_glob`, and fenced snippets), `index_status`, and `reindex`.
+
+```sh
+# Register with Claude Code, scoped to the current project:
+claude mcp add hips -- hips mcp --root "$PWD"
+```
+
+```jsonc
+// ...or by hand, in an MCP client config:
+{
+  "mcpServers": {
+    "hips": {
+      "command": "hips",
+      "args": ["mcp", "--root", "/path/to/repo"]
+    }
+  }
+}
+```
+
+**Staying fresh.** The server watches the tree (FSEvents / inotify) and marks
+it dirty on any change to an indexable file; the *next* tool call rebuilds
+before answering. Rebuilding rather than appending a segment is forced by the
+layout: `embeddings.bin` is keyed positionally by `doc_id`, and a rebuild
+reassigns every `doc_id`.
+
+Three caches make a rebuild proportional to the edit rather than to the
+repository:
+
+- **Vectors.** `embcache.bin` keys FP16 embeddings by a hash of the chunk
+  text, so only chunks whose content changed are re-encoded (~65 ms each).
+- **Quantization.** The IVF centroids and PQ codebooks are *trained once* and
+  reused: k-means for IVF plus 16 x 256-centroid k-means for PQ costs ~1 s on
+  a small repo and scales with the corpus, yet none of it depends on which
+  chunk changed. A rebuild reads the trained parameters back out of `ivf.bin`
+  and `pq.bin` and only quantizes chunks it has no cached code for — one pass
+  over the centroids and codebooks each, microseconds. Cached codes are
+  tagged with a hash of the parameters that produced them, so retraining
+  invalidates them automatically. Retraining happens on the first build, when
+  the ideal cluster count has drifted more than 2x, or on demand
+  (`--retrain`, or `reindex` with `{"retrain": true}`).
+- **Chunking.** Files are read and split in parallel across cores.
+
+Measured on this repository (812 chunks, 46 files) and on the whole crates.io
+source cache (358k chunks, 15k files) — Apple M-series, 8 cores:
+
+```
+                                        this repo     crates.io cache
+first build (encodes every chunk)          ~60 s              (n/a)
+rebuild, nothing changed                   0.02 s             2.4 s
+edit -> next query, in-server            55-95 ms              --
+steady-state hybrid query                   11 ms              --
+```
+
+The 55-95 ms is everything: watcher wakeup, re-chunking the tree, encoding
+the one changed chunk on the GPU, re-quantizing it, rewriting the index, and
+running the search. Before the quantizer was made reusable this was ~1.1 s,
+essentially all of it retraining quantizers over unchanged data.
+
+At the crates.io scale the remaining 2.4 s is dominated by tokenizing all
+358k chunks (1.7 s), which a single-index layout has to redo in full; that is
+the price of keeping `embeddings.bin` positionally keyed. Real single repos
+sit at the left-hand column. `CSEARCH_TIMING=1` prints the per-phase
+breakdown.
+
+**Scoring path.** Product quantization is enabled per query rather than
+always-on, because it is a fixed cost (building `M x 256` lookup tables)
+plus almost nothing per document, while exact scoring is a per-document dot
+product. Measured with `cargo run --release --example pq_scoring_bench`:
+
+```
+candidates   exact FP16   f32 ceiling      PQ/ADC
+       100        118 us         65 us      462 us
+     1 000        1.2 ms        631 us      441 us
+    10 000       13.5 ms        6.8 ms      489 us
+   200 000        298 ms        152 ms      1.9 ms
+```
+
+Break-even is near 630 candidates, so ADC is used only above
+`pq::MIN_CANDIDATES` (900, deliberately above break-even — below it PQ costs
+recall and saves nothing). A query's candidate count is estimated from the
+IVF geometry, `num_docs * nprobe / num_clusters`, which puts the switch-over
+around 20k chunks at the default `nprobe`. `--no-pq` forces exact scoring.
+
+Deferring the rebuild to query time also means a burst of edits (a branch
+switch, a formatter run) costs one rebuild rather than one per file, and
+keeps the encoder on the thread whose Metal pipelines are already warm.
+Rebuilds are atomic: the new index is staged in a sibling directory and
+swapped in, so a concurrent reader never sees it half-written.
+
 ### Run the tests
 
 ```sh
@@ -400,10 +575,10 @@ segment, dropping tombstones — after which scores are identical to a
 fresh build of the live documents (verified by test).
 
 ```sh
-high-performance-search-engine add    --index ./idx --input batch1.jsonl
-high-performance-search-engine add    --index ./idx --input batch2.jsonl --upsert  # change-detecting
-high-performance-search-engine delete --index ./idx --id doc-123
-high-performance-search-engine merge  --index ./idx
+hips add    --index ./idx --input batch1.jsonl
+hips add    --index ./idx --input batch2.jsonl --upsert  # change-detecting
+hips delete --index ./idx --id doc-123
+hips merge  --index ./idx
 ```
 
 `--upsert` answers "which documents changed?" inside the engine: every
@@ -419,7 +594,9 @@ deviation, shared with Lucene: df counts tombstoned documents until a
 merge removes them. `search`/`serve` open both layouts transparently;
 `migrate` upgrades pre-v4 indexes in place.
 
-## Limitations compared to Elasticsearch
+## Limitations
+
+What this engine deliberately does not do:
 
 - single-node only
 - no distributed shards
@@ -429,8 +606,9 @@ merge removes them. `search`/`serve` open both layouts transparently;
 - no autocomplete
 - no aggregations
 - no advanced analyzers (no stemming, no synonyms, no language-specific analysis)
-- no vectors
-- no semantic search
+- no distributed vector search / HNSW (an optional encoder-first hybrid
+  — CodeRankEmbed + IVF cluster postings + PQ, same `doc_id`s as BM25 —
+  lives behind `--features semantic`; it is not a vector database)
 - no highlighting
 - no relevance tuning beyond BM25
 

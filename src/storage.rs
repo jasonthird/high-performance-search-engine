@@ -119,6 +119,7 @@ const NUM_SECTIONS: usize = 14;
 pub(crate) struct MetaSections {
     pub avg_doc_len: f32,
     pub remove_stopwords: bool,
+    pub code_mode: bool,
     pub block_size: u32,
     pub doc_lens: Vec<u32>,
     pub doc_offsets: Vec<u64>,
@@ -218,7 +219,14 @@ pub(crate) fn write_meta(
     w.write_all(&(meta.doc_lens.len() as u64).to_le_bytes())?;
     w.write_all(&(meta.term_dfs.len() as u64).to_le_bytes())?;
     w.write_all(&(meta.block_size as u64).to_le_bytes())?;
-    w.write_all(&(u64::from(meta.remove_stopwords)).to_le_bytes())?;
+    // Bit 0 = stopwords, bit 1 = code-oriented tokenizer. Extra bits are
+    // ignored by older readers of this field as a boolean, so existing
+    // indexes (0 or 1) stay compatible.
+    let mut flags = u64::from(meta.remove_stopwords);
+    if meta.code_mode {
+        flags |= 2;
+    }
+    w.write_all(&flags.to_le_bytes())?;
     w.write_all(&(meta.avg_doc_len.to_bits() as u64).to_le_bytes())?;
     for (off, len) in &table {
         w.write_all(&off.to_le_bytes())?;
@@ -264,6 +272,7 @@ pub struct DiskIndex {
     num_terms: usize,
     block_size: usize,
     remove_stopwords: bool,
+    code_mode: bool,
     avg_doc_len: f32,
     sections: [(u64, u64); NUM_SECTIONS],
 }
@@ -354,6 +363,7 @@ pub fn save_index(index: &Index, dir: &Path) -> anyhow::Result<u64> {
     let meta = MetaSections {
         avg_doc_len: index.avg_doc_len(),
         remove_stopwords: index.remove_stopwords(),
+        code_mode: index.code_mode(),
         block_size: block_size as u32,
         doc_lens: index.docs().iter().map(|d| d.doc_len).collect(),
         doc_offsets,
@@ -400,7 +410,9 @@ pub fn load_index(dir: &Path) -> anyhow::Result<DiskIndex> {
     let num_docs = u64_at(16) as usize;
     let num_terms = u64_at(24) as usize;
     let block_size = u64_at(32) as usize;
-    let remove_stopwords = u64_at(40) != 0;
+    let flags = u64_at(40);
+    let remove_stopwords = flags & 1 != 0;
+    let code_mode = flags & 2 != 0;
     let avg_doc_len = f32::from_bits(u64_at(48) as u32);
     let mut sections = [(0u64, 0u64); NUM_SECTIONS];
     for (i, s) in sections.iter_mut().enumerate() {
@@ -418,6 +430,7 @@ pub fn load_index(dir: &Path) -> anyhow::Result<DiskIndex> {
         num_terms,
         block_size,
         remove_stopwords,
+        code_mode,
         avg_doc_len,
         sections,
     })
@@ -520,6 +533,40 @@ impl DiskIndex {
             current.extend_from_slice(suffix);
         }
         String::from_utf8_lossy(&current).into_owned()
+    }
+
+    /// Stream every (term, document frequency) pair in one linear pass over
+    /// the front-coded dictionary. Used to seed the spelling corrector's
+    /// vocabulary; terms are valid UTF-8 by construction.
+    pub fn for_each_term(&self, mut f: impl FnMut(&str, u32)) {
+        let groups = self.u32s(S_DICT_GROUPS);
+        let dict = self.section(S_DICT_BYTES);
+        let name_to_slot = self.u32s(S_NAME_TO_SLOT);
+        let term_dfs = self.u32s(S_TERM_DFS);
+        let num_groups = groups.len().saturating_sub(1);
+        let mut rank = 0usize;
+        let mut current: Vec<u8> = Vec::new();
+        for g in 0..num_groups {
+            let head = self.group_head(dict, groups, g);
+            current.clear();
+            current.extend_from_slice(head);
+            let mut pos = groups[g] as usize + 2 + head.len();
+            let end = groups[g + 1] as usize;
+            loop {
+                let slot = name_to_slot[rank] as usize;
+                f(&String::from_utf8_lossy(&current), term_dfs[slot]);
+                rank += 1;
+                if pos >= end {
+                    break;
+                }
+                let lcp = dict[pos] as usize;
+                let suffix_len = u16::from_le_bytes([dict[pos + 1], dict[pos + 2]]) as usize;
+                let suffix = &dict[pos + 3..pos + 3 + suffix_len];
+                pos += 3 + suffix_len;
+                current.truncate(lcp);
+                current.extend_from_slice(suffix);
+            }
+        }
     }
 
     /// Resolve an external id to its doc_id via the hash sidecar
@@ -629,6 +676,10 @@ impl SearchableIndex for DiskIndex {
 
     fn remove_stopwords(&self) -> bool {
         self.remove_stopwords
+    }
+
+    fn code_mode(&self) -> bool {
+        self.code_mode
     }
 
     fn doc_len(&self, doc_id: u32) -> u32 {

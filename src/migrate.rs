@@ -139,6 +139,7 @@ pub fn migrate_v3_to_v4(dir: &Path) -> anyhow::Result<usize> {
     let sections = MetaSections {
         avg_doc_len,
         remove_stopwords,
+        code_mode: false,
         block_size: block_size as u32,
         doc_lens,
         doc_offsets,

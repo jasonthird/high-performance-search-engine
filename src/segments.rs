@@ -225,6 +225,24 @@ impl SegmentedIndex {
         self.segments.iter().map(|s| s.index.size_bytes()).sum()
     }
 
+    pub fn remove_stopwords(&self) -> bool {
+        self.manifest.remove_stopwords
+    }
+
+    /// Global document frequency of a term (summed across all segments,
+    /// tombstones included, matching the idf statistics used at search time).
+    pub fn term_df(&self, term: &str) -> u32 {
+        self.segments.iter().map(|s| s.index.term_df(term)).sum()
+    }
+
+    /// Stream (term, per-segment df) pairs across every segment. The same
+    /// term recurs once per segment it appears in; the caller sums the dfs.
+    pub fn for_each_term(&self, mut f: impl FnMut(&str, u32)) {
+        for seg in &self.segments {
+            seg.index.for_each_term(|t, df| f(t, df));
+        }
+    }
+
     fn global_stats(&self) -> (usize, f32) {
         let live_docs: u64 = self.num_docs_live();
         let live_len: u64 = self.segments.iter().map(|s| s.entry.live_len).sum();
@@ -326,6 +344,7 @@ impl SegmentedIndex {
             results,
             stats,
             took_ms: start.elapsed().as_secs_f64() * 1000.0,
+            corrected: None,
         }
     }
 }
@@ -666,6 +685,7 @@ impl SegmentedWriter {
                 total_len as f32 / num_docs as f32
             },
             remove_stopwords: self.manifest.remove_stopwords,
+            code_mode: false,
             block_size: block_size as u32,
             doc_lens,
             doc_offsets,

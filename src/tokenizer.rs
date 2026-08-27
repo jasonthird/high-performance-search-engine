@@ -9,9 +9,12 @@ const STOPWORDS: &[&str] = &[
     "they", "this", "to", "was", "will", "with",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Tokenizer {
     remove_stopwords: bool,
+    /// When set, identifiers are indexed both as a whole (so exact names
+    /// still match) and as camelCase / snake_case / dotted components.
+    code_mode: bool,
 }
 
 impl Default for Tokenizer {
@@ -22,7 +25,28 @@ impl Default for Tokenizer {
 
 impl Tokenizer {
     pub fn new(remove_stopwords: bool) -> Self {
-        Self { remove_stopwords }
+        Self {
+            remove_stopwords,
+            code_mode: false,
+        }
+    }
+
+    /// Enable or disable the code-oriented analyzer. Queries must use the
+    /// same setting the index was built with.
+    pub fn code(mut self, on: bool) -> Self {
+        self.code_mode = on;
+        self
+    }
+
+    pub fn with_flags(remove_stopwords: bool, code_mode: bool) -> Self {
+        Self {
+            remove_stopwords,
+            code_mode,
+        }
+    }
+
+    pub fn code_mode(&self) -> bool {
+        self.code_mode
     }
 
     /// Tokenize a text into lowercase alphanumeric tokens.
@@ -38,6 +62,10 @@ impl Tokenizer {
     /// sequence instead of 16 byte-loops); non-ASCII characters and other
     /// architectures take the scalar path.
     pub fn for_each_token(&self, text: &str, mut f: impl FnMut(&str)) {
+        if self.code_mode {
+            self.for_each_code_token(text, &mut f);
+            return;
+        }
         let mut token = String::with_capacity(32);
         let bytes = text.as_bytes();
         let mut i = 0;
@@ -106,6 +134,133 @@ impl Tokenizer {
         }
         token.clear();
     }
+
+    /// Code analyzer: keep each identifier intact (lowercased) and also
+    /// emit its camelCase / snake_case / dotted pieces so both
+    /// `getUserByOrganizationId` and "get user organization" retrieve it.
+    fn for_each_code_token(&self, text: &str, f: &mut impl FnMut(&str)) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let ch = text[i..].chars().next().expect("char boundary");
+            let len = ch.len_utf8();
+            if is_ident_start(ch) {
+                let start = i;
+                i += len;
+                while i < bytes.len() {
+                    let c = text[i..].chars().next().expect("char boundary");
+                    if is_ident_continue(c) {
+                        i += c.len_utf8();
+                    } else if c == '.' {
+                        let next = text[i + 1..].chars().next();
+                        if next.is_some_and(is_ident_start) {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.emit_ident(&text[start..i], f);
+            } else if ch.is_alphanumeric() {
+                let start = i;
+                i += len;
+                while i < bytes.len() {
+                    let c = text[i..].chars().next().expect("char boundary");
+                    if c.is_alphanumeric() {
+                        i += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                let mut lower = String::new();
+                for c in text[start..i].chars() {
+                    lower.extend(c.to_lowercase());
+                }
+                self.emit_maybe_stop(&lower, f);
+            } else {
+                i += len;
+            }
+        }
+    }
+
+    fn emit_ident(&self, span: &str, f: &mut impl FnMut(&str)) {
+        let full = span.to_lowercase();
+        // Never drop the original identifier: exact-name BM25 depends on it.
+        if !full.is_empty() {
+            f(&full);
+        }
+        for dotted in span.split('.') {
+            if dotted.is_empty() {
+                continue;
+            }
+            let dotted_lower = dotted.to_lowercase();
+            if dotted_lower != full {
+                self.emit_maybe_stop(&dotted_lower, f);
+            }
+            for snake in dotted.split('_') {
+                if snake.is_empty() {
+                    continue;
+                }
+                let snake_lower = snake.to_lowercase();
+                if snake_lower != full && snake_lower != dotted_lower {
+                    self.emit_maybe_stop(&snake_lower, f);
+                }
+                for part in camel_parts(snake) {
+                    if part != snake_lower && part != full && part != dotted_lower {
+                        self.emit_maybe_stop(&part, f);
+                    }
+                }
+            }
+        }
+    }
+
+    fn emit_maybe_stop(&self, token: &str, f: &mut impl FnMut(&str)) {
+        if token.is_empty() {
+            return;
+        }
+        if self.remove_stopwords && STOPWORDS.contains(&token) {
+            return;
+        }
+        f(token);
+    }
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch.is_alphabetic() || ch == '_'
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// Split an underscore-free identifier on camelCase / PascalCase / digits.
+/// `XMLHttpRequest` -> ["xml", "http", "request"].
+fn camel_parts(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for i in 1..chars.len() {
+        let prev = chars[i - 1];
+        let curr = chars[i];
+        let next = chars.get(i + 1).copied();
+        let split = (prev.is_lowercase() && curr.is_uppercase())
+            || (prev.is_uppercase()
+                && curr.is_uppercase()
+                && next.is_some_and(|n| n.is_lowercase()))
+            || (prev.is_alphabetic() && curr.is_ascii_digit())
+            || (prev.is_ascii_digit() && curr.is_alphabetic());
+        if split {
+            parts.push(chars[start..i].iter().collect::<String>().to_lowercase());
+            start = i;
+        }
+    }
+    parts.push(chars[start..].iter().collect::<String>().to_lowercase());
+    parts
 }
 
 /// NEON classification of one all-ASCII 16-byte chunk.
@@ -248,5 +403,96 @@ mod tests {
             tok.tokenize("the best pizza in the city"),
             vec!["best", "pizza", "city"]
         );
+    }
+
+    fn code_tok(stop: bool) -> Tokenizer {
+        Tokenizer::new(stop).code(true)
+    }
+
+    #[test]
+    fn camel_case_keeps_full_identifier_and_parts() {
+        let tok = code_tok(false);
+        let tokens = tok.tokenize("getUserByOrganizationId");
+        assert!(
+            tokens.contains(&"getuserbyorganizationid".into()),
+            "{tokens:?}"
+        );
+        for part in ["get", "user", "by", "organization", "id"] {
+            assert!(tokens.contains(&part.to_string()), "missing {part} in {tokens:?}");
+        }
+    }
+
+    #[test]
+    fn snake_case_keeps_full_identifier_and_parts() {
+        let tok = code_tok(false);
+        let tokens = tok.tokenize("get_user_by_organization_id");
+        assert!(tokens.contains(&"get_user_by_organization_id".into()));
+        for part in ["get", "user", "by", "organization", "id"] {
+            assert!(tokens.contains(&part.to_string()), "missing {part} in {tokens:?}");
+        }
+    }
+
+    #[test]
+    fn screaming_snake_and_pascal_and_dotted_paths() {
+        let tok = code_tok(false);
+        let scream = tok.tokenize("GET_USER_BY_ORGANIZATION_ID");
+        assert!(scream.contains(&"get_user_by_organization_id".into()));
+        assert!(scream.contains(&"organization".into()));
+
+        let pascal = tok.tokenize("UserService");
+        assert!(pascal.contains(&"userservice".into()));
+        assert!(pascal.contains(&"user".into()));
+        assert!(pascal.contains(&"service".into()));
+
+        let dotted = tok.tokenize("std.collections.HashMap");
+        assert!(dotted.contains(&"std.collections.hashmap".into()));
+        assert!(dotted.contains(&"std".into()));
+        assert!(dotted.contains(&"collections".into()));
+        assert!(dotted.contains(&"hashmap".into()));
+        assert!(dotted.contains(&"hash".into()));
+        assert!(dotted.contains(&"map".into()));
+    }
+
+    #[test]
+    fn acronym_split_xml_http_request() {
+        let tok = code_tok(false);
+        let tokens = tok.tokenize("XMLHttpRequest");
+        assert!(tokens.contains(&"xmlhttprequest".into()));
+        assert!(tokens.contains(&"xml".into()));
+        assert!(tokens.contains(&"http".into()));
+        assert!(tokens.contains(&"request".into()));
+    }
+
+    #[test]
+    fn code_mode_does_not_drop_full_identifier_stopword_parts() {
+        // "by" is a stopword; the full identifier must still be indexed.
+        let tok = code_tok(true);
+        let tokens = tok.tokenize("getUserByOrganizationId");
+        assert!(tokens.contains(&"getuserbyorganizationid".into()));
+        assert!(!tokens.contains(&"by".into()));
+        assert!(tokens.contains(&"user".into()));
+    }
+
+    #[test]
+    fn default_tokenizer_still_splits_on_underscores() {
+        let tok = Tokenizer::new(false);
+        assert_eq!(
+            tok.tokenize("get_user_id"),
+            vec!["get", "user", "id"]
+        );
+        assert!(!tok.tokenize("get_user_id").contains(&"get_user_id".into()));
+    }
+
+    #[test]
+    fn camel_parts_helper() {
+        assert_eq!(
+            camel_parts("getUserByOrganizationId"),
+            vec!["get", "user", "by", "organization", "id"]
+        );
+        assert_eq!(
+            camel_parts("HTTPSConnection"),
+            vec!["https", "connection"]
+        );
+        assert_eq!(camel_parts("utf8Parser"), vec!["utf", "8", "parser"]);
     }
 }

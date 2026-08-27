@@ -336,6 +336,7 @@ pub fn build_index_external(
     let meta = MetaSections {
         avg_doc_len,
         remove_stopwords,
+        code_mode: false,
         block_size: block_size as u32,
         doc_lens,
         doc_offsets,

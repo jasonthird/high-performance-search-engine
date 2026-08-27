@@ -1,0 +1,30 @@
+getUserByOrganizationId
+validate_session
+retry_policy
+rollback_transaction
+jwt_validation_middleware
+where do we check if the user's session has expired?
+how do we verify a JSON web token on incoming requests?
+find the code that looks up a user given their organization
+where are passwords hashed before storing them?
+how do we stop too many requests from one client?
+retry failed HTTP requests
+exponential backoff for network errors
+cache invalidation after writes
+dead letter queue for failed jobs
+circuit breaker for downstream HTTP
+database transaction rollback
+JWT validation middleware
+RBAC permission check
+LRU cache eviction
+bcrypt password verification
+middleware that validates JWTs
+HTTP retry with backoff
+session token expiry check
+user organization membership lookup
+transactional commit and rollback
+acquire a redis distributed lock
+presign an S3 upload URL
+send a welcome email to a new user
+parse a pagination cursor
+haversine distance between coordinates

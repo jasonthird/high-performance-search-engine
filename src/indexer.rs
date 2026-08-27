@@ -36,6 +36,11 @@ pub trait SearchableIndex: Sync {
     fn num_terms(&self) -> usize;
     fn avg_doc_len(&self) -> f32;
     fn remove_stopwords(&self) -> bool;
+    /// Code-oriented analyzer (camelCase / snake_case splits). Default off
+    /// so existing indexes and the segmented path stay unchanged.
+    fn code_mode(&self) -> bool {
+        false
+    }
     /// Length in tokens of one document (the only per-doc fact scoring needs).
     fn doc_len(&self, doc_id: u32) -> u32;
     /// External id and title of one document (only fetched for the top-k
@@ -97,8 +102,15 @@ pub struct Index {
     posting_lists: Vec<PostingList>,
     /// Tokenizer setting used at index time; queries must match it.
     remove_stopwords: bool,
+    /// Code-oriented analyzer used at index time; queries must match it.
+    #[serde(default)]
+    code_mode: bool,
     /// Postings per block (fixed for the whole index).
     block_size: usize,
+    /// Full title+body in `doc_id` order, only when the builder was asked
+    /// to keep text for CodeRankEmbed. Never written to docs.bin.
+    #[serde(skip)]
+    embed_texts: Option<Vec<String>>,
 }
 
 impl Index {
@@ -125,6 +137,16 @@ impl Index {
     pub fn block_size(&self) -> usize {
         self.block_size
     }
+
+    /// Take the in-memory bodies reserved for embedding (same order as
+    /// internal doc_ids / posting lists).
+    pub fn take_embed_texts(&mut self) -> Option<Vec<String>> {
+        self.embed_texts.take()
+    }
+
+    pub fn code_mode(&self) -> bool {
+        self.code_mode
+    }
 }
 
 impl SearchableIndex for Index {
@@ -142,6 +164,10 @@ impl SearchableIndex for Index {
 
     fn remove_stopwords(&self) -> bool {
         self.remove_stopwords
+    }
+
+    fn code_mode(&self) -> bool {
+        self.code_mode
     }
 
     fn doc_len(&self, doc_id: u32) -> u32 {
@@ -258,8 +284,9 @@ impl Interner {
 }
 
 /// One tokenized document: metadata plus its distinct (term_id, tf) pairs —
-/// 8 bytes per posting instead of a String-keyed map.
-type TokenizedDoc = (DocMeta, Vec<(u32, u32)>);
+/// 8 bytes per posting instead of a String-keyed map. Optional third field
+/// is the raw title+body kept only when we will embed in doc_id order.
+type TokenizedDoc = (DocMeta, Vec<(u32, u32)>, Option<String>);
 
 /// Incremental index builder: feed it chunks of parsed documents, then
 /// `finish`. Raw document text never outlives its chunk.
@@ -268,6 +295,8 @@ pub struct IndexBuilder {
     interner: Interner,
     docs: Vec<TokenizedDoc>,
     remove_stopwords: bool,
+    code_mode: bool,
+    keep_embed_text: bool,
     title_weight: u32,
     block_size: usize,
     reorder: ReorderStrategy,
@@ -285,10 +314,25 @@ impl IndexBuilder {
             interner: Interner::new(),
             docs: Vec::new(),
             remove_stopwords,
+            code_mode: false,
+            keep_embed_text: false,
             title_weight: title_weight.max(1),
             block_size,
             reorder,
         }
+    }
+
+    /// Switch on the code-oriented tokenizer. Must be called before
+    /// [`Self::add_documents`].
+    pub fn set_code_mode(&mut self, on: bool) {
+        self.code_mode = on;
+        self.tokenizer = Tokenizer::with_flags(self.remove_stopwords, on);
+    }
+
+    /// Keep full title+body through reordering so embeddings line up with
+    /// the inverted index's internal doc_ids.
+    pub fn set_keep_embed_text(&mut self, on: bool) {
+        self.keep_embed_text = on;
     }
 
     /// Tokenize one chunk of documents in parallel and append the compact
@@ -297,6 +341,7 @@ impl IndexBuilder {
         let tokenizer = &self.tokenizer;
         let interner = &self.interner;
         let title_weight = self.title_weight;
+        let keep_embed_text = self.keep_embed_text;
         let mut tokenized: Vec<TokenizedDoc> = chunk
             .par_iter()
             .map(|doc| {
@@ -329,7 +374,8 @@ impl IndexBuilder {
                     doc_len,
                     content_hash: content_hash(&doc.title, &doc.body),
                 };
-                (meta, pairs)
+                let embed_text = keep_embed_text.then(|| format!("{}\n{}", doc.title, doc.body));
+                (meta, pairs, embed_text)
             })
             .collect();
         self.docs.append(&mut tokenized);
@@ -340,6 +386,8 @@ impl IndexBuilder {
             interner,
             docs,
             remove_stopwords,
+            code_mode,
+            keep_embed_text,
             block_size,
             reorder,
             ..
@@ -357,7 +405,7 @@ impl IndexBuilder {
         }
 
         let num_docs = docs.len();
-        let total_len: u64 = docs.iter().map(|(m, _)| m.doc_len as u64).sum();
+        let total_len: u64 = docs.iter().map(|(m, _, _)| m.doc_len as u64).sum();
         let avg_doc_len = if total_len == 0 {
             1.0 // avoid division by zero; irrelevant when there are no postings
         } else {
@@ -379,7 +427,7 @@ impl IndexBuilder {
         // ascending doc order: every posting lands in its (preallocated)
         // list already sorted by doc_id — no hash maps, no merge, no sort.
         let mut dfs = vec![0u32; num_terms];
-        for (_, pairs) in &docs {
+        for (_, pairs, _) in &docs {
             for &(old_id, _) in pairs {
                 dfs[remap[old_id as usize] as usize] += 1;
             }
@@ -388,7 +436,7 @@ impl IndexBuilder {
             .iter()
             .map(|&df| Vec::with_capacity(df as usize))
             .collect();
-        for (doc_id, (_, pairs)) in docs.iter().enumerate() {
+        for (doc_id, (_, pairs, _)) in docs.iter().enumerate() {
             for &(old_id, tf) in pairs {
                 postings_per_term[remap[old_id as usize] as usize].push(Posting {
                     doc_id: doc_id as u32,
@@ -397,7 +445,7 @@ impl IndexBuilder {
             }
         }
 
-        let doc_lens: Vec<u32> = docs.iter().map(|(m, _)| m.doc_len).collect();
+        let doc_lens: Vec<u32> = docs.iter().map(|(m, _, _)| m.doc_len).collect();
         let posting_lists: Vec<PostingList> = postings_per_term
             .into_par_iter()
             .map(|postings| PostingList::build(postings, num_docs, &doc_lens, block_size))
@@ -409,13 +457,26 @@ impl IndexBuilder {
             .map(|(new_id, &old_id)| (names[old_id as usize].clone(), new_id as u32))
             .collect();
 
+        let mut embed_texts = keep_embed_text.then(|| Vec::with_capacity(docs.len()));
+        let docs: Vec<DocMeta> = docs
+            .into_iter()
+            .map(|(meta, _, text)| {
+                if let Some(buf) = embed_texts.as_mut() {
+                    buf.push(text.unwrap_or_default());
+                }
+                meta
+            })
+            .collect();
+
         Index {
-            docs: docs.into_iter().map(|(meta, _)| meta).collect(),
+            docs,
             avg_doc_len,
             term_dict,
             posting_lists,
             remove_stopwords,
+            code_mode,
             block_size,
+            embed_texts,
         }
     }
 }
@@ -440,7 +501,7 @@ fn apply_reordering(docs: Vec<TokenizedDoc>, strategy: ReorderStrategy) -> Vec<T
             // The compact pairs already carry dense term ids.
             let doc_terms: Vec<Vec<u32>> = docs
                 .iter()
-                .map(|(_, pairs)| pairs.iter().map(|&(t, _)| t).collect())
+                .map(|(_, pairs, _)| pairs.iter().map(|&(t, _)| t).collect())
                 .collect();
             if strategy == ReorderStrategy::BpGpu {
                 #[cfg(feature = "gpu")]
@@ -510,10 +571,39 @@ pub fn build_index_from_jsonl(
     block_size: usize,
     reorder: ReorderStrategy,
 ) -> anyhow::Result<Index> {
+    build_index_from_jsonl_ex(
+        path,
+        remove_stopwords,
+        title_weight,
+        block_size,
+        reorder,
+        false,
+        false,
+    )
+}
+
+/// [`build_index_from_jsonl`] with an optional code-oriented tokenizer
+/// and optional in-memory bodies for embedding (same doc_id order as
+/// the inverted index).
+pub fn build_index_from_jsonl_ex(
+    path: &Path,
+    remove_stopwords: bool,
+    title_weight: u32,
+    block_size: usize,
+    reorder: ReorderStrategy,
+    code_mode: bool,
+    keep_embed_text: bool,
+) -> anyhow::Result<Index> {
     let file =
         std::fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
     let reader = std::io::BufReader::with_capacity(1 << 20, file);
     let mut builder = IndexBuilder::new(remove_stopwords, title_weight, block_size, reorder);
+    if code_mode {
+        builder.set_code_mode(true);
+    }
+    if keep_embed_text {
+        builder.set_keep_embed_text(true);
+    }
 
     let mut lines: Vec<String> = Vec::with_capacity(INDEX_CHUNK_SIZE);
     let mut line_no = 0usize;
@@ -661,5 +751,25 @@ mod tests {
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[1].id, "b");
         assert!(parse_jsonl("not json").is_err());
+    }
+
+    #[test]
+    fn code_mode_indexes_full_identifier_and_parts() {
+        let docs = vec![doc(
+            "d0",
+            "users.rs::getUserByOrganizationId",
+            "fn getUserByOrganizationId(org_id: u64) { lookup(org_id) }",
+        )];
+        let mut builder =
+            IndexBuilder::new(true, 2, DEFAULT_BLOCK_SIZE, ReorderStrategy::None);
+        builder.set_code_mode(true);
+        builder.add_documents(&docs);
+        let index = builder.finish();
+        assert!(index.code_mode());
+        assert!(index.posting_list_for("getuserbyorganizationid").is_some());
+        assert!(index.posting_list_for("organization").is_some());
+        assert!(index.posting_list_for("get_user_by_organization_id").is_none());
+        let results = crate::searcher::search(&index, "getUserByOrganizationId", 5).results;
+        assert_eq!(results[0].id, "d0");
     }
 }

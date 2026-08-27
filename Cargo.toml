@@ -9,6 +9,12 @@ repository = "https://github.com/jasonthird/high-performance-search-engine"
 keywords = ["search-engine", "bm25", "inverted-index", "full-text-search", "wand"]
 categories = ["text-processing", "algorithms", "database-implementations"]
 
+[[bin]]
+# Short, typeable name: this binary is meant to be invoked by hand and by an
+# MCP client, not only through `cargo run`.
+name = "hips"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 axum = "0.7"
@@ -24,8 +30,31 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simd-json = "0.17.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# Optional: CodeRankEmbed inference (see `semantic` feature).
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.21", optional = true }
+hf-hub = { version = "0.4", optional = true }
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
+
+# Metal for batched document encoding; Accelerate for batch-1 query
+# encoding (Candle Metal is kernel-launch bound on short BERT sequences).
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
+candle-nn = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.11", optional = true, features = ["metal"] }
 
 [features]
 # GPU-accelerated BP document reordering: zero-copy Metal via objc2
 # (macOS only). Off by default.
 gpu = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+# Hybrid code search: CodeRankEmbed + IVF/PQ over the same doc_ids as BM25.
+# Off by default so the lexical engine stays dependency-light.
+semantic = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
