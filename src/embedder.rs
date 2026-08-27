@@ -47,6 +47,52 @@ pub struct Embedder {
     model: NomicBertModel,
     tokenizer: Tokenizer,
     device: Device,
+    /// Query-vector LRU: a repeated query costs a map lookup instead of a
+    /// ~7-15 ms forward pass. Agents re-issue queries (retries, refinement
+    /// loops, "the same search with a different top_k") often enough that
+    /// this is the cheapest latency win in the whole retrieval path.
+    /// Document encoding is NOT cached here — that is `embcache`'s job,
+    /// keyed by content and persisted.
+    query_cache: std::sync::Mutex<QueryCache>,
+}
+
+/// Tiny string-keyed LRU. At 256 entries x 768 f32 this is ~0.8 MB.
+struct QueryCache {
+    map: std::collections::HashMap<String, Vec<f32>>,
+    order: std::collections::VecDeque<String>,
+}
+
+const QUERY_CACHE_CAP: usize = 256;
+
+impl QueryCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Vec<f32>> {
+        let hit = self.map.get(key).cloned()?;
+        // Move to most-recent; O(n) over 256 keys is nothing next to the
+        // forward pass this avoids.
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(pos).expect("position just found");
+            self.order.push_back(k);
+        }
+        Some(hit)
+    }
+
+    fn put(&mut self, key: String, value: Vec<f32>) {
+        if self.map.len() >= QUERY_CACHE_CAP && !self.map.contains_key(&key) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        if self.map.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+        }
+    }
 }
 
 impl Embedder {
@@ -120,6 +166,7 @@ impl Embedder {
             model,
             tokenizer,
             device,
+            query_cache: std::sync::Mutex::new(QueryCache::new()),
         };
         // Compile Metal pipelines (first forward is hundreds of ms).
         let _ = embedder.embed_query("warmup");
@@ -144,9 +191,18 @@ impl Embedder {
     }
 
     pub fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
+        if let Ok(mut cache) = self.query_cache.lock() {
+            if let Some(vector) = cache.get(query) {
+                return Ok(vector);
+            }
+        }
         let prefixed = format!("{QUERY_PREFIX}{query}");
         let mut batch = self.embed_batch(&[prefixed.as_str()])?;
-        Ok(batch.pop().expect("one query"))
+        let vector = batch.pop().expect("one query");
+        if let Ok(mut cache) = self.query_cache.lock() {
+            cache.put(query.to_string(), vector.clone());
+        }
+        Ok(vector)
     }
 
     pub fn embed_docs(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
