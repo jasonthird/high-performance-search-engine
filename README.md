@@ -526,9 +526,8 @@ vectorized FP16 scoring of every vector costs ~16 ms. `pq.bin` is still
 built: its codebooks drive the incremental-rebuild cache, and `PqMode::Force`
 keeps ADC available for benchmarks.
 
-**Segmented mode: O(edit) reindex.** `index-repo --segmented` (and
-`mcp --segmented`) switches from rebuild-the-world to the same Lucene-style
-segment layout the lexical engine already used for `add`/`delete`/`merge`,
+**Segmented layout: O(edit) reindex (the default).** `index-repo` and
+`mcp` use the same Lucene-style segment layout the lexical engine already used for `add`/`delete`/`merge`,
 now extended to vectors: each segment carries its own `embeddings.bin` plus
 a `keys.bin` of content-cache keys. An edit tombstones the stale chunks
 (the manifest remembers which chunk ids each file produced), appends the
@@ -547,7 +546,10 @@ one-file edit -> reindexed             0.15 s                 0.20 s
 
 The 0.15 s is dominated by walking the tree (0.11 s); the index work itself
 is milliseconds. `tests/segmented_repo.rs` covers the lifecycle: edits,
-line-shift renames, file deletion, and merge-with-vector-rebuild.
+line-shift renames, file deletion, and merge-with-vector-rebuild. An index
+built with the old single layout migrates automatically on the next
+`index-repo` (its content cache is kept, so migration re-encodes nothing
+unchanged); `--single` keeps the legacy rebuild-the-world path available.
 
 **Scoring path.** Product quantization is enabled per query rather than
 always-on, because it is a fixed cost (building `M x 256` lookup tables)

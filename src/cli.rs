@@ -144,12 +144,11 @@ enum Command {
         /// A normal rebuild reuses it, which is what makes small edits fast.
         #[arg(long)]
         retrain: bool,
-        /// Segmented (incrementally updatable) layout: edits append a
-        /// segment and tombstone stale chunks instead of rebuilding, so
-        /// reindex cost tracks the edit, not the corpus. Semantic scoring
-        /// is exact per segment (no IVF/PQ).
+        /// Legacy single-index layout: every rebuild reprocesses the whole
+        /// tree. The default is segmented — edits append a segment and
+        /// tombstone stale chunks, so reindex cost tracks the edit.
         #[arg(long)]
-        segmented: bool,
+        single: bool,
     },
     /// Generate a CodeSearchNet-style eval set from a source tree: each
     /// documented declaration becomes (query = its doc comment, relevant
@@ -188,9 +187,9 @@ enum Command {
         /// Do not watch the tree; the index only changes on `reindex`.
         #[arg(long)]
         no_watch: bool,
-        /// Segmented layout (incremental edits; see `index-repo --segmented`).
+        /// Legacy single-index layout (see `index-repo --single`).
         #[arg(long)]
-        segmented: bool,
+        single: bool,
         /// Default number of results per search.
         #[arg(long, default_value_t = 10)]
         top_k: usize,
@@ -419,7 +418,7 @@ pub fn run() -> anyhow::Result<()> {
             title_weight,
             ivf_clusters,
             retrain,
-            segmented,
+            single,
         } => cmd_index_repo(
             &root,
             index.as_deref(),
@@ -427,7 +426,7 @@ pub fn run() -> anyhow::Result<()> {
             title_weight,
             ivf_clusters,
             retrain,
-            segmented,
+            !single,
         ),
         Command::EvalGen {
             root,
@@ -441,7 +440,7 @@ pub fn run() -> anyhow::Result<()> {
             lexical,
             rebuild,
             no_watch,
-            segmented,
+            single,
             top_k,
             semantic_candidates,
             fusion,
@@ -455,7 +454,7 @@ pub fn run() -> anyhow::Result<()> {
             !lexical,
             rebuild,
             !no_watch,
-            segmented,
+            !single,
             top_k,
             SearchOpts {
                 mode: RankMode::Hybrid,

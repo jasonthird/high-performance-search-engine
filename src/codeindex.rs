@@ -101,7 +101,7 @@ impl Default for BuildOpts {
             reorder: ReorderStrategy::None,
             ivf_clusters: 0,
             retrain: false,
-            segmented: false,
+            segmented: true,
             quiet: false,
         }
     }
@@ -427,6 +427,24 @@ impl RepoIndexer {
         }
         timer.mark("chunk");
 
+        // Migration: an index built with the old single layout cannot mix
+        // with segments. Wipe it and rebuild — but keep `embcache.bin`, so
+        // the migration costs seconds, not a re-encode of the repo.
+        if self.index_dir.join("meta.bin").exists()
+            && !crate::segments::is_segmented(&self.index_dir)
+        {
+            self.log("migrating single-layout index to segmented (vectors kept)".to_string());
+            for entry in std::fs::read_dir(&self.index_dir)?.flatten() {
+                if entry.file_name() != crate::embcache::CACHE_FILE.as_ref() as &std::ffi::OsStr {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        std::fs::remove_dir_all(&path).ok();
+                    } else {
+                        std::fs::remove_file(&path).ok();
+                    }
+                }
+            }
+        }
         let mut writer = crate::segments::SegmentedWriter::open_or_create_ex(
             &self.index_dir,
             true,
