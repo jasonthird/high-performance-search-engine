@@ -59,11 +59,10 @@ semantic = [
     "dep:hf-hub",
 ]
 
-# Optional: a local candle fork with fused Metal SDPA in NomicBert
-# attention (../candle, branch nomic-bert-fused-sdpa; measured +1-5%,
-# upstream PR candidate). Uncomment to use it; the default build works
-# from crates.io alone.
-# [patch.crates-io]
-# candle-core = { path = "../candle/candle-core" }
-# candle-nn = { path = "../candle/candle-nn" }
-# candle-transformers = { path = "../candle/candle-transformers" }
+# Candle fork with fused Metal SDPA in NomicBert attention: 1.7x faster
+# document encoding at seq 512 (huggingface/candle#3918). Drop this block
+# once the PR is released on crates.io.
+[patch.crates-io]
+candle-core = { git = "https://github.com/jasonthird/candle", branch = "nomic-bert-fused-sdpa" }
+candle-nn = { git = "https://github.com/jasonthird/candle", branch = "nomic-bert-fused-sdpa" }
+candle-transformers = { git = "https://github.com/jasonthird/candle", branch = "nomic-bert-fused-sdpa" }
