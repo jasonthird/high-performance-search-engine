@@ -530,6 +530,60 @@ impl SegmentedWriter {
         Ok(name)
     }
 
+    /// Tombstone a batch of documents by external id in one pass: each
+    /// segment is opened once and its tombstone file written once, however
+    /// many ids it holds. A 200-file refactor tombstones hundreds of chunks;
+    /// per-id deletion would reload every segment for each of them.
+    /// Returns how many ids were found and tombstoned.
+    pub fn delete_documents(&mut self, external_ids: &[String]) -> anyhow::Result<usize> {
+        if external_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut remaining: std::collections::HashSet<&str> =
+            external_ids.iter().map(String::as_str).collect();
+        let mut deleted = 0usize;
+        for entry in self.manifest.segments.iter_mut() {
+            if remaining.is_empty() {
+                break;
+            }
+            let index = storage::load_index(&self.dir.join(&entry.name))?;
+            let mut tombstones: Option<Vec<u64>> = None;
+            let mut found: Vec<&str> = Vec::new();
+            for &id in remaining.iter() {
+                let Some(doc_id) = index.find_by_external_id(id) else {
+                    continue;
+                };
+                let words = match &mut tombstones {
+                    Some(w) => w,
+                    None => {
+                        let mut w = read_tombstones(&self.dir, &entry.name, entry.num_docs)?;
+                        w.resize((entry.num_docs as usize).div_ceil(64), 0);
+                        tombstones.insert(w)
+                    }
+                };
+                let word = (doc_id / 64) as usize;
+                if (words[word] >> (doc_id % 64)) & 1 == 1 {
+                    continue; // already tombstoned
+                }
+                words[word] |= 1 << (doc_id % 64);
+                entry.live_docs -= 1;
+                entry.live_len -= index.doc_len(doc_id) as u64;
+                deleted += 1;
+                found.push(id);
+            }
+            if let Some(words) = tombstones {
+                write_tombstones(&self.dir, &entry.name, &words)?;
+            }
+            for id in found {
+                remaining.remove(id);
+            }
+        }
+        if deleted > 0 {
+            write_manifest(&self.dir, &self.manifest)?;
+        }
+        Ok(deleted)
+    }
+
     /// Tombstone a document by external id. Returns true if found.
     pub fn delete_document(&mut self, external_id: &str) -> anyhow::Result<bool> {
         for entry in self.manifest.segments.iter_mut() {
@@ -597,6 +651,7 @@ impl SegmentedWriter {
         };
 
         let mut to_add: Vec<InputDoc> = Vec::new();
+        let mut to_delete: Vec<String> = Vec::new();
         let mut added = 0usize;
         let mut updated = 0usize;
         let mut unchanged = 0usize;
@@ -605,7 +660,7 @@ impl SegmentedWriter {
             match live_lookup(&doc.id) {
                 Some((_, _, stored)) if stored == new_hash => unchanged += 1,
                 Some(_) => {
-                    self.delete_document(&doc.id)?;
+                    to_delete.push(doc.id.clone());
                     to_add.push(doc.clone());
                     updated += 1;
                 }
@@ -615,6 +670,7 @@ impl SegmentedWriter {
                 }
             }
         }
+        self.delete_documents(&to_delete)?;
         let new_segment = if to_add.is_empty() {
             None
         } else {

@@ -299,21 +299,16 @@ pub fn walk(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
     let mut ignores = IgnoreSet::default();
     ignores.push_dir(&root, "");
     let mut out = Vec::new();
-    walk_dir(&root, "", &mut ignores, &mut out)?;
+    walk_dir(&root, "", &ignores, &mut out);
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
 }
 
-fn walk_dir(
-    dir: &Path,
-    prefix: &str,
-    ignores: &mut IgnoreSet,
-    out: &mut Vec<SourceFile>,
-) -> anyhow::Result<()> {
+fn walk_dir(dir: &Path, prefix: &str, ignores: &IgnoreSet, out: &mut Vec<SourceFile>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         // An unreadable directory is not fatal: skip it and keep indexing.
-        Err(_) => return Ok(()),
+        Err(_) => return,
     };
     let mut dirs = Vec::new();
     for entry in entries.flatten() {
@@ -355,15 +350,24 @@ fn walk_dir(
             });
         }
     }
-    for (path, rel) in dirs {
-        // Nested .gitignore layers apply only below their own directory, and
-        // are popped again on the way out so siblings do not inherit them.
-        let before = ignores.layers.len();
-        ignores.push_dir(&path, &rel);
-        walk_dir(&path, &rel, ignores, out)?;
-        ignores.layers.truncate(before);
+    // Subdirectories walk in parallel: the walk is stat-syscall bound, and
+    // directories are independent. Each subtree gets its own IgnoreSet
+    // extension (a nested .gitignore applies only below its own directory),
+    // which also removes the push/truncate stack discipline the serial
+    // version needed. Determinism comes from the final sort in `walk`.
+    let sub: Vec<Vec<SourceFile>> = dirs
+        .par_iter()
+        .map(|(path, rel)| {
+            let mut scoped = ignores.clone();
+            scoped.push_dir(path, rel);
+            let mut sub_out = Vec::new();
+            walk_dir(path, rel, &scoped, &mut sub_out);
+            sub_out
+        })
+        .collect();
+    for mut files in sub {
+        out.append(&mut files);
     }
-    Ok(())
 }
 
 fn is_source(name: &str) -> bool {

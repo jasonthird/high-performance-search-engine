@@ -430,34 +430,47 @@ pub fn segmented_semantic_pool(
     pool: usize,
 ) -> Vec<SegHybridHit> {
     use rayon::prelude::*;
-    let mut rows: Vec<SegHybridHit> = stores
-        .stores
+
+    // Parallelism is over fixed-size doc ranges, not segments: after a
+    // compaction merge the index is one big segment, and per-segment
+    // parallelism would put the entire scan on one core exactly when it
+    // is largest.
+    const SCAN_CHUNK: u32 = 4096;
+    let mut ranges: Vec<(usize, u32, u32)> = Vec::new();
+    for (si, store) in stores.stores.iter().enumerate() {
+        let n = store.as_ref().map(|s| s.num_docs()).unwrap_or(0);
+        let mut at = 0u32;
+        while at < n {
+            let end = (at + SCAN_CHUNK).min(n);
+            ranges.push((si, at, end));
+            at = end;
+        }
+    }
+    let mut rows: Vec<SegHybridHit> = ranges
         .par_iter()
-        .enumerate()
-        .flat_map_iter(|(si, store)| {
-            let store = store.as_ref();
-            let n = store.map(|s| s.num_docs()).unwrap_or(0);
-            let mut seg_rows = Vec::new();
-            if let Some(store) = store {
-                for doc_id in 0..n {
-                    if !live(si, doc_id) {
-                        continue;
-                    }
-                    let sem = store.cosine(doc_id, query);
-                    seg_rows.push(SegHybridHit {
-                        segment: si,
-                        doc_id,
-                        score: sem,
-                        bm25: 0.0,
-                        semantic: sem,
-                    });
+        .flat_map_iter(|&(si, start, end)| {
+            let store = stores.stores[si]
+                .as_ref()
+                .expect("ranges only cover segments with stores");
+            let mut chunk_rows = Vec::new();
+            for doc_id in start..end {
+                if !live(si, doc_id) {
+                    continue;
                 }
-                // Keep only this segment's best `pool`; the global merge
-                // below cannot need more than that from one segment.
-                seg_rows.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-                seg_rows.truncate(pool);
+                let sem = store.cosine(doc_id, query);
+                chunk_rows.push(SegHybridHit {
+                    segment: si,
+                    doc_id,
+                    score: sem,
+                    bm25: 0.0,
+                    semantic: sem,
+                });
             }
-            seg_rows
+            // Keep only this range's best `pool`; the global merge below
+            // cannot need more than that from one range.
+            chunk_rows.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            chunk_rows.truncate(pool);
+            chunk_rows
         })
         .collect();
     rows.sort_by(|a, b| {

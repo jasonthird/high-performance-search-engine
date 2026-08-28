@@ -36,8 +36,11 @@ pub const PQ_FILE: &str = "pq.bin";
 ///    200 000        132 ms      1.9 ms
 /// ```
 ///
-/// That puts the break-even near 225 candidates. This threshold sits well
-/// above it deliberately: below break-even PQ is pure loss (it costs recall
+/// That put the break-even near 225 candidates; the NEON f16 dot moved
+/// exact scoring another ~6x (see `dot_f16_bytes`), pushing break-even to
+/// ~1,100 — and ADC is no longer chosen automatically at all (recall, see
+/// `PqMode`). This threshold sits well above the original break-even
+/// deliberately: below break-even PQ is pure loss (it costs recall
 /// and saves nothing), so the safe error is to keep scoring exactly for
 /// longer than strictly necessary.
 pub const MIN_CANDIDATES: usize = 900;

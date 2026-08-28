@@ -454,17 +454,18 @@ impl RepoIndexer {
         // 1. Tombstone chunks that no longer exist: every id a removed file
         //    had, and every id of a changed file that its new chunking no
         //    longer produces (line shifts rename ids).
-        let mut deleted = 0usize;
+        let mut stale: Vec<String> = Vec::new();
         let mut upserts: Vec<crate::indexer::InputDoc> = Vec::new();
         for file in &changed_files {
             let new_docs = docs_by_file.remove(&file.rel).unwrap_or_default();
             let new_ids: HashSet<&str> = new_docs.iter().map(|d| d.id.as_str()).collect();
             if let Some(prev) = prev_files.get(file.rel.as_str()) {
-                for id in &prev.chunk_ids {
-                    if !new_ids.contains(id.as_str()) && writer.delete_document(id)? {
-                        deleted += 1;
-                    }
-                }
+                stale.extend(
+                    prev.chunk_ids
+                        .iter()
+                        .filter(|id| !new_ids.contains(id.as_str()))
+                        .cloned(),
+                );
             }
             records.push(FileRecord {
                 path: file.rel.clone(),
@@ -475,12 +476,9 @@ impl RepoIndexer {
             upserts.extend(new_docs);
         }
         for prev in &removed {
-            for id in &prev.chunk_ids {
-                if writer.delete_document(id)? {
-                    deleted += 1;
-                }
-            }
+            stale.extend(prev.chunk_ids.iter().cloned());
         }
+        let deleted = writer.delete_documents(&stale)?;
         timer.mark("tombstone");
 
         // 2. Append changed/new chunks as one segment.
