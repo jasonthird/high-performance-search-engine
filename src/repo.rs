@@ -171,13 +171,50 @@ impl IgnoreSet {
 
     /// Add the `.gitignore` found in `dir` (repo-relative `prefix`), if any.
     fn push_dir(&mut self, dir: &Path, prefix: &str) {
-        let path = dir.join(".gitignore");
-        let Ok(text) = fs::read_to_string(&path) else {
+        self.push_file(&dir.join(".gitignore"), prefix);
+    }
+
+    /// Add one ignore file's rules under `prefix`, if it exists.
+    fn push_file(&mut self, path: &Path, prefix: &str) {
+        let Ok(text) = fs::read_to_string(path) else {
             return;
         };
         let rules = Self::parse_layer(prefix, &text);
         if !rules.is_empty() {
             self.layers.push((prefix.to_string(), rules));
+        }
+    }
+
+    /// Layer git's non-committed exclude sources under the root prefix:
+    /// the user-global excludes file, then `.git/info/exclude`. Local
+    /// toolchains and build trees (a `.kde-craft/`, a scratch checkout)
+    /// are routinely ignored only at these levels, never in a committed
+    /// .gitignore — without them the walker indexes hundreds of
+    /// thousands of junk chunks that git itself ignores. Pushed before
+    /// the root .gitignore so committed rules win, matching git's
+    /// precedence (last match wins across layers).
+    fn push_git_excludes(&mut self, root: &Path) {
+        for path in global_ignore_paths() {
+            self.push_file(&path, "");
+        }
+        let git = root.join(".git");
+        let gitdir = if git.is_dir() {
+            Some(git)
+        } else {
+            // Worktrees and submodules use a `gitdir: <path>` pointer file.
+            fs::read_to_string(&git).ok().and_then(|s| {
+                s.trim().strip_prefix("gitdir:").map(|p| {
+                    let p = PathBuf::from(p.trim());
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        root.join(p)
+                    }
+                })
+            })
+        };
+        if let Some(gd) = gitdir {
+            self.push_file(&gd.join("info").join("exclude"), "");
         }
     }
 
@@ -297,6 +334,7 @@ pub fn walk(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
         .canonicalize()
         .with_context(|| format!("cannot open {}", root.display()))?;
     let mut ignores = IgnoreSet::default();
+    ignores.push_git_excludes(&root);
     ignores.push_dir(&root, "");
     let mut out = Vec::new();
     walk_dir(&root, "", &ignores, &mut out);
@@ -321,6 +359,12 @@ fn walk_dir(dir: &Path, prefix: &str, ignores: &IgnoreSet, out: &mut Vec<SourceF
         let Ok(ft) = entry.file_type() else { continue };
         // Symlinks are not followed: they can escape the repo or form cycles.
         if ft.is_symlink() {
+            continue;
+        }
+        // Hidden entries are skipped wholesale (ripgrep's default): dot
+        // directories hold VCS state, caches, and local toolchains — a
+        // stray `.kde-craft/` once contributed 168k junk chunks.
+        if name.starts_with('.') {
             continue;
         }
         if ft.is_dir() {
@@ -664,6 +708,44 @@ fn push_split(
     }
 }
 
+/// The user's global git ignore file(s): `core.excludesFile` when set in
+/// `~/.gitconfig` or `$XDG_CONFIG_HOME/git/config`, else git's default
+/// `~/.config/git/ignore`. A minimal INI scan — no `git` subprocess, so
+/// indexing works the same on hosts without git installed.
+fn global_ignore_paths() -> Vec<PathBuf> {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => return Vec::new(),
+    };
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    for config in [home.join(".gitconfig"), xdg.join("git").join("config")] {
+        let Ok(text) = fs::read_to_string(&config) else {
+            continue;
+        };
+        let mut in_core = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_core = line.eq_ignore_ascii_case("[core]");
+            } else if in_core {
+                if let Some((key, value)) = line.split_once('=') {
+                    if key.trim().eq_ignore_ascii_case("excludesfile") {
+                        let value = value.trim().trim_matches('"');
+                        let path = match value.strip_prefix("~/") {
+                            Some(rest) => home.join(rest),
+                            None => PathBuf::from(value),
+                        };
+                        return vec![path];
+                    }
+                }
+            }
+        }
+    }
+    vec![xdg.join("git").join("ignore")]
+}
+
 /// Order-sensitive fingerprint of a walked file list: any added, removed,
 /// renamed, resized, or touched file changes it. `walk` returns files
 /// sorted, so the same tree always fingerprints the same.
@@ -844,5 +926,33 @@ mod tests {
         assert!(!set.is_ignored("target", false), "dir-only rule");
         assert!(set.is_ignored("src/a.tmp", false));
         assert!(!set.is_ignored("src/keep.tmp", false), "negation wins");
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn walk_skips_hidden_dirs_and_info_exclude() {
+        let root = std::env::temp_dir().join(format!("hips-walk-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        write(&root.join("src/main.rs"), "fn main() {}");
+        // Hidden toolchain dir with source files: must not be walked.
+        write(&root.join(".kde-craft/include/big.h"), "int x;");
+        // Untracked junk ignored only via .git/info/exclude.
+        write(&root.join("scratch/copy.rs"), "fn junk() {}");
+        write(&root.join(".git/info/exclude"), "scratch/\n");
+        write(&root.join(".git/HEAD"), "ref: refs/heads/main\n");
+
+        let files = walk(&root).unwrap();
+        let rels: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, ["src/main.rs"], "walked: {rels:?}");
+        fs::remove_dir_all(&root).ok();
     }
 }
