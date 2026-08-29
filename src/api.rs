@@ -62,7 +62,7 @@ async fn search_handler(
     // Cap user-controlled k: an unbounded value forces every matching doc
     // into the top-k heap and amplifies the response arbitrarily (and
     // usize::MAX would overflow the heap's k + 1 capacity).
-    let k = params.k.unwrap_or(10).min(1000);
+    let k = params.k.unwrap_or(15).min(1000);
     let query = params.q.clone();
     // Searching is CPU-bound; run it on the blocking pool so it does not
     // stall the async executor under concurrent load.

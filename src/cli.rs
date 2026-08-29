@@ -163,7 +163,7 @@ enum Command {
         #[arg(long)]
         single: bool,
         /// Default number of results per search.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 15)]
         top_k: usize,
 #[command(flatten)]
         knobs: FusionArgs,
@@ -181,7 +181,7 @@ enum Command {
         #[arg(long)]
         query: String,
         /// Number of results to return.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 15)]
         top_k: usize,
         /// Render each result title as a clickable terminal hyperlink using
         /// this URL template. `{id}` and `{title}` are substituted (title is
@@ -237,7 +237,7 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
         /// Number of results to return per query.
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 15)]
         top_k: usize,
         /// Clickable-link URL template; see `search --url`.
         #[arg(long)]
