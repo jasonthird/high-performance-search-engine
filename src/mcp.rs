@@ -29,9 +29,15 @@ use crate::watch::TreeWatcher;
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// Snippet lines returned per hit. Enough to judge relevance, small enough
-/// that ten hits do not flood the caller's context.
-const SNIPPET_LINES: usize = 40;
+/// Snippet lines returned per snippeted hit. Enough to judge relevance,
+/// small enough that hits do not flood the caller's context: results are
+/// pointers the caller can open, not a substitute for reading the file.
+const SNIPPET_LINES: usize = 12;
+
+/// Only the top hits carry snippets; the rest are path:line pointers.
+/// Measured on codex one-shot sessions: full 40-line snippets on every
+/// hit made an MCP search cost more tokens than the grep it replaced.
+const SNIPPET_HITS: usize = 5;
 
 pub struct ServerConfig {
     pub root: PathBuf,
@@ -58,8 +64,15 @@ impl Server {
     /// Prepare the index (building it if absent) and start watching.
     pub fn start(config: ServerConfig) -> anyhow::Result<Self> {
         let indexer = RepoIndexer::new(&config.root, &config.index_dir, config.build.clone())?;
-        // Pay for model load at startup, not on the first search after an edit.
-        indexer.preload_embedder()?;
+        // The encoder loads lazily on the first search: eager loading here
+        // delays the MCP initialize handshake by model-load time (~1-2s) in
+        // every session, including sessions that never search — measured as
+        // a real overhead for one-shot `codex exec` style clients. Set
+        // HIPS_PRELOAD=1 to restore eager loading for long-lived sessions
+        // that want the first search warm.
+        if std::env::var_os("HIPS_PRELOAD").is_some_and(|v| v == "1") {
+            indexer.preload_embedder()?;
+        }
         let needs_build = config.force_rebuild || !index_exists(&config.index_dir);
         let manifest = if needs_build {
             indexer.build()?
@@ -484,7 +497,7 @@ impl Server {
                 )),
                 None => out.push_str(&format!("\n   score {:.4}\n", hit.score)),
             }
-            if include_snippet {
+            if include_snippet && rank < SNIPPET_HITS {
                 if let Some(snippet) =
                     repo::snippet_for(&self.config.root, &hit.id, SNIPPET_LINES)
                 {
