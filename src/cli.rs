@@ -1272,17 +1272,18 @@ fn cmd_bench(
     opts: SearchOpts,
     candidate_sweep: &str,
 ) -> anyhow::Result<()> {
+    let text = fs::read_to_string(queries_path)
+        .with_context(|| format!("failed to read {}", queries_path.display()))?;
+    let queries: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(!queries.is_empty(), "no queries found in file");
+
     if opts.mode == RankMode::Bm25 {
         let index = storage::load_index(index_dir)?;
-        let text = fs::read_to_string(queries_path)
-            .with_context(|| format!("failed to read {}", queries_path.display()))?;
-        let queries: Vec<String> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect();
-        anyhow::ensure!(!queries.is_empty(), "no queries found in file");
         for query in &queries {
             searcher::search(&index, query, top_k);
         }
@@ -1295,15 +1296,6 @@ fn cmd_bench(
     #[cfg(feature = "semantic")]
     {
         let index = searcher::AnyIndex::open(index_dir)?;
-        let text = fs::read_to_string(queries_path)
-            .with_context(|| format!("failed to read {}", queries_path.display()))?;
-        let queries: Vec<String> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect();
-        anyhow::ensure!(!queries.is_empty(), "no queries found in file");
         let embedder = crate::embedder::Embedder::load()?;
         let mut counts: Vec<usize> = candidate_sweep
             .split(',')

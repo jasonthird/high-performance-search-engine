@@ -82,7 +82,6 @@ pub struct PqIndex {
 
 /// Per-query lookup tables: `table[m][code] = q_sub[m] · codebook[m][code]`.
 pub struct AdcTables {
-    m: usize,
     table: Vec<f32>, // m * 256
 }
 
@@ -179,7 +178,7 @@ impl PqIndex {
                 table[sm * KS + c] = acc;
             }
         }
-        AdcTables { m, table }
+        AdcTables { table }
     }
 
     pub fn adc(&self, tables: &AdcTables, doc_id: u32) -> f32 {

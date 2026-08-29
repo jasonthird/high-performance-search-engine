@@ -79,10 +79,7 @@ struct Segment {
 
 impl Segment {
     fn is_deleted(&self, doc_id: u32) -> bool {
-        let word = (doc_id / 64) as usize;
-        self.deleted
-            .get(word)
-            .is_some_and(|w| (w >> (doc_id % 64)) & 1 == 1)
+        bit_is_set(&self.deleted, doc_id)
     }
 }
 
@@ -158,6 +155,19 @@ fn write_manifest(dir: &Path, manifest: &Manifest) -> anyhow::Result<()> {
     drop(w);
     fs::rename(&tmp, dir.join(MANIFEST_FILE)).context("failed to commit manifest")?;
     Ok(())
+}
+
+
+/// Test one document's bit in a tombstone bitmap.
+fn bit_is_set(words: &[u64], doc: u32) -> bool {
+    words
+        .get((doc / 64) as usize)
+        .is_some_and(|w| (w >> (doc % 64)) & 1 == 1)
+}
+
+/// Set one document's bit (the bitmap must already be sized to cover it).
+fn set_bit(words: &mut [u64], doc: u32) {
+    words[(doc / 64) as usize] |= 1 << (doc % 64);
 }
 
 fn tombstone_path(dir: &Path, name: &str) -> PathBuf {
@@ -292,22 +302,22 @@ impl SegmentedIndex {
         (live_docs as usize, avg)
     }
 
-    /// Exact top-k search across all segments under global statistics.
-    /// Raw BM25 top-k as (segment, doc_id, score) triples, for callers
-    /// (hybrid fusion) that need scores joined with other per-document
-    /// signals before summaries are materialized.
-    pub fn search_hits_raw(&self, query: &str, k: usize) -> Vec<(usize, u32, f32)> {
-        let outcome_terms = {
-            let tokenizer = Tokenizer::with_flags(self.manifest.remove_stopwords, self.manifest.code_mode);
-            let mut terms: Vec<String> = Vec::new();
-            tokenizer.for_each_token(query, |t| {
-                if !terms.iter().any(|x| x == t) {
-                    terms.push(t.to_owned());
-                }
-            });
-            terms
-        };
-        let terms = outcome_terms;
+    /// The shared query pipeline: tokenize + dedup terms, compute global
+    /// statistics and per-term global idf (df counts tombstoned docs until
+    /// merge, as in Lucene), search every segment in parallel under those
+    /// statistics, and merge-sort-truncate the per-segment top-k heaps.
+    /// Returns the merged (segment, doc_id, score) triples plus aggregated
+    /// engine statistics.
+    fn search_core(&self, query: &str, k: usize) -> (Vec<(usize, u32, f32)>, SearchStats) {
+        let remove_stopwords = self.manifest.remove_stopwords;
+        let tokenizer = Tokenizer::with_flags(remove_stopwords, self.manifest.code_mode);
+        let mut terms: Vec<String> = Vec::new();
+        tokenizer.for_each_token(query, |t| {
+            if !terms.iter().any(|x| x == t) {
+                terms.push(t.to_owned());
+            }
+        });
+
         let (num_docs_global, avg_doc_len_global) = self.global_stats();
         let mut idfs: HashMap<String, f32> = HashMap::new();
         for term in &terms {
@@ -320,7 +330,8 @@ impl SegmentedIndex {
                 idfs.insert(term.clone(), bm25::idf(num_docs_global, df as usize));
             }
         }
-        let per_segment: Vec<(usize, Vec<crate::block_max_wand::SearchHit>)> = self
+
+        let per_segment: Vec<(usize, Vec<crate::block_max_wand::SearchHit>, SearchStats)> = self
             .segments
             .par_iter()
             .enumerate()
@@ -330,30 +341,47 @@ impl SegmentedIndex {
                     num_docs_global,
                     avg_doc_len_global,
                     idfs: &idfs,
-                    remove_stopwords: self.manifest.remove_stopwords,
+                    remove_stopwords,
                 };
-                let (hits, _) = if terms.len() >= MAXSCORE_MIN_TERMS {
+                let (hits, stats) = if terms.len() >= MAXSCORE_MIN_TERMS {
                     maxscore::search(&view, &terms, k)
                 } else {
                     block_max_wand::search(&view, &terms, k)
                 };
-                (si, hits)
+                (si, hits, stats)
             })
             .collect();
+
+        let mut stats = SearchStats {
+            num_docs_total: num_docs_global,
+            num_query_terms: terms.len(),
+            ..SearchStats::default()
+        };
         let mut merged: Vec<(usize, u32, f32)> = Vec::new();
-        for (si, hits) in per_segment {
+        for (si, hits, seg_stats) in per_segment {
+            stats.num_postings_visited += seg_stats.num_postings_visited;
+            stats.num_docs_scored += seg_stats.num_docs_scored;
+            stats.num_blocks_visited += seg_stats.num_blocks_visited;
+            stats.num_blocks_skipped += seg_stats.num_blocks_skipped;
             for hit in hits {
                 merged.push((si, hit.doc_id, hit.score));
             }
         }
         merged.sort_unstable_by(|a, b| {
-            b.2.partial_cmp(&a.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.2.total_cmp(&a.2)
                 .then_with(|| a.0.cmp(&b.0))
                 .then_with(|| a.1.cmp(&b.1))
         });
         merged.truncate(k);
-        merged
+        (merged, stats)
+    }
+
+    /// Exact top-k search across all segments under global statistics.
+    /// Raw BM25 top-k as (segment, doc_id, score) triples, for callers
+    /// (hybrid fusion) that need scores joined with other per-document
+    /// signals before summaries are materialized.
+    pub fn search_hits_raw(&self, query: &str, k: usize) -> Vec<(usize, u32, f32)> {
+        self.search_core(query, k).0
     }
 
     /// Per-segment directory names, in manifest (and doc-compaction) order.
@@ -381,81 +409,11 @@ impl SegmentedIndex {
     }
 
     pub fn search(&self, query: &str, k: usize) -> SearchOutcome {
-        let remove_stopwords = self.manifest.remove_stopwords;
-        let tokenizer = Tokenizer::with_flags(remove_stopwords, self.manifest.code_mode);
-        let mut terms: Vec<String> = Vec::new();
-        tokenizer.for_each_token(query, |t| {
-            if !terms.iter().any(|x| x == t) {
-                terms.push(t.to_owned());
-            }
-        });
-
         let start = Instant::now();
-        let (num_docs_global, avg_doc_len_global) = self.global_stats();
-
-        // Global df per term -> global idf (df counts tombstoned docs until
-        // merge, as in Lucene).
-        let mut idfs: HashMap<String, f32> = HashMap::new();
-        for term in &terms {
-            let df: u64 = self
-                .segments
-                .iter()
-                .map(|s| s.index.term_df(term) as u64)
-                .sum();
-            if df > 0 {
-                idfs.insert(term.clone(), bm25::idf(num_docs_global, df as usize));
-            }
-        }
-
-        // Each segment is searched independently (in parallel) and the
-        // per-segment top-k heaps merge into the final ranking.
-        let per_segment: Vec<(usize, Vec<crate::block_max_wand::SearchHit>, SearchStats)> = self
-            .segments
-            .par_iter()
-            .enumerate()
-            .map(|(si, segment)| {
-                let view = SegmentView {
-                    segment,
-                    num_docs_global,
-                    avg_doc_len_global,
-                    idfs: &idfs,
-                    remove_stopwords,
-                };
-                let (hits, stats) = if terms.len() >= MAXSCORE_MIN_TERMS {
-                    maxscore::search(&view, &terms, k)
-                } else {
-                    block_max_wand::search(&view, &terms, k)
-                };
-                (si, hits, stats)
-            })
-            .collect();
-
-        let mut stats = SearchStats {
-            num_docs_total: num_docs_global,
-            num_query_terms: terms.len(),
-            ..SearchStats::default()
-        };
-        let mut merged: Vec<(f32, usize, u32)> = Vec::new();
-        for (si, hits, seg_stats) in per_segment {
-            stats.num_postings_visited += seg_stats.num_postings_visited;
-            stats.num_docs_scored += seg_stats.num_docs_scored;
-            stats.num_blocks_visited += seg_stats.num_blocks_visited;
-            stats.num_blocks_skipped += seg_stats.num_blocks_skipped;
-            for hit in hits {
-                merged.push((hit.score, si, hit.doc_id));
-            }
-        }
-        merged.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.cmp(&b.2))
-        });
-        merged.truncate(k);
-
+        let (merged, stats) = self.search_core(query, k);
         let results = merged
             .into_iter()
-            .map(|(score, si, doc_id)| {
+            .map(|(si, doc_id, score)| {
                 let summary = self.segments[si].index.doc_summary(doc_id);
                 SearchResult {
                     id: summary.id,
@@ -657,11 +615,10 @@ impl SegmentedWriter {
                         tombstones.insert(w)
                     }
                 };
-                let word = (doc_id / 64) as usize;
-                if (words[word] >> (doc_id % 64)) & 1 == 1 {
+                if bit_is_set(words, doc_id) {
                     continue; // already tombstoned
                 }
-                words[word] |= 1 << (doc_id % 64);
+                set_bit(words, doc_id);
                 entry.live_docs -= 1;
                 entry.live_len -= index.doc_len(doc_id) as u64;
                 deleted += 1;
@@ -682,25 +639,8 @@ impl SegmentedWriter {
 
     /// Tombstone a document by external id. Returns true if found.
     pub fn delete_document(&mut self, external_id: &str) -> anyhow::Result<bool> {
-        for entry in self.manifest.segments.iter_mut() {
-            let index = storage::load_index(&self.dir.join(&entry.name))?;
-            let Some(doc_id) = index.find_by_external_id(external_id) else {
-                continue;
-            };
-            let mut deleted = read_tombstones(&self.dir, &entry.name, entry.num_docs)?;
-            deleted.resize((entry.num_docs as usize).div_ceil(64), 0);
-            let word = (doc_id / 64) as usize;
-            if (deleted[word] >> (doc_id % 64)) & 1 == 1 {
-                continue; // already tombstoned; treat as not-found here
-            }
-            deleted[word] |= 1 << (doc_id % 64);
-            write_tombstones(&self.dir, &entry.name, &deleted)?;
-            entry.live_docs -= 1;
-            entry.live_len -= index.doc_len(doc_id) as u64;
-            write_manifest(&self.dir, &self.manifest)?;
-            return Ok(true);
-        }
-        Ok(false)
+        let id = external_id.to_owned();
+        Ok(self.delete_documents(std::slice::from_ref(&id))? > 0)
     }
 
     /// Update = delete (if present) + add as a new segment.
@@ -735,10 +675,7 @@ impl SegmentedWriter {
         let live_lookup = |id: &str| -> Option<(usize, u32, u64)> {
             for (si, (_, index, deleted, _)) in segments.iter().enumerate() {
                 if let Some(doc_id) = index.find_by_external_id(id) {
-                    let dead = deleted
-                        .get((doc_id / 64) as usize)
-                        .is_some_and(|w| (w >> (doc_id % 64)) & 1 == 1);
-                    if !dead {
+                    if !bit_is_set(deleted, doc_id) {
                         return Some((si, doc_id, index.content_hash(doc_id)));
                     }
                 }
@@ -826,11 +763,6 @@ impl SegmentedWriter {
             })
             .collect::<anyhow::Result<_>>()?;
 
-        let is_dead = |deleted: &Vec<u64>, doc: u32| -> bool {
-            deleted
-                .get((doc / 64) as usize)
-                .is_some_and(|w| (w >> (doc % 64)) & 1 == 1)
-        };
 
         // Doc id remap: live docs renumber densely in (segment, doc) order.
         let mut remap: Vec<Vec<Option<u32>>> = Vec::with_capacity(segments.len());
@@ -839,7 +771,7 @@ impl SegmentedWriter {
             let _ = index;
             let mut seg_map = Vec::with_capacity(entry.num_docs as usize);
             for doc in 0..entry.num_docs {
-                if is_dead(deleted, doc) {
+                if bit_is_set(deleted, doc) {
                     seg_map.push(None);
                 } else {
                     seg_map.push(Some(next_id));
@@ -910,11 +842,13 @@ impl SegmentedWriter {
         let mut encoded: Vec<u8> = Vec::new();
         while !cursors.is_empty() {
             // Smallest current name across cursors.
+            // Min by &str, cloning only the winner (not every cursor's term).
             let term = cursors
                 .iter()
-                .map(|(_, _, name)| name.clone())
+                .map(|(_, _, name)| name.as_str())
                 .min()
-                .expect("non-empty");
+                .expect("non-empty")
+                .to_owned();
 
             merged_list.clear();
             for (si, _, name) in cursors.iter() {

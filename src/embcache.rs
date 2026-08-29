@@ -46,31 +46,23 @@ const NO_CLUSTER: u32 = u32::MAX;
 /// Cache key for one chunk: FNV-1a over the exact text handed to the encoder,
 /// mixed with its length so that same-prefix truncations cannot collide.
 pub fn key_for(text: &str) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in text.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h ^ (text.len() as u64).wrapping_mul(0x9e3779b97f4a7c15)
+    crate::hash::fnv1a(text.as_bytes()) ^ (text.len() as u64).wrapping_mul(0x9e3779b97f4a7c15)
 }
 
 /// Identify a trained quantizer by its parameters, so cached codes are only
 /// reused against the exact centroids and codebooks that produced them.
 pub fn quantizer_id(centroids: &[f32], codebooks: &[f32]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = crate::hash::Fnv1a::new();
     let mut feed = |v: &[f32]| {
         for &x in v {
             // Hash the stored FP16 form: that is what a reload will see.
-            for &b in &f32_to_f16(x).to_le_bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
+            h.write(&f32_to_f16(x).to_le_bytes());
         }
     };
     feed(centroids);
     feed(codebooks);
     // Keep the length in the id so a truncated read can never collide.
-    h ^ ((centroids.len() as u64) << 32 | codebooks.len() as u64)
+    h.finish() ^ ((centroids.len() as u64) << 32 | codebooks.len() as u64)
 }
 
 struct Entry {

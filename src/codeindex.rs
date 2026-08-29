@@ -167,11 +167,7 @@ impl Default for PhaseTimer {
 /// keyed by the absolute path, so indexing a codebase never writes into it.
 pub fn default_index_dir(root: &Path) -> PathBuf {
     let abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in abs.to_string_lossy().as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
+    let h = crate::hash::fnv1a(abs.to_string_lossy().as_bytes());
     let name = abs
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -548,21 +544,18 @@ impl RepoIndexer {
     /// doc_id order) so a later merge can rebuild vectors without the
     /// encoder.
     #[cfg(feature = "semantic")]
-    fn embed_segment(
+    /// Cache-first encode: hash each text, encode only the cache misses in
+    /// batches of `batch`, and return `(keys, vectors, encoded, cached)`.
+    /// The cache is updated in memory; the caller decides when to save it.
+    #[cfg(feature = "semantic")]
+    fn encode_cached(
         &self,
-        seg_dir: &Path,
-        docs: &[crate::indexer::InputDoc],
-    ) -> anyhow::Result<(usize, usize)> {
-        use crate::embcache::{key_for, EmbedCache};
-        use crate::embeddings::CODERANK_DIM;
-
-        let texts: Vec<String> = docs
-            .iter()
-            .map(|d| format!("{}
-{}", d.title, d.body))
-            .collect();
-        let keys: Vec<u64> = texts.iter().map(|t| key_for(t)).collect();
-        let mut cache = EmbedCache::load(&self.index_dir, CODERANK_DIM);
+        cache: &mut crate::embcache::EmbedCache,
+        texts: &[String],
+        batch: usize,
+        progress: bool,
+    ) -> anyhow::Result<(Vec<u64>, Vec<Vec<f32>>, usize, usize)> {
+        let keys: Vec<u64> = texts.iter().map(|t| crate::embcache::key_for(t)).collect();
         let misses: Vec<usize> = (0..texts.len())
             .filter(|&i| !cache.contains(keys[i]))
             .collect();
@@ -573,18 +566,43 @@ impl RepoIndexer {
                 "encoding {encoded} changed chunks ({cached} unchanged, from cache)"
             ));
             let embedder = self.embedder()?;
-            for batch in misses.chunks(256) {
-                let refs: Vec<&str> = batch.iter().map(|&i| texts[i].as_str()).collect();
+            let mut done = 0usize;
+            for chunk in misses.chunks(batch) {
+                let refs: Vec<&str> = chunk.iter().map(|&i| texts[i].as_str()).collect();
                 let vectors = embedder.embed_docs(&refs)?;
-                for (&i, vector) in batch.iter().zip(vectors.iter()) {
+                for (&i, vector) in chunk.iter().zip(vectors.iter()) {
                     cache.insert(keys[i], vector);
+                }
+                done += chunk.len();
+                if progress && !self.opts.quiet && (done.is_multiple_of(512) || done == encoded) {
+                    eprintln!("  encoded {done}/{encoded}");
                 }
             }
         }
         let mut vectors = Vec::with_capacity(texts.len());
-        for key in &keys {
-            vectors.push(cache.get(*key).context("vector missing after encode")?);
+        for (i, key) in keys.iter().enumerate() {
+            let vector = cache
+                .get(*key)
+                .with_context(|| format!("embedding missing for chunk {i}"))?;
+            vectors.push(vector);
         }
+        Ok((keys, vectors, encoded, cached))
+    }
+
+    fn embed_segment(
+        &self,
+        seg_dir: &Path,
+        docs: &[crate::indexer::InputDoc],
+    ) -> anyhow::Result<(usize, usize)> {
+        use crate::embcache::EmbedCache;
+        use crate::embeddings::CODERANK_DIM;
+
+        let texts: Vec<String> = docs
+            .iter()
+            .map(|d| format!("{}\n{}", d.title, d.body))
+            .collect();
+        let mut cache = EmbedCache::load(&self.index_dir, CODERANK_DIM);
+        let (keys, vectors, encoded, cached) = self.encode_cached(&mut cache, &texts, 256, false)?;
         crate::embeddings::write_f16(seg_dir, CODERANK_DIM as u32, &vectors)?;
         write_keys(seg_dir, &keys)?;
         // NOTE: the cache is *not* pruned here — stale entries are trimmed
@@ -716,46 +734,15 @@ impl RepoIndexer {
     ) -> anyhow::Result<(usize, usize)> {
         use std::collections::HashSet;
 
-        use crate::embcache::{key_for, EmbedCache};
+        use crate::embcache::EmbedCache;
         use crate::embeddings::CODERANK_DIM;
 
         // The cache lives with the installed index, not the staging dir, so
         // it survives across rebuilds.
         let mut cache = EmbedCache::load(&self.index_dir, CODERANK_DIM);
-
-        let keys: Vec<u64> = texts.iter().map(|t| key_for(t)).collect();
-        let misses: Vec<usize> = (0..texts.len())
-            .filter(|&i| !cache.contains(keys[i]))
-            .collect();
-        let encoded = misses.len();
-        let cached = texts.len() - encoded;
-        if encoded > 0 {
-            self.log(format!(
-                "encoding {encoded} changed chunks ({cached} unchanged, from cache)"
-            ));
-            let embedder = self.embedder()?;
-            let mut done = 0usize;
-            for batch in misses.chunks(64) {
-                let refs: Vec<&str> = batch.iter().map(|&i| texts[i].as_str()).collect();
-                let vectors = embedder.embed_docs(&refs)?;
-                for (&i, vector) in batch.iter().zip(vectors.iter()) {
-                    cache.insert(keys[i], vector);
-                }
-                done += batch.len();
-                if !self.opts.quiet && (done.is_multiple_of(512) || done == encoded) {
-                    eprintln!("  encoded {done}/{encoded}");
-                }
-            }
-        }
-
+        let (keys, vectors, encoded, cached) = self.encode_cached(&mut cache, texts, 64, true)?;
         let n = texts.len();
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
-        for (i, key) in keys.iter().enumerate() {
-            let vector = cache
-                .get(*key)
-                .with_context(|| format!("embedding missing for chunk {i}"))?;
-            vectors.push(vector);
-        }
+
         let mut timer = PhaseTimer::new();
         crate::embeddings::write_f16(staging, CODERANK_DIM as u32, &vectors)?;
         let store = crate::embeddings::EmbeddingStore::open(staging)?;

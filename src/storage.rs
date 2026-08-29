@@ -67,12 +67,7 @@ pub(crate) fn write_hashes_file(
 
 /// Stable hash for external ids (FNV-1a 64).
 pub(crate) fn id_hash(id: &str) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in id.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    crate::hash::fnv1a(id.as_bytes())
 }
 
 /// Write the (hash, doc_id) sidecar, sorted by hash.

@@ -79,17 +79,11 @@ pub struct DocMeta {
 
 /// Content hash over title and body (order-sensitive, separator-safe).
 pub fn content_hash(title: &str, body: &str) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    };
-    feed(title.as_bytes());
-    feed(&[0xFF]);
-    feed(body.as_bytes());
-    h
+    let mut h = crate::hash::Fnv1a::new();
+    h.write(title.as_bytes());
+    h.write(&[0xFF]);
+    h.write(body.as_bytes());
+    h.finish()
 }
 
 /// The immutable, searchable index.

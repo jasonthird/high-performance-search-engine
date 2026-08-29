@@ -668,20 +668,14 @@ fn push_split(
 /// renamed, resized, or touched file changes it. `walk` returns files
 /// sorted, so the same tree always fingerprints the same.
 pub fn fingerprint(files: &[SourceFile]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    };
+    let mut h = crate::hash::Fnv1a::new();
     for f in files {
-        feed(f.rel.as_bytes());
-        feed(&f.len.to_le_bytes());
-        feed(&f.mtime_ns.to_le_bytes());
-        feed(&[0xFE]);
+        h.write(f.rel.as_bytes());
+        h.write(&f.len.to_le_bytes());
+        h.write(&f.mtime_ns.to_le_bytes());
+        h.write(&[0xFE]);
     }
-    h
+    h.finish()
 }
 
 /// Read and chunk every source file under `root`.

@@ -16,6 +16,7 @@ pub mod embcache;
 pub mod embeddings;
 pub mod eval;
 pub mod external;
+pub mod hash;
 pub mod hybrid;
 pub mod indexer;
 pub mod ivf;
