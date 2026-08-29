@@ -183,7 +183,7 @@ impl IvfIndex {
                 (acc, c as u32)
             })
             .collect();
-        scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+        scores.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         scores.into_iter().take(nprobe).map(|(_, c)| c).collect()
     }
 

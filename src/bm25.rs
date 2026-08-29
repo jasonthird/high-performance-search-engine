@@ -8,10 +8,14 @@ pub const B: f32 = 0.75;
 
 /// idf = ln(1 + (N - df + 0.5) / (df + 0.5))
 ///
-/// Always positive, even when a term appears in every document.
+/// Always positive, even when a term appears in every document. `df` is
+/// clamped to `N`: segmented indexes count tombstoned postings in `df` but
+/// only live documents in `N`, and an unclamped `df > N` would drive the
+/// formula negative, breaking the positive-score upper bounds that
+/// Block-Max WAND and MaxScore pruning rely on.
 pub fn idf(num_docs: usize, df: usize) -> f32 {
     let n = num_docs as f32;
-    let df = df as f32;
+    let df = df.min(num_docs) as f32;
     (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
 }
 
@@ -37,6 +41,14 @@ mod tests {
     fn idf_positive_even_for_ubiquitous_terms() {
         assert!(idf(100, 100) > 0.0);
         assert!(idf(1, 1) > 0.0);
+    }
+
+    #[test]
+    fn idf_stays_positive_when_df_exceeds_live_docs() {
+        // Segmented indexes count tombstoned postings in df but only live
+        // docs in N; a doc updated three times gives df=4 against N=1.
+        assert!(idf(1, 4) > 0.0);
+        assert!(idf(0, 7) > 0.0);
     }
 
     #[test]

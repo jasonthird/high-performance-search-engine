@@ -79,6 +79,23 @@ impl AnyIndex {
             IndexKind::Single(Box::new(crate::storage::load_index(dir)?))
         };
         let embeddings = crate::embeddings::EmbeddingStore::open(dir).ok();
+        // A sidecar left behind by an older build maps rows to renumbered
+        // doc_ids: silently wrong scores, or panics past the end. Drop it
+        // (with a warning) rather than serve stale vectors.
+        let embeddings = match (&kind, embeddings) {
+            (IndexKind::Single(index), Some(store))
+                if store.num_docs() as usize != index.num_docs() =>
+            {
+                eprintln!(
+                    "warning: embeddings.bin has {} rows but the index has {} docs; \
+                     ignoring stale vector sidecar (rebuild with --embed)",
+                    store.num_docs(),
+                    index.num_docs()
+                );
+                None
+            }
+            (_, e) => e,
+        };
         let ivf = crate::ivf::IvfIndex::open(dir).ok();
         let pq = crate::pq::PqIndex::open(dir).ok();
         let seg_stores = match &kind {
@@ -86,7 +103,20 @@ impl AnyIndex {
                 let stores = seg
                     .segment_names()
                     .iter()
-                    .map(|name| crate::embeddings::EmbeddingStore::open(&dir.join(name)).ok())
+                    .enumerate()
+                    .map(|(si, name)| {
+                        let store = crate::embeddings::EmbeddingStore::open(&dir.join(name)).ok()?;
+                        if store.num_docs() != seg.num_docs_in(si) {
+                            eprintln!(
+                                "warning: segment {name} embeddings have {} rows for {} docs; \
+                                 ignoring stale vector sidecar",
+                                store.num_docs(),
+                                seg.num_docs_in(si)
+                            );
+                            return None;
+                        }
+                        Some(store)
+                    })
                     .collect::<Vec<_>>();
                 stores
                     .iter()
@@ -146,7 +176,7 @@ impl AnyIndex {
                 use crate::indexer::SearchableIndex as _;
                 index.code_mode()
             }
-            IndexKind::Segmented(_) => false,
+            IndexKind::Segmented(index) => index.code_mode(),
         }
     }
 

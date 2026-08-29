@@ -153,14 +153,9 @@ impl Embedder {
             ..Default::default()
         }));
 
-        // Candle's Metal backend flushes its command buffer every
-        // CANDLE_METAL_COMPUTE_PER_BUFFER ops (default 50) — several
-        // mid-forward flushes for a 12-layer model. 200 measured 9.2 ->
-        // 6.2 ms on a batch-1 query forward, with no effect on large
-        // (compute-bound) shapes. Respect an explicit user setting.
-        if std::env::var_os("CANDLE_METAL_COMPUTE_PER_BUFFER").is_none() {
-            std::env::set_var("CANDLE_METAL_COMPUTE_PER_BUFFER", "200");
-        }
+        // CANDLE_METAL_COMPUTE_PER_BUFFER is set in main() before any
+        // thread exists (calling setenv here would race concurrent getenv
+        // on the rayon/watcher threads — undefined behavior).
         let (device, dtype) = pick_device(kind);
         // SAFETY: weights file is not mutated while mapped.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device) }

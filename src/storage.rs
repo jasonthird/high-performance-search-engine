@@ -135,9 +135,24 @@ pub(crate) struct MetaSections {
     pub block_byte_offsets: Vec<u32>,
 }
 
+/// Clamp a string to the u16 length limit of the serialized format,
+/// backing up to a UTF-8 char boundary so the truncation stays valid.
+/// The recorded length and the appended bytes must always agree, or
+/// readers misparse everything after the oversized record.
+pub(crate) fn clamp_len(bytes: &[u8]) -> usize {
+    if bytes.len() <= u16::MAX as usize {
+        return bytes.len();
+    }
+    let mut len = u16::MAX as usize;
+    while len > 0 && bytes[len] & 0xC0 == 0x80 {
+        len -= 1;
+    }
+    len
+}
+
 pub(crate) fn write_str(out: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize);
+    let len = clamp_len(bytes);
     out.extend_from_slice(&(len as u16).to_le_bytes());
     out.extend_from_slice(&bytes[..len]);
 }
@@ -154,8 +169,9 @@ pub(crate) fn front_code_dict<'a>(
         let t = term.as_bytes();
         if i % DICT_GROUP == 0 {
             group_offsets.push(bytes.len() as u32);
-            bytes.extend_from_slice(&(t.len().min(u16::MAX as usize) as u16).to_le_bytes());
-            bytes.extend_from_slice(t);
+            let len = clamp_len(t);
+            bytes.extend_from_slice(&(len as u16).to_le_bytes());
+            bytes.extend_from_slice(&t[..len]);
         } else {
             let lcp = prev
                 .iter()
@@ -165,8 +181,9 @@ pub(crate) fn front_code_dict<'a>(
                 .count();
             let suffix = &t[lcp..];
             bytes.push(lcp as u8);
-            bytes.extend_from_slice(&(suffix.len().min(u16::MAX as usize) as u16).to_le_bytes());
-            bytes.extend_from_slice(suffix);
+            let len = clamp_len(suffix);
+            bytes.extend_from_slice(&(len as u16).to_le_bytes());
+            bytes.extend_from_slice(&suffix[..len]);
         }
         prev.clear();
         prev.extend_from_slice(t);
@@ -417,6 +434,16 @@ pub fn load_index(dir: &Path) -> anyhow::Result<DiskIndex> {
     let mut sections = [(0u64, 0u64); NUM_SECTIONS];
     for (i, s) in sections.iter_mut().enumerate() {
         *s = (u64_at(56 + i * 16), u64_at(64 + i * 16));
+    }
+    // Validate the section table before anything slices into the mmap:
+    // a truncated or corrupt meta.bin must fail here with an error, not
+    // panic later inside a query (slice bounds / bytemuck alignment).
+    let meta_len = meta.len() as u64;
+    for (i, &(off, len)) in sections.iter().enumerate() {
+        anyhow::ensure!(
+            off % 8 == 0 && off.checked_add(len).is_some_and(|end| end <= meta_len),
+            "corrupt index: section {i} ({off}+{len}) exceeds meta.bin ({meta_len} bytes)"
+        );
     }
 
     Ok(DiskIndex {

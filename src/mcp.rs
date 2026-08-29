@@ -284,6 +284,12 @@ impl Server {
             "reindex" => {
                 let before = self.manifest.num_docs;
                 let retrain = args.get("retrain").and_then(Value::as_bool).unwrap_or(false);
+                // This rebuild covers all watcher events seen so far; clear
+                // the dirty flag first so the next search doesn't rebuild
+                // again (an edit during the rebuild re-sets it).
+                if let Some(w) = self.watcher.as_ref() {
+                    w.take_dirty();
+                }
                 self.rebuild_with(retrain)?;
                 Ok(format!(
                     "Rebuilt in {:.2}s: {} chunks ({:+}), {} encoded, {} reused from cache.",

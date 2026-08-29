@@ -233,6 +233,10 @@ impl SegmentedIndex {
         self.manifest.remove_stopwords
     }
 
+    pub fn code_mode(&self) -> bool {
+        self.manifest.code_mode
+    }
+
     /// Global document frequency of a term (summed across all segments,
     /// tombstones included, matching the idf statistics used at search time).
     pub fn term_df(&self, term: &str) -> u32 {
@@ -650,12 +654,27 @@ impl SegmentedWriter {
             None
         };
 
+        // Within one batch the last occurrence of an id wins; without this
+        // dedup every copy would be classified `added` and land live in the
+        // new segment, and later deletes would only find the first.
+        let docs: Vec<&InputDoc> = {
+            let mut last: HashMap<&str, usize> = HashMap::new();
+            for (i, d) in docs.iter().enumerate() {
+                last.insert(d.id.as_str(), i);
+            }
+            docs.iter()
+                .enumerate()
+                .filter(|(i, d)| last[d.id.as_str()] == *i)
+                .map(|(_, d)| d)
+                .collect()
+        };
+
         let mut to_add: Vec<InputDoc> = Vec::new();
         let mut to_delete: Vec<String> = Vec::new();
         let mut added = 0usize;
         let mut updated = 0usize;
         let mut unchanged = 0usize;
-        for doc in docs {
+        for &doc in &docs {
             let new_hash = crate::indexer::content_hash(&doc.title, &doc.body);
             match live_lookup(&doc.id) {
                 Some((_, _, stored)) if stored == new_hash => unchanged += 1,
@@ -872,7 +891,7 @@ impl SegmentedWriter {
                 total_len as f32 / num_docs as f32
             },
             remove_stopwords: self.manifest.remove_stopwords,
-            code_mode: false,
+            code_mode: self.manifest.code_mode,
             block_size: block_size as u32,
             doc_lens,
             doc_offsets,

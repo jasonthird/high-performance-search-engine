@@ -295,6 +295,11 @@ pub fn bp_order_gpu(doc_terms: &[Vec<u32>]) -> Vec<u32> {
         });
     }
 
+    if num_docs == 0 {
+        // `zeroed(num_docs.max(1))` below would otherwise fabricate a
+        // 1-element "permutation" naming a document that doesn't exist.
+        return Vec::new();
+    }
     let mut order = SharedBuf::<u32>::zeroed(&ctx.device, num_docs.max(1));
     for (i, slot) in order.mem.as_mut_slice().iter_mut().enumerate() {
         *slot = i as u32;

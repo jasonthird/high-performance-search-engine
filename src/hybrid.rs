@@ -152,8 +152,7 @@ fn fuse_and_truncate(rows: &mut Vec<HybridHit>, fusion: Fusion, k: usize) -> Vec
             order.sort_by(|&a, &b| {
                 rows[b]
                     .bm25
-                    .partial_cmp(&rows[a].bm25)
-                    .unwrap()
+                    .total_cmp(&rows[a].bm25)
                     .then(rows[a].doc_id.cmp(&rows[b].doc_id))
             });
             for (rank, &i) in order.iter().enumerate() {
@@ -164,8 +163,7 @@ fn fuse_and_truncate(rows: &mut Vec<HybridHit>, fusion: Fusion, k: usize) -> Vec
             order.sort_by(|&a, &b| {
                 rows[b]
                     .semantic
-                    .partial_cmp(&rows[a].semantic)
-                    .unwrap()
+                    .total_cmp(&rows[a].semantic)
                     .then(rows[a].doc_id.cmp(&rows[b].doc_id))
             });
             for (rank, &i) in order.iter().enumerate() {
@@ -189,10 +187,14 @@ fn fuse_union(
     match fusion {
         Fusion::Weighted { alpha } => {
             let (lo, hi) = min_max(rows.iter().filter(|r| r.bm25 > 0.0).map(|r| r.bm25));
-            let span = (hi - lo).max(1e-9);
+            let span = hi - lo;
             for r in rows.iter_mut() {
                 let n = if r.bm25 <= 0.0 {
                     0.0
+                } else if span <= f32::EPSILON {
+                    // All matched docs share one score (or there is a single
+                    // match): a lexical hit still outranks a non-match.
+                    1.0
                 } else {
                     (r.bm25 - lo) / span
                 };
@@ -215,8 +217,7 @@ fn fuse_union(
 
     rows.sort_by(|a, b| {
         b.score
-            .partial_cmp(&a.score)
-            .unwrap()
+            .total_cmp(&a.score)
             .then(a.doc_id.cmp(&b.doc_id))
     });
     rows.truncate(k);
@@ -256,8 +257,7 @@ pub fn semantic_pool(
         .collect();
     rows.sort_by(|a, b| {
         b.semantic
-            .partial_cmp(&a.semantic)
-            .unwrap()
+            .total_cmp(&a.semantic)
             .then(a.doc_id.cmp(&b.doc_id))
     });
     rows.truncate(pool.max(1));
@@ -285,8 +285,7 @@ pub fn brute_force_semantic(
         .collect();
     rows.sort_by(|a, b| {
         b.score
-            .partial_cmp(&a.score)
-            .unwrap()
+            .total_cmp(&a.score)
             .then(a.doc_id.cmp(&b.doc_id))
     });
     rows.truncate(k);
@@ -333,6 +332,27 @@ mod tests {
         write_f16(&dir, 4, &[d0, d1, d2]).unwrap();
         let store = EmbeddingStore::open(&dir).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn weighted_fusion_single_bm25_hit_keeps_lexical_signal() {
+        // With one BM25 hit the normalization span is zero; the hit used
+        // to normalize to 0.0 and lose to pure-semantic docs even at
+        // alpha = 0.9.
+        let (dir, store) = store_named("hyb-single");
+        let query = {
+            let mut q = vec![1.0f32, 0.0, 0.0, 0.0];
+            l2_normalize(&mut q);
+            q
+        };
+        // Doc 1 is orthogonal to the query but is the only lexical match.
+        let bm25 = [SearchHit {
+            doc_id: 1,
+            score: 5.0,
+        }];
+        let hits = merge_retrieve(&bm25, &store, &query, Fusion::weighted(0.9), 3, 3);
+        assert_eq!(hits[0].doc_id, 1, "lexical match must win at alpha=0.9");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -468,15 +488,14 @@ pub fn segmented_semantic_pool(
             }
             // Keep only this range's best `pool`; the global merge below
             // cannot need more than that from one range.
-            chunk_rows.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            chunk_rows.sort_by(|a, b| b.score.total_cmp(&a.score));
             chunk_rows.truncate(pool);
             chunk_rows
         })
         .collect();
     rows.sort_by(|a, b| {
         b.score
-            .partial_cmp(&a.score)
-            .unwrap()
+            .total_cmp(&a.score)
             .then(a.segment.cmp(&b.segment))
             .then(a.doc_id.cmp(&b.doc_id))
     });
@@ -540,10 +559,14 @@ pub fn segmented_fuse(
     match fusion {
         Fusion::Weighted { alpha } => {
             let (lo, hi) = min_max(rows.iter().filter(|r| r.bm25 > 0.0).map(|r| r.bm25));
-            let span = (hi - lo).max(1e-9);
+            let span = hi - lo;
             for r in rows.iter_mut() {
                 let n = if r.bm25 <= 0.0 {
                     0.0
+                } else if span <= f32::EPSILON {
+                    // All matched docs share one score (or there is a single
+                    // match): a lexical hit still outranks a non-match.
+                    1.0
                 } else {
                     (r.bm25 - lo) / span
                 };
@@ -565,8 +588,7 @@ pub fn segmented_fuse(
     }
     rows.sort_by(|a, b| {
         b.score
-            .partial_cmp(&a.score)
-            .unwrap()
+            .total_cmp(&a.score)
             .then(a.segment.cmp(&b.segment))
             .then(a.doc_id.cmp(&b.doc_id))
     });

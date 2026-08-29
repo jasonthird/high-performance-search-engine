@@ -295,7 +295,9 @@ pub fn f32_to_f16(v: f32) -> u16 {
             sign | ((frac + 0x1000) >> 13) as u16
         }
     } else {
-        sign | (exp as u16) << 10 | ((frac + 0x1000) >> 13) as u16
+        // Add (not OR) so a mantissa rounding carry propagates into the
+        // exponent; overflow to exp 31 correctly yields infinity.
+        sign | (((exp as u16) << 10) + ((frac + 0x1000) >> 13) as u16)
     }
 }
 
@@ -398,6 +400,20 @@ mod tests {
             let back = f16_to_f32(f32_to_f16(x));
             assert!((back - x).abs() < 0.001, "{x} -> {back}");
         }
+    }
+
+    #[test]
+    fn f16_rounding_carry_propagates_into_exponent() {
+        // Values just below a power of two round up across the exponent
+        // boundary. Encoding used to OR the mantissa carry into an
+        // already-set exponent bit, collapsing these to half their value.
+        for (x, want) in [(0.49999997f32, 0.5f32), (1.999_999_9f32, 2.0f32)] {
+            let back = f16_to_f32(f32_to_f16(x));
+            assert_eq!(back, want, "{x} -> {back}, want {want}");
+        }
+        // Rounding at the very top of the f16 range must overflow to inf,
+        // not wrap into a corrupt encoding.
+        assert!(f16_to_f32(f32_to_f16(65535.0)).is_infinite());
     }
 
     #[test]

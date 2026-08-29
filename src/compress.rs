@@ -250,6 +250,9 @@ pub fn block_tf(bytes: &[u8], idx: usize) -> u32 {
 /// `bytes` into `out`. Returns the number of bytes consumed.
 pub fn decode_block(bytes: &[u8], out: &mut Vec<Posting>) -> usize {
     let header = read_header(bytes);
+    // A corrupt block with count == 0 would underflow `count - 1` below
+    // into a near-usize::MAX bit offset.
+    assert!(header.count > 0, "corrupt posting block: count == 0");
     let payload_bits =
         (header.count - 1) * header.doc_bits as usize + header.count * header.tf_bits as usize;
     let payload_bytes = payload_bits.div_ceil(8);

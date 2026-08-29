@@ -380,7 +380,10 @@ impl RepoIndexer {
         let tree_fingerprint = repo::fingerprint(&files);
         let previous = Manifest::load(&self.index_dir).ok();
         if let Some(prev) = &previous {
-            if prev.tree_fingerprint == tree_fingerprint && prev.tree_fingerprint != 0 {
+            if prev.tree_fingerprint == tree_fingerprint
+                && prev.tree_fingerprint != 0
+                && prev.embedded == self.opts.embed
+            {
                 self.log(format!(
                     "index up to date ({} chunks, fingerprint unchanged)",
                     prev.num_docs
