@@ -13,8 +13,8 @@ fn main() -> anyhow::Result<()> {
     use std::collections::HashSet;
     use std::path::Path;
 
-    use high_performance_search_engine::cli::{FusionArg, PqMode, RankMode, SearchOpts};
-    use high_performance_search_engine::cli::run_ranked_with;
+    use high_performance_search_engine::query::{FusionArg, PqMode, RankMode, SearchOpts};
+    use high_performance_search_engine::query::run_ranked_with;
     use high_performance_search_engine::embedder::Embedder;
     use high_performance_search_engine::searcher::AnyIndex;
 

@@ -37,40 +37,12 @@ impl From<ReorderArg> for ReorderStrategy {
         }
     }
 }
-
-// Fusion defaults (weighted, alpha 0.15) come from two eval sets over 31k
-// real code chunks (examples in `eval-gen`): R@10 on natural-language
-// doc-comment queries / on identifier queries —
-//   bm25 .255/.976   semantic .716/.974   rrf hybrid .569/.975
-//   weighted alpha=.15 hybrid: .696/.993 — best on identifiers, within 3%
-// of pure semantic on NL, and keeps a lexical anchor for text the encoder
-// cannot see (string literals, config files, tails of >512-token chunks).
-
-/// Whether ADC scoring is used. `Auto` defers to [`crate::pq::worth_using`]:
-/// below the break-even candidate count PQ costs recall and saves nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PqMode {
-    Auto,
-    Off,
-    /// Use ADC regardless of candidate count (benchmarking).
-    Force,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum FusionArg {
-    Weighted,
-    Rrf,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum RankMode {
-    Bm25,
-    /// Encoder retrieves over all vectors; BM25 is a helper on the same doc_ids.
-    Hybrid,
-    /// Old retrieve-then-rerank: cosine only on BM25 candidates.
-    Rerank,
-    Semantic,
-}
+pub use crate::query::{
+    require_semantic, FusionArgs,
+    run_ranked, FusionArg, PqMode, RankMode, RankedHit, RankedRun, SearchOpts,
+};
+#[cfg(feature = "semantic")]
+pub use crate::query::run_ranked_with;
 
 #[derive(Parser)]
 #[command(
@@ -193,19 +165,8 @@ enum Command {
         /// Default number of results per search.
         #[arg(long, default_value_t = 10)]
         top_k: usize,
-        /// Pool size before fusion.
-        #[arg(long, default_value_t = 200)]
-        semantic_candidates: usize,
-        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
-        fusion: FusionArg,
-        #[arg(long, default_value_t = 0.15)]
-        alpha: f32,
-        #[arg(long, default_value_t = 60.0)]
-        rrf_k: f32,
-        #[arg(long, default_value_t = 0)]
-        nprobe: usize,
-        #[arg(long)]
-        no_pq: bool,
+#[command(flatten)]
+        knobs: FusionArgs,
     },
     /// Search an index from the command line (Block-Max WAND).
     Search {
@@ -236,26 +197,8 @@ enum Command {
         /// Also accepted as an alias for `--mode hybrid`.
         #[arg(long)]
         hybrid: bool,
-        /// Pool size: BM25 hits kept as helper, and encoder neighbors kept,
-        /// before fusion (`hybrid` / `rerank`).
-        #[arg(long, default_value_t = 200)]
-        semantic_candidates: usize,
-        /// Score fusion: min-max weighted mix, or reciprocal rank fusion.
-        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
-        fusion: FusionArg,
-        /// BM25 weight for `--fusion weighted` (semantic weight is 1-alpha).
-        #[arg(long, default_value_t = 0.15)]
-        alpha: f32,
-        /// RRF constant k (Cormack et al.).
-        #[arg(long, default_value_t = 60.0)]
-        rrf_k: f32,
-        /// IVF lists to probe (0 = auto). Encoder retrieval uses the same
-        /// inverted-file cluster postings as stored in `ivf.bin`.
-        #[arg(long, default_value_t = 0)]
-        nprobe: usize,
-        /// Skip product-quantized scoring even if pq.bin exists (FP16 dots).
-        #[arg(long)]
-        no_pq: bool,
+#[command(flatten)]
+        knobs: FusionArgs,
     },
     /// Precompute CodeRankEmbed vectors for an existing index (needs
     /// `--features semantic`). Writes `<index>/embeddings.bin`.
@@ -279,18 +222,8 @@ enum Command {
         qrels: PathBuf,
         #[arg(long, default_value_t = 10)]
         top_k: usize,
-        #[arg(long, default_value_t = 200)]
-        semantic_candidates: usize,
-        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
-        fusion: FusionArg,
-        #[arg(long, default_value_t = 0.15)]
-        alpha: f32,
-        #[arg(long, default_value_t = 60.0)]
-        rrf_k: f32,
-        #[arg(long, default_value_t = 0)]
-        nprobe: usize,
-        #[arg(long)]
-        no_pq: bool,
+#[command(flatten)]
+        knobs: FusionArgs,
     },
     /// Interactive query prompt: load the index once, then type queries and
     /// see results + per-query latency live. `\bench N` repeats the last
@@ -371,18 +304,8 @@ enum Command {
         mode: RankMode,
         #[arg(long)]
         hybrid: bool,
-        #[arg(long, default_value_t = 200)]
-        semantic_candidates: usize,
-        #[arg(long, value_enum, default_value_t = FusionArg::Weighted)]
-        fusion: FusionArg,
-        #[arg(long, default_value_t = 0.15)]
-        alpha: f32,
-        #[arg(long, default_value_t = 60.0)]
-        rrf_k: f32,
-        #[arg(long, default_value_t = 0)]
-        nprobe: usize,
-        #[arg(long)]
-        no_pq: bool,
+#[command(flatten)]
+        knobs: FusionArgs,
         /// Repeat the hybrid timing sweep over these candidate counts
         /// (comma-separated). Empty means just `--semantic-candidates`.
         #[arg(long, default_value = "")]
@@ -442,12 +365,7 @@ pub fn run() -> anyhow::Result<()> {
             no_watch,
             single,
             top_k,
-            semantic_candidates,
-            fusion,
-            alpha,
-            rrf_k,
-            nprobe,
-            no_pq,
+            knobs,
         } => cmd_mcp(
             &root,
             index.as_deref(),
@@ -456,15 +374,7 @@ pub fn run() -> anyhow::Result<()> {
             !no_watch,
             !single,
             top_k,
-            SearchOpts {
-                mode: RankMode::Hybrid,
-                semantic_candidates,
-                fusion,
-                alpha,
-                rrf_k,
-                nprobe,
-                pq: if no_pq { PqMode::Off } else { PqMode::Auto },
-            },
+            knobs.to_opts(RankMode::Hybrid),
         ),
         Command::Search {
             index,
@@ -474,26 +384,13 @@ pub fn run() -> anyhow::Result<()> {
             url,
             mode,
             hybrid,
-            semantic_candidates,
-            fusion,
-            alpha,
-            rrf_k,
-            nprobe,
-            no_pq,
+            knobs,
         } => cmd_search(
             &resolve_index(index.as_deref(), root.as_deref())?,
             &query,
             top_k,
             url.as_deref(),
-            SearchOpts {
-                mode: if hybrid { RankMode::Hybrid } else { mode },
-                semantic_candidates,
-                fusion,
-                alpha,
-                rrf_k,
-                nprobe,
-                pq: if no_pq { PqMode::Off } else { PqMode::Auto },
-            },
+            knobs.to_opts(if hybrid { RankMode::Hybrid } else { mode }),
         ),
         Command::Embed { index, input } => cmd_embed(&index, &input),
         Command::EvalCode {
@@ -501,26 +398,13 @@ pub fn run() -> anyhow::Result<()> {
             queries,
             qrels,
             top_k,
-            semantic_candidates,
-            fusion,
-            alpha,
-            rrf_k,
-            nprobe,
-            no_pq,
+            knobs,
         } => cmd_eval_code(
             &index,
             &queries,
             &qrels,
             top_k,
-            SearchOpts {
-                mode: RankMode::Hybrid,
-                semantic_candidates,
-                fusion,
-                alpha,
-                rrf_k,
-                nprobe,
-                pq: if no_pq { PqMode::Off } else { PqMode::Auto },
-            },
+            knobs.to_opts(RankMode::Hybrid),
         ),
         Command::Repl {
             index,
@@ -556,77 +440,18 @@ pub fn run() -> anyhow::Result<()> {
             top_k,
             mode,
             hybrid,
-            semantic_candidates,
-            fusion,
-            alpha,
-            rrf_k,
-            nprobe,
-            no_pq,
+            knobs,
             candidate_sweep,
         } => cmd_bench(
             &index,
             &queries,
             top_k,
-            SearchOpts {
-                mode: if hybrid { RankMode::Hybrid } else { mode },
-                semantic_candidates,
-                fusion,
-                alpha,
-                rrf_k,
-                nprobe,
-                pq: if no_pq { PqMode::Off } else { PqMode::Auto },
-            },
+            knobs.to_opts(if hybrid { RankMode::Hybrid } else { mode }),
             &candidate_sweep,
         ),
     }
 }
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub struct SearchOpts {
-    pub mode: RankMode,
-    pub semantic_candidates: usize,
-    pub fusion: FusionArg,
-    pub alpha: f32,
-    pub rrf_k: f32,
-    pub nprobe: usize,
-    pub pq: PqMode,
-}
-
-/// Pick the scoring path: ADC only when enough documents will be scored to
-/// amortize its table build. See [`crate::pq::MIN_CANDIDATES`] for the
-/// measurements behind the threshold.
-#[allow(dead_code)]
-fn choose_pq<'a>(
-    index: &'a searcher::AnyIndex,
-    opts: &SearchOpts,
-    top_k: usize,
-) -> Option<&'a crate::pq::PqIndex> {
-    let pq = index.pq()?;
-    match opts.pq {
-        PqMode::Off => None,
-        PqMode::Force => Some(pq),
-        // Measured on 31k chunks of real code (examples/pq_tradeoff.rs):
-        // IVF-only semantic recall@10 was 0.677, IVF+PQ collapsed it to
-        // 0.143 — this PQ quantizes raw vectors (not residuals), and the
-        // reconstruction error swamps the score differences that matter.
-        // Meanwhile exact scoring of all 31k vectors costs ~16 ms with the
-        // vectorized f16 path. So ADC is never chosen automatically; it
-        // remains available via Force for benchmarks and future
-        // residual-quantization work.
-        PqMode::Auto => {
-            let _ = top_k;
-            None
-        }
-    }
-}
-
-pub(crate) fn fusion_from(opts: &SearchOpts) -> crate::hybrid::Fusion {
-    match opts.fusion {
-        FusionArg::Weighted => crate::hybrid::Fusion::weighted(opts.alpha),
-        FusionArg::Rrf => crate::hybrid::Fusion::rrf(opts.rrf_k),
-    }
-}
 
 fn cmd_add(index_dir: &Path, input: &Path, title_weight: u32, upsert: bool) -> anyhow::Result<()> {
     use crate::segments::SegmentedWriter;
@@ -1120,270 +945,7 @@ fn print_outcome(query: &str, outcome: &searcher::SearchOutcome, url_template: O
     );
 }
 
-pub struct RankedHit {
-    pub id: String,
-    pub title: String,
-    pub score: f32,
-    pub bm25: f32,
-    pub semantic: f32,
-}
 
-pub struct RankedRun {
-    pub results: Vec<RankedHit>,
-    pub stats: crate::block_max_wand::SearchStats,
-    pub bm25_ms: f64,
-    pub embed_ms: f64,
-    pub score_ms: f64,
-    pub total_ms: f64,
-}
-
-pub(crate) fn require_semantic() -> anyhow::Result<()> {
-    if cfg!(feature = "semantic") {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "this binary was built without CodeRankEmbed; rebuild with `cargo build --release --features semantic`"
-        )
-    }
-}
-
-fn run_ranked(
-    index: &searcher::AnyIndex,
-    query: &str,
-    top_k: usize,
-    opts: &SearchOpts,
-) -> anyhow::Result<RankedRun> {
-    require_semantic()?;
-    #[cfg(feature = "semantic")]
-    {
-        let embedder = crate::embedder::Embedder::load()?;
-        run_ranked_with(index, &embedder, query, top_k, opts)
-    }
-    #[cfg(not(feature = "semantic"))]
-    {
-        let _ = (index, query, top_k, opts);
-        unreachable!("require_semantic already returned")
-    }
-}
-
-/// Query embed and BM25 do not depend on each other. Encode on this
-/// thread (Metal stays where the model was warmed up) and run WAND on a
-/// helper thread; IVF/fusion still wait for the vector.
-#[cfg(feature = "semantic")]
-fn embed_and_bm25(
-    disk: &storage::DiskIndex,
-    embedder: &crate::embedder::Embedder,
-    query: &str,
-    k: usize,
-) -> anyhow::Result<(
-    Vec<f32>,
-    Vec<crate::block_max_wand::SearchHit>,
-    crate::block_max_wand::SearchStats,
-    f64,
-    f64,
-)> {
-    std::thread::scope(|s| {
-        let bm25 = s.spawn(|| searcher::search_hits(disk, query, k));
-        let t_embed = Instant::now();
-        let qvec = embedder.embed_query(query)?;
-        let embed_ms = t_embed.elapsed().as_secs_f64() * 1000.0;
-        let (hits, stats, bm25_ms) = bm25
-            .join()
-            .map_err(|_| anyhow::anyhow!("BM25 helper thread panicked"))?;
-        Ok((qvec, hits, stats, bm25_ms, embed_ms))
-    })
-}
-
-#[cfg(feature = "semantic")]
-pub fn run_ranked_with(
-    index: &searcher::AnyIndex,
-    embedder: &crate::embedder::Embedder,
-    query: &str,
-    top_k: usize,
-    opts: &SearchOpts,
-) -> anyhow::Result<RankedRun> {
-    use crate::hybrid;
-    use crate::indexer::SearchableIndex as _;
-    if index.as_single().is_none() {
-        return run_ranked_segmented(index, embedder, query, top_k, opts);
-    }
-    let embeddings = index
-        .embeddings()
-        .context("no embeddings.bin — run `embed --index ... --input ...` first")?;
-    let disk = index
-        .as_single()
-        .context("hybrid/semantic modes currently support a single (non-segmented) index")?;
-
-    let total = Instant::now();
-
-    let (hits, stats, bm25_ms, embed_ms, score_ms) = match opts.mode {
-        RankMode::Bm25 => unreachable!(),
-        RankMode::Hybrid => {
-            let pool = opts.semantic_candidates.max(top_k);
-            let (qvec, bm25_hits, stats, bm25_ms, embed_ms) =
-                embed_and_bm25(disk, embedder, query, pool)?;
-            let t_score = Instant::now();
-            let fused = hybrid::merge_retrieve_ivf(
-                &bm25_hits,
-                embeddings,
-                &qvec,
-                fusion_from(opts),
-                top_k,
-                pool,
-                index.ivf(),
-                opts.nprobe,
-                choose_pq(index, opts, top_k),
-            );
-            let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
-            (fused, stats, bm25_ms, embed_ms, score_ms)
-        }
-        RankMode::Rerank => {
-            let candidates = opts.semantic_candidates.max(top_k);
-            let (qvec, bm25_hits, stats, bm25_ms, embed_ms) =
-                embed_and_bm25(disk, embedder, query, candidates)?;
-            let t_score = Instant::now();
-            let fused = hybrid::rerank(&bm25_hits, embeddings, &qvec, fusion_from(opts), top_k);
-            let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
-            (fused, stats, bm25_ms, embed_ms, score_ms)
-        }
-        RankMode::Semantic => {
-            let t_embed = Instant::now();
-            let qvec = embedder.embed_query(query)?;
-            let embed_ms = t_embed.elapsed().as_secs_f64() * 1000.0;
-            let t_score = Instant::now();
-            let fused = hybrid::semantic_pool(
-                embeddings,
-                &qvec,
-                top_k,
-                index.ivf(),
-                opts.nprobe,
-                choose_pq(index, opts, top_k),
-            );
-            let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
-            (
-                fused,
-                crate::block_max_wand::SearchStats {
-                    num_docs_total: disk.num_docs(),
-                    ..Default::default()
-                },
-                0.0,
-                embed_ms,
-                score_ms,
-            )
-        }
-    };
-    let results = hits
-        .into_iter()
-        .map(|h| {
-            let s = disk.doc_summary(h.doc_id);
-            RankedHit {
-                id: s.id,
-                title: s.title,
-                score: h.score,
-                bm25: h.bm25,
-                semantic: h.semantic,
-            }
-        })
-        .collect();
-    Ok(RankedRun {
-        results,
-        stats,
-        bm25_ms,
-        embed_ms,
-        score_ms,
-        total_ms: total.elapsed().as_secs_f64() * 1000.0,
-    })
-}
-
-/// Ranked retrieval over a segmented index: BM25 across segments plus an
-/// exact per-segment brute-force semantic pool, fused like the single-index
-/// path. No IVF/PQ — segments stay small between merges, and exact scoring
-/// measured better on both recall and simplicity at repo scale.
-#[cfg(feature = "semantic")]
-fn run_ranked_segmented(
-    index: &searcher::AnyIndex,
-    embedder: &crate::embedder::Embedder,
-    query: &str,
-    top_k: usize,
-    opts: &SearchOpts,
-) -> anyhow::Result<RankedRun> {
-    use crate::hybrid;
-
-    let seg = match index.kind() {
-        searcher::IndexKind::Segmented(seg) => seg,
-        searcher::IndexKind::Single(_) => unreachable!("caller checked"),
-    };
-    let stores = index
-        .segment_stores()
-        .context("segmented index has no embeddings; rebuild with --segmented (not --lexical)")?;
-
-    let total = Instant::now();
-    let pool = opts.semantic_candidates.max(top_k);
-
-    // Query embed and BM25 in parallel, mirroring the single-index path.
-    let (qvec, bm25_hits, embed_ms, bm25_ms) = std::thread::scope(|scope| {
-        let bm25 = scope.spawn(|| {
-            let t = Instant::now();
-            let hits = if opts.mode == RankMode::Semantic {
-                Vec::new()
-            } else {
-                seg.search_hits_raw(query, pool)
-            };
-            (hits, t.elapsed().as_secs_f64() * 1000.0)
-        });
-        let t = Instant::now();
-        let qvec = embedder.embed_query(query)?;
-        let embed_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let (hits, bm25_ms) = bm25
-            .join()
-            .map_err(|_| anyhow::anyhow!("BM25 helper thread panicked"))?;
-        Ok::<_, anyhow::Error>((qvec, hits, embed_ms, bm25_ms))
-    })?;
-
-    let t_score = Instant::now();
-    let live = |si: usize, doc: u32| seg.is_live(si, doc);
-    let hits = match opts.mode {
-        RankMode::Semantic => {
-            let mut sem = hybrid::segmented_semantic_pool(stores, &live, &qvec, top_k);
-            sem.truncate(top_k);
-            sem
-        }
-        RankMode::Rerank => {
-            // Cosine only on the BM25 candidates.
-            hybrid::segmented_fuse(&bm25_hits, Vec::new(), stores, &qvec, fusion_from(opts), top_k)
-        }
-        _ => {
-            let sem = hybrid::segmented_semantic_pool(stores, &live, &qvec, pool);
-            hybrid::segmented_fuse(&bm25_hits, sem, stores, &qvec, fusion_from(opts), top_k)
-        }
-    };
-    let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
-
-    let results = hits
-        .into_iter()
-        .map(|h| {
-            let summary = seg.doc_summary_in(h.segment, h.doc_id);
-            RankedHit {
-                id: summary.id,
-                title: summary.title,
-                score: h.score,
-                bm25: h.bm25,
-                semantic: h.semantic,
-            }
-        })
-        .collect();
-    Ok(RankedRun {
-        results,
-        stats: crate::block_max_wand::SearchStats {
-            num_docs_total: index.num_docs() as usize,
-            ..Default::default()
-        },
-        bm25_ms,
-        embed_ms,
-        score_ms,
-        total_ms: total.elapsed().as_secs_f64() * 1000.0,
-    })
-}
 
 fn cmd_write_embeddings(
     index_dir: &Path,

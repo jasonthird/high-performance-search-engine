@@ -225,7 +225,7 @@ impl RepoIndexer {
             .canonicalize()
             .with_context(|| format!("cannot open {}", root.display()))?;
         if opts.embed {
-            crate::cli::require_semantic()?;
+            crate::query::require_semantic()?;
         }
         Ok(Self {
             root,

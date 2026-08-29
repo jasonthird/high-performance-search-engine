@@ -42,7 +42,7 @@ pub struct ServerConfig {
     /// Watch the tree and rebuild on change.
     pub watch: bool,
     pub default_top_k: usize,
-    pub search: crate::cli::SearchOpts,
+    pub search: crate::query::SearchOpts,
 }
 
 pub struct Server {
@@ -435,12 +435,12 @@ impl Server {
     ) -> anyhow::Result<Vec<Hit>> {
         let mut opts = self.config.search;
         opts.mode = match mode {
-            Some("semantic") => crate::cli::RankMode::Semantic,
-            Some("rerank") => crate::cli::RankMode::Rerank,
-            _ => crate::cli::RankMode::Hybrid,
+            Some("semantic") => crate::query::RankMode::Semantic,
+            Some("rerank") => crate::query::RankMode::Rerank,
+            _ => crate::query::RankMode::Hybrid,
         };
         let embedder = self.indexer.embedder()?;
-        let run = crate::cli::run_ranked_with(&self.index, embedder, query, k, &opts)?;
+        let run = crate::query::run_ranked_with(&self.index, embedder, query, k, &opts)?;
         Ok(run
             .results
             .into_iter()

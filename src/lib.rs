@@ -24,6 +24,7 @@ pub mod maxscore;
 pub mod mcp;
 pub mod migrate;
 pub mod postings;
+pub mod query;
 pub mod repo;
 pub mod reorder;
 pub mod searcher;
