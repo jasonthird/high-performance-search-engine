@@ -189,10 +189,11 @@ enum Command {
         /// `--url 'https://en.wikipedia.org/?curid={id}'`.
         #[arg(long)]
         url: Option<String>,
-        /// Ranking mode: lexical BM25 (default), embedding-first hybrid
-        /// (encoder over all vectors + BM25 helper), BM25-then-rerank, or
-        /// encoder-only.
-        #[arg(long, value_enum, default_value_t = RankMode::Bm25)]
+        /// Ranking mode: embedding-first hybrid (default: encoder over all
+        /// vectors + BM25 helper), lexical BM25, BM25-then-rerank, or
+        /// encoder-only. Hybrid falls back to BM25 (with a note) when the
+        /// index has no embeddings or the binary lacks the encoder.
+        #[arg(long, value_enum, default_value_t = RankMode::Hybrid)]
         mode: RankMode,
         /// Also accepted as an alias for `--mode hybrid`.
         #[arg(long)]
@@ -879,6 +880,20 @@ fn cmd_search(
     opts: SearchOpts,
 ) -> anyhow::Result<()> {
     let index = searcher::AnyIndex::open(index_dir)?;
+    let mut opts = opts;
+    // Hybrid is the default, but it needs an encoder build and stored
+    // vectors; fall back to lexical BM25 (with a note) rather than fail.
+    if opts.mode != RankMode::Bm25 && (!cfg!(feature = "semantic") || !index.has_vectors()) {
+        eprintln!(
+            "note: {} — using lexical BM25 (pass --mode bm25 to silence)",
+            if cfg!(feature = "semantic") {
+                "index has no embeddings"
+            } else {
+                "built without --features semantic"
+            }
+        );
+        opts.mode = RankMode::Bm25;
+    }
     if opts.mode == RankMode::Bm25 {
         let outcome = index.search(query, top_k);
         print_outcome(query, &outcome, url_template);
@@ -1166,11 +1181,24 @@ fn cmd_repl(index_dir: &Path, top_k: usize, url_template: Option<&str>) -> anyho
 
     let load_start = Instant::now();
     let index = searcher::AnyIndex::open(index_dir)?;
+    // Hybrid by default when the index has vectors and the binary has the
+    // encoder: load the model once here, not per query.
+    #[cfg(feature = "semantic")]
+    let embedder = if index.has_vectors() {
+        Some(crate::embedder::Embedder::load()?)
+    } else {
+        None
+    };
+    #[cfg(feature = "semantic")]
+    let hybrid = embedder.is_some();
+    #[cfg(not(feature = "semantic"))]
+    let hybrid = false;
     println!(
-        "loaded {} docs, {} bytes in {:.0} ms",
+        "loaded {} docs, {} bytes in {:.0} ms ({} search)",
         index.num_docs(),
         index.size_bytes(),
         load_start.elapsed().as_secs_f64() * 1000.0,
+        if hybrid { "hybrid" } else { "lexical" },
     );
     println!("type a query and press enter; `\\bench N` repeats the last query N times; Ctrl-D to quit\n");
 
@@ -1188,12 +1216,44 @@ fn cmd_repl(index_dir: &Path, top_k: usize, url_template: Option<&str>) -> anyho
             if last_query.is_empty() {
                 println!("(run a query first, then \\bench N)");
             } else {
+                #[cfg(feature = "semantic")]
+                if let Some(embedder) = &embedder {
+                    bench_one_hybrid(&index, embedder, &last_query, top_k, n)?;
+                } else {
+                    bench_one(&index, &last_query, top_k, n);
+                }
+                #[cfg(not(feature = "semantic"))]
                 bench_one(&index, &last_query, top_k, n);
             }
         } else if query.is_empty() {
             // ignore
         } else {
             last_query = query.to_string();
+            #[cfg(feature = "semantic")]
+            if let Some(embedder) = &embedder {
+                let opts = SearchOpts::default();
+                let run = run_ranked_with(&index, embedder, query, top_k, &opts)?;
+                for (rank, r) in run.results.iter().enumerate() {
+                    println!(
+                        "{:>3}. {:>8.3}  bm25={:>8.3}  sem={:>6.3}  {}",
+                        rank + 1,
+                        r.score,
+                        r.bm25,
+                        r.semantic,
+                        render_title(url_template, &r.id, &r.title),
+                    );
+                }
+                if run.results.is_empty() {
+                    println!("(no results)");
+                }
+                println!(
+                    "  {:.3} ms · bm25 {:.3} + embed {:.3} + score {:.3}",
+                    run.total_ms, run.bm25_ms, run.embed_ms, run.score_ms,
+                );
+                print!("\nsearch> ");
+                std::io::stdout().flush().ok();
+                continue;
+            }
             let outcome = index.search(query, top_k);
             if let Some(corrected) = &outcome.corrected {
                 println!("corrected to: {corrected:?}");
@@ -1219,6 +1279,45 @@ fn cmd_repl(index_dir: &Path, top_k: usize, url_template: Option<&str>) -> anyho
         std::io::stdout().flush().ok();
     }
     println!();
+    Ok(())
+}
+
+/// As [`bench_one`], but through the full hybrid pipeline (encode + BM25
+/// + fusion) with the already-loaded encoder.
+#[cfg(feature = "semantic")]
+fn bench_one_hybrid(
+    index: &searcher::AnyIndex,
+    embedder: &crate::embedder::Embedder,
+    query: &str,
+    top_k: usize,
+    n: usize,
+) -> anyhow::Result<()> {
+    use std::time::Instant;
+    let opts = SearchOpts::default();
+    // Warm-up so model/pipeline caches don't pollute the measured run.
+    for _ in 0..(n / 10).max(1) {
+        run_ranked_with(index, embedder, query, top_k, &opts)?;
+    }
+    let mut samples: Vec<f64> = Vec::with_capacity(n);
+    let wall = Instant::now();
+    for _ in 0..n {
+        let t = Instant::now();
+        run_ranked_with(index, embedder, query, top_k, &opts)?;
+        samples.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    let total = wall.elapsed().as_secs_f64();
+    samples.sort_unstable_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| samples[((p * n as f64) as usize).min(n - 1)];
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    println!(
+        "  {n} hybrid runs of {query:?}: mean {:.3} ms · p50 {:.3} · p95 {:.3} · p99 {:.3} · min {:.3} · {:.0} queries/s",
+        mean,
+        pct(0.50),
+        pct(0.95),
+        pct(0.99),
+        samples[0],
+        n as f64 / total,
+    );
     Ok(())
 }
 

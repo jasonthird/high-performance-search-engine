@@ -392,6 +392,22 @@ pub struct FusionArgs {
     pub no_pq: bool,
 }
 
+impl Default for SearchOpts {
+    /// The measured defaults: hybrid retrieval with weighted fusion,
+    /// alpha 0.15 — same values the CLI flags default to.
+    fn default() -> Self {
+        Self {
+            mode: RankMode::Hybrid,
+            semantic_candidates: 200,
+            fusion: FusionArg::Weighted,
+            alpha: 0.15,
+            rrf_k: 60.0,
+            nprobe: 0,
+            pq: PqMode::Auto,
+        }
+    }
+}
+
 impl FusionArgs {
     pub fn to_opts(&self, mode: RankMode) -> SearchOpts {
         SearchOpts {
