@@ -300,23 +300,23 @@ fn run_ranked_segmented(
     let pool = opts.semantic_candidates.max(top_k);
 
     // Query embed and BM25 in parallel, mirroring the single-index path.
-    let (qvec, bm25_hits, embed_ms, bm25_ms) = std::thread::scope(|scope| {
+    let (qvec, bm25_hits, mut stats, embed_ms, bm25_ms) = std::thread::scope(|scope| {
         let bm25 = scope.spawn(|| {
             let t = Instant::now();
-            let hits = if opts.mode == RankMode::Semantic {
-                Vec::new()
+            let (hits, stats) = if opts.mode == RankMode::Semantic {
+                (Vec::new(), crate::block_max_wand::SearchStats::default())
             } else {
-                seg.search_hits_raw(query, pool)
+                seg.search_hits_raw_with_stats(query, pool)
             };
-            (hits, t.elapsed().as_secs_f64() * 1000.0)
+            (hits, stats, t.elapsed().as_secs_f64() * 1000.0)
         });
         let t = Instant::now();
         let qvec = embedder.embed_query(query)?;
         let embed_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let (hits, bm25_ms) = bm25
+        let (hits, stats, bm25_ms) = bm25
             .join()
             .map_err(|_| anyhow::anyhow!("BM25 helper thread panicked"))?;
-        Ok::<_, anyhow::Error>((qvec, hits, embed_ms, bm25_ms))
+        Ok::<_, anyhow::Error>((qvec, hits, stats, embed_ms, bm25_ms))
     })?;
 
     let t_score = Instant::now();
@@ -351,12 +351,10 @@ fn run_ranked_segmented(
             }
         })
         .collect();
+    stats.num_docs_total = index.num_docs() as usize;
     Ok(RankedRun {
         results,
-        stats: crate::block_max_wand::SearchStats {
-            num_docs_total: index.num_docs() as usize,
-            ..Default::default()
-        },
+        stats,
         bm25_ms,
         embed_ms,
         score_ms,

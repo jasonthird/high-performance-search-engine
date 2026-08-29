@@ -38,13 +38,12 @@ pub struct SearchOutcome {
 /// Duplicate query terms would otherwise double-count BM25 contributions.
 pub fn query_terms<I: SearchableIndex + ?Sized>(index: &I, query: &str) -> Vec<String> {
     let tokenizer = Tokenizer::with_flags(index.remove_stopwords(), index.code_mode());
-    let mut terms = Vec::new();
-    for token in tokenizer.tokenize(query) {
-        if !terms.contains(&token) {
-            terms.push(token);
-        }
-    }
-    terms
+    let mut seen = std::collections::HashSet::new();
+    tokenizer
+        .tokenize(query)
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
 }
 
 /// The underlying index layout: a single immutable index or a segmented

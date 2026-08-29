@@ -312,8 +312,9 @@ impl SegmentedIndex {
         let remove_stopwords = self.manifest.remove_stopwords;
         let tokenizer = Tokenizer::with_flags(remove_stopwords, self.manifest.code_mode);
         let mut terms: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         tokenizer.for_each_token(query, |t| {
-            if !terms.iter().any(|x| x == t) {
+            if seen.insert(t.to_owned()) {
                 terms.push(t.to_owned());
             }
         });
@@ -382,6 +383,16 @@ impl SegmentedIndex {
     /// signals before summaries are materialized.
     pub fn search_hits_raw(&self, query: &str, k: usize) -> Vec<(usize, u32, f32)> {
         self.search_core(query, k).0
+    }
+
+    /// As [`Self::search_hits_raw`], also returning the aggregated engine
+    /// statistics of the run (postings visited, blocks skipped, ...).
+    pub fn search_hits_raw_with_stats(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> (Vec<(usize, u32, f32)>, SearchStats) {
+        self.search_core(query, k)
     }
 
     /// Per-segment directory names, in manifest (and doc-compaction) order.

@@ -255,12 +255,11 @@ pub fn semantic_pool(
             }
         })
         .collect();
-    rows.sort_by(|a, b| {
+    top_k_by(&mut rows, pool, |a, b| {
         b.semantic
             .total_cmp(&a.semantic)
             .then(a.doc_id.cmp(&b.doc_id))
     });
-    rows.truncate(pool.max(1));
     rows
 }
 
@@ -283,13 +282,23 @@ pub fn brute_force_semantic(
             }
         })
         .collect();
-    rows.sort_by(|a, b| {
+    top_k_by(&mut rows, k, |a, b| {
         b.score
             .total_cmp(&a.score)
             .then(a.doc_id.cmp(&b.doc_id))
     });
-    rows.truncate(k);
     rows
+}
+
+/// Keep the best `k` rows by `cmp` without sorting the full candidate set:
+/// O(n) selection, then an O(k log k) sort of only the survivors.
+fn top_k_by<T>(rows: &mut Vec<T>, k: usize, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) {
+    let k = k.max(1);
+    if rows.len() > k {
+        rows.select_nth_unstable_by(k - 1, &cmp);
+        rows.truncate(k);
+    }
+    rows.sort_by(cmp);
 }
 
 fn min_max(vals: impl Iterator<Item = f32>) -> (f32, f32) {
@@ -488,8 +497,7 @@ pub fn segmented_semantic_pool(
             }
             // Keep only this range's best `pool`; the global merge below
             // cannot need more than that from one range.
-            chunk_rows.sort_by(|a, b| b.score.total_cmp(&a.score));
-            chunk_rows.truncate(pool);
+            top_k_by(&mut chunk_rows, pool, |a, b| b.score.total_cmp(&a.score));
             chunk_rows
         })
         .collect();
