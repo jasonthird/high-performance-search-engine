@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: build + test (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Both feature configurations: a cfg() mistake that breaks one but
+      # not the other has shipped before (c865a91 fixed one).
+      - name: Test (default features)
+        run: cargo test
+      - name: Test (--features semantic)
+        run: cargo test --features semantic
+      - name: Check examples and warnings
+        run: |
+          cargo check --examples --features semantic
+          cargo check 2>&1 | tee /tmp/check.log
+          ! grep -q '^warning' /tmp/check.log

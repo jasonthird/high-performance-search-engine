@@ -270,3 +270,43 @@ fn bp_reordering_shrinks_the_index() {
         "bp reordering should shrink postings: {sizes:?}"
     );
 }
+
+/// A truncated or bit-flipped meta.bin must fail at open with an error —
+/// never open "successfully" and panic later inside a query.
+#[test]
+fn corrupt_meta_fails_at_open_not_at_query() {
+    let index = build_index(&clustered_docs(300, 77), true, DEFAULT_BLOCK_SIZE, ReorderStrategy::None);
+    let dir = temp_dir("corrupt");
+    save_index(&index, &dir).unwrap();
+    let meta_path = dir.join("meta.bin");
+    let good = std::fs::read(&meta_path).unwrap();
+
+    // Truncations at many byte lengths: each must load cleanly as an error
+    // or, when the header happens to stay intact, still search without
+    // panicking is NOT required — the contract is Err at open.
+    for keep in [9, 64, good.len() / 4, good.len() / 2, good.len() - 8] {
+        std::fs::write(&meta_path, &good[..keep]).unwrap();
+        assert!(
+            load_index(&dir).is_err(),
+            "truncated meta.bin ({keep} of {} bytes) must not open",
+            good.len()
+        );
+    }
+
+    // Bit-flips in the section table (offsets/lengths) must be caught by
+    // the bounds validation at open.
+    for &byte in &[60usize, 68, 76, 100, 140] {
+        let mut bad = good.clone();
+        bad[byte] ^= 0xFF;
+        std::fs::write(&meta_path, &bad).unwrap();
+        if let Ok(disk) = load_index(&dir) {
+            // A flip that keeps every section in bounds can legitimately
+            // open; searching it must still not panic.
+            let _ = searcher::search(&disk, "t0w1 t1w2", 10);
+        }
+    }
+
+    std::fs::write(&meta_path, &good).unwrap();
+    assert!(load_index(&dir).is_ok(), "restored index must open again");
+    std::fs::remove_dir_all(&dir).ok();
+}

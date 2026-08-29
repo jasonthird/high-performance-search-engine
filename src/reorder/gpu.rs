@@ -206,8 +206,10 @@ struct MetalCtx {
 }
 
 impl MetalCtx {
-    fn new() -> Self {
-        let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
+    /// None when the host has no Metal device (e.g. a virtualized CI
+    /// runner); the caller falls back to the CPU implementation.
+    fn try_new() -> Option<Self> {
+        let device = MTLCreateSystemDefaultDevice()?;
         let library = device
             .newLibraryWithSource_options_error(&NSString::from_str(MSL_SOURCE), None)
             .expect("MSL compilation failed");
@@ -218,11 +220,11 @@ impl MetalCtx {
             .newComputePipelineStateWithFunction_error(&function)
             .expect("pipeline creation failed");
         let queue = device.newCommandQueue().expect("command queue");
-        Self {
+        Some(Self {
             queue,
             pipeline,
             device,
-        }
+        })
     }
 }
 
@@ -268,7 +270,10 @@ unsafe impl Sync for MetalCtx {}
 /// Compute a BP ordering with GPU-assisted top levels. Same contract as
 /// [`super::bp_order`].
 pub fn bp_order_gpu(doc_terms: &[Vec<u32>]) -> Vec<u32> {
-    let ctx = MetalCtx::new();
+    let Some(ctx) = MetalCtx::try_new() else {
+        eprintln!("no Metal device available; falling back to CPU graph bisection");
+        return super::bp_order(doc_terms);
+    };
     let num_docs = doc_terms.len();
     let num_terms = doc_terms
         .iter()

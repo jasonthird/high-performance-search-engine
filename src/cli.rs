@@ -568,6 +568,24 @@ fn cmd_index(
         let texts = embed_texts.context("internal error: embed texts were dropped")?;
         let lens: Vec<u32> = index.docs().iter().map(|d| d.doc_len).collect();
         cmd_write_embeddings(out, &texts, &lens, ivf_clusters)?;
+    } else {
+        // Rebuilding in place renumbers doc_ids; vector sidecars from a
+        // previous --embed build would map stale rows onto the new ids
+        // (undetectably when the doc count happens to match). Remove them
+        // rather than serve wrong scores; `embed` recreates them.
+        let mut removed = Vec::new();
+        for name in ["embeddings.bin", "ivf.bin", "pq.bin", "keys.bin"] {
+            if fs::remove_file(out.join(name)).is_ok() {
+                removed.push(name);
+            }
+        }
+        if !removed.is_empty() {
+            println!(
+                "removed stale vector sidecars from previous embedded build: {} \
+                 (rerun with --embed to rebuild them)",
+                removed.join(", ")
+            );
+        }
     }
     Ok(())
 }
