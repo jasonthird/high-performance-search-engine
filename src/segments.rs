@@ -198,6 +198,31 @@ pub fn is_segmented(dir: &Path) -> bool {
     dir.join(MANIFEST_FILE).exists()
 }
 
+/// Recompute a segment's live doc count and live length from its tombstone
+/// bitmap, given the segment's open index for per-doc lengths.
+///
+/// Tombstone files and the manifest are written in separate steps; a crash
+/// between them leaves the manifest's cached `live_docs`/`live_len` stale.
+/// The bitmaps are the source of truth, so both open paths recount from
+/// them and the counts self-heal.
+fn recount_live(entry: &SegmentEntry, index: &DiskIndex, deleted: &[u64]) -> (u32, u64) {
+    let mut dead = 0u32;
+    let mut dead_len = 0u64;
+    for (wi, &word) in deleted.iter().enumerate() {
+        let mut word = word;
+        while word != 0 {
+            let bit = word.trailing_zeros();
+            let doc = wi as u32 * 64 + bit;
+            if doc < entry.num_docs {
+                dead += 1;
+                dead_len += index.doc_len(doc) as u64;
+            }
+            word &= word - 1;
+        }
+    }
+    (entry.num_docs - dead, entry.total_len - dead_len)
+}
+
 impl SegmentedIndex {
     pub fn open(dir: &Path) -> anyhow::Result<Self> {
         let manifest = read_manifest(dir)?;
@@ -207,8 +232,13 @@ impl SegmentedIndex {
             .map(|entry| {
                 let index = storage::load_index(&dir.join(&entry.name))?;
                 let deleted = read_tombstones(dir, &entry.name, entry.num_docs)?;
+                // Trust the bitmaps, not the manifest's cached counts: a
+                // crash between tombstone and manifest writes leaves the
+                // cache stale, and global BM25 stats come from these.
+                let mut entry = entry.clone();
+                (entry.live_docs, entry.live_len) = recount_live(&entry, &index, &deleted);
                 Ok(Segment {
-                    entry: entry.clone(),
+                    entry,
                     index,
                     deleted,
                 })
@@ -461,6 +491,11 @@ pub struct UpsertOutcome {
 pub struct SegmentedWriter {
     dir: PathBuf,
     manifest: Manifest,
+    /// Exclusive advisory lock on `writer.lock`, held for the writer's
+    /// lifetime. Two concurrent writers would otherwise both read the same
+    /// `next_segment`, claim the same `seg-NNNNNN` directory, and clobber
+    /// each other's manifest. Released on drop (close).
+    _lock: File,
 }
 
 impl SegmentedWriter {
@@ -482,8 +517,21 @@ impl SegmentedWriter {
         code_mode: bool,
     ) -> anyhow::Result<Self> {
         fs::create_dir_all(dir)?;
+        let lock = File::create(dir.join("writer.lock")).context("failed to create writer.lock")?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "{} is locked by another writer (writer.lock held)",
+                dir.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).context("failed to lock writer.lock")
+            }
+        }
         let manifest = if is_segmented(dir) {
-            read_manifest(dir)?
+            let mut manifest = read_manifest(dir)?;
+            Self::recover(dir, &mut manifest)?;
+            manifest
         } else {
             anyhow::ensure!(
                 !dir.join("meta.bin").exists(),
@@ -505,7 +553,51 @@ impl SegmentedWriter {
         Ok(Self {
             dir: dir.to_path_buf(),
             manifest,
+            _lock: lock,
         })
+    }
+
+    /// Crash recovery, run once at writer open with the lock held:
+    /// self-heal the manifest's cached live counts from the tombstone
+    /// bitmaps, and garbage-collect segment directories and tombstone
+    /// files that no manifest entry references (a crash mid-`merge_all`
+    /// or mid-add leaves them behind).
+    fn recover(dir: &Path, manifest: &mut Manifest) -> anyhow::Result<()> {
+        let mut healed = false;
+        for entry in manifest.segments.iter_mut() {
+            let deleted = read_tombstones(dir, &entry.name, entry.num_docs)?;
+            if deleted.iter().all(|&w| w == 0) {
+                continue;
+            }
+            let index = storage::load_index(&dir.join(&entry.name))?;
+            let (live_docs, live_len) = recount_live(entry, &index, &deleted);
+            if (live_docs, live_len) != (entry.live_docs, entry.live_len) {
+                (entry.live_docs, entry.live_len) = (live_docs, live_len);
+                healed = true;
+            }
+        }
+        if healed {
+            write_manifest(dir, manifest)?;
+        }
+
+        let referenced: std::collections::HashSet<&str> =
+            manifest.segments.iter().map(|e| e.name.as_str()).collect();
+        for e in fs::read_dir(dir)? {
+            let e = e?;
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(seg) = name.strip_suffix(".del") {
+                if !referenced.contains(seg) {
+                    fs::remove_file(e.path()).ok();
+                }
+            } else if name.starts_with("seg-")
+                && e.file_type()?.is_dir()
+                && !referenced.contains(name)
+            {
+                fs::remove_dir_all(e.path()).ok();
+            }
+        }
+        Ok(())
     }
 
     /// Add a batch of documents as one new segment.

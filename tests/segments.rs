@@ -224,6 +224,7 @@ fn merge_equals_fresh_rebuild_of_live_docs() {
         assert!(writer.delete_document(id).unwrap());
     }
     writer.merge_all().unwrap();
+    drop(writer); // release the writer lock before reopening below
 
     let merged = SegmentedIndex::open(&dir).unwrap();
     assert_eq!(merged.num_segments(), 1);
@@ -311,6 +312,83 @@ fn upsert_detects_changes_by_content_hash() {
     writer.merge_all().unwrap();
     let (added, updated, unchanged) = writer.upsert_documents(&next).unwrap();
     assert_eq!((added, updated, unchanged), (0, 0, 201));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn second_writer_is_locked_out() {
+    let dir = temp_dir("lock");
+    let mut writer = SegmentedWriter::open_or_create(&dir, true, 2).unwrap();
+    writer.add_documents(&generate_docs(10, 50, 1, "l")).unwrap();
+
+    let err = match SegmentedWriter::open_or_create(&dir, true, 2) {
+        Ok(_) => panic!("second writer must not acquire the lock"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("locked by another writer"),
+        "unexpected error: {err:#}"
+    );
+
+    // Dropping the first writer releases the lock.
+    drop(writer);
+    SegmentedWriter::open_or_create(&dir, true, 2).unwrap();
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stale_manifest_counts_self_heal() {
+    let dir = temp_dir("heal");
+    let docs = generate_docs(30, 80, 2, "h");
+    {
+        let mut writer = SegmentedWriter::open_or_create(&dir, true, 2).unwrap();
+        writer.add_documents(&docs).unwrap();
+        writer.delete_document("h-3").unwrap();
+    }
+    // Simulate a crash between the tombstone write and the manifest write:
+    // roll the manifest back to the pre-delete state while the tombstone
+    // stays on disk.
+    let manifest_path = dir.join("manifest.bin");
+    let good = std::fs::read(&manifest_path).unwrap();
+    {
+        let mut writer = SegmentedWriter::open_or_create(&dir, true, 2).unwrap();
+        writer.delete_document("h-4").unwrap();
+    }
+    std::fs::write(&manifest_path, &good).unwrap();
+
+    // The reader recounts from the bitmaps: both deletions visible.
+    let index = SegmentedIndex::open(&dir).unwrap();
+    assert_eq!(index.num_docs_live(), 28);
+
+    // The writer heals the manifest on open; a plain re-read then agrees.
+    drop(SegmentedWriter::open_or_create(&dir, true, 2).unwrap());
+    let index = SegmentedIndex::open(&dir).unwrap();
+    assert_eq!(index.num_docs_live(), 28);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn orphan_segments_are_garbage_collected() {
+    let dir = temp_dir("gc");
+    {
+        let mut writer = SegmentedWriter::open_or_create(&dir, true, 2).unwrap();
+        writer.add_documents(&generate_docs(10, 50, 3, "g")).unwrap();
+    }
+    // Simulate a crash mid-add: a segment directory and tombstone file
+    // that no manifest entry references.
+    let orphan = dir.join("seg-000999");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("meta.bin"), b"partial").unwrap();
+    std::fs::write(dir.join("seg-000999.del"), [0u8; 8]).unwrap();
+
+    drop(SegmentedWriter::open_or_create(&dir, true, 2).unwrap());
+    assert!(!orphan.exists(), "orphan segment dir should be removed");
+    assert!(!dir.join("seg-000999.del").exists());
+    // The real segment survives.
+    assert_eq!(SegmentedIndex::open(&dir).unwrap().num_docs_live(), 10);
 
     std::fs::remove_dir_all(&dir).ok();
 }
