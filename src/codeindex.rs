@@ -539,11 +539,6 @@ impl RepoIndexer {
         Ok(manifest)
     }
 
-    /// Encode one segment's documents (cache-first) and write its
-    /// `embeddings.bin` plus `keys.bin` (the embcache key per doc, in
-    /// doc_id order) so a later merge can rebuild vectors without the
-    /// encoder.
-    #[cfg(feature = "semantic")]
     /// Cache-first encode: hash each text, encode only the cache misses in
     /// batches of `batch`, and return `(keys, vectors, encoded, cached)`.
     /// The cache is updated in memory; the caller decides when to save it.
@@ -589,6 +584,11 @@ impl RepoIndexer {
         Ok((keys, vectors, encoded, cached))
     }
 
+    /// Encode one segment's documents (cache-first) and write its
+    /// `embeddings.bin` plus `keys.bin` (the embcache key per doc, in
+    /// doc_id order) so a later merge can rebuild vectors without the
+    /// encoder.
+    #[cfg(feature = "semantic")]
     fn embed_segment(
         &self,
         seg_dir: &Path,
