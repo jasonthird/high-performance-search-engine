@@ -233,8 +233,13 @@ struct GpuCorpus {
     edge_term: SharedBuf<u32>,
     /// Edge range of each original document (`num_docs + 1` entries).
     doc_offsets: SharedBuf<u32>,
-    /// The permutation being computed; partitions address it by offset.
-    order: SharedBuf<u32>,
+    /// Metal handle for the permutation buffer — only the objc object, not
+    /// the host memory. The CPU side of that memory is owned by a separate
+    /// `PageAligned` in `bp_order_gpu` and mutated exclusively through the
+    /// `&mut [u32]` threaded down the recursion; keeping the `PageAligned`
+    /// here too would alias that `&mut` through `&GpuCorpus` (UB under
+    /// stacked borrows).
+    order_mtl: Retained<ProtocolObject<dyn MTLBuffer>>,
     num_terms: usize,
 }
 
@@ -300,31 +305,41 @@ pub fn bp_order_gpu(doc_terms: &[Vec<u32>]) -> Vec<u32> {
         // 1-element "permutation" naming a document that doesn't exist.
         return Vec::new();
     }
-    let mut order = SharedBuf::<u32>::zeroed(&ctx.device, num_docs.max(1));
-    for (i, slot) in order.mem.as_mut_slice().iter_mut().enumerate() {
+    // The order memory stays a standalone `PageAligned`, mutated only
+    // through the `&mut [u32]` below; the corpus holds just the wrapping
+    // Metal handle, so no shared Rust reference to this memory exists
+    // while the recursion mutates it. The GPU reads it through the Metal
+    // buffer (same physical pages); disjoint partition ranges + waiting on
+    // each dispatch before mutating keep that race-free.
+    let mut order_mem = PageAligned::<u32>::zeroed(num_docs);
+    for (i, slot) in order_mem.as_mut_slice().iter_mut().enumerate() {
         *slot = i as u32;
     }
-    // The CPU permutes `order` in place through this slice while dispatches
-    // read it through the wrapping Metal buffer (same memory). Disjoint
-    // partition ranges + waiting on each dispatch before mutating keep this
-    // race-free.
-    // SAFETY: `corpus` (and the allocation) outlives the recursion; the
-    // slice is only ever split into disjoint sub-partitions.
-    let order_slice: &mut [u32] =
-        unsafe { std::slice::from_raw_parts_mut(order.mem.ptr.as_ptr().cast(), num_docs) };
+    // SAFETY: the pointer is page-aligned, the length is a page multiple,
+    // and `order_mem` outlives `corpus` (declared before it, so it drops
+    // after; no deallocator, so Metal never frees memory it does not own).
+    let order_mtl = unsafe {
+        ctx.device.newBufferWithBytesNoCopy_length_options_deallocator(
+            order_mem.ptr.cast(),
+            order_mem.byte_cap,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    }
+    .expect("newBufferWithBytesNoCopy failed");
 
     let corpus = GpuCorpus {
         ctx,
         edge_term,
         doc_offsets,
-        order,
+        order_mtl,
         num_terms,
     };
 
-    bisect_gpu(order_slice, 0, doc_terms, &corpus, 0);
+    bisect_gpu(order_mem.as_mut_slice(), 0, doc_terms, &corpus, 0);
 
-    let result = corpus.order.mem.as_slice().to_vec();
-    result
+    drop(corpus); // release the Metal buffer before reading the memory back
+    order_mem.as_slice().to_vec()
 }
 
 /// Encode, commit, and wait for one gain pass over `n` slots starting at
@@ -346,7 +361,7 @@ fn dispatch_gains(
     // buffer; offsets are 4-byte aligned; params is a plain #[repr(C)]
     // struct matching the MSL layout.
     unsafe {
-        enc.setBuffer_offset_atIndex(Some(&corpus.order.mtl), base * size_of::<u32>(), 0);
+        enc.setBuffer_offset_atIndex(Some(&corpus.order_mtl), base * size_of::<u32>(), 0);
         enc.setBuffer_offset_atIndex(Some(&corpus.edge_term.mtl), 0, 1);
         enc.setBuffer_offset_atIndex(Some(&corpus.doc_offsets.mtl), 0, 2);
         enc.setBuffer_offset_atIndex(Some(&side.mtl), 0, 3);

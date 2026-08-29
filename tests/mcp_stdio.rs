@@ -183,3 +183,43 @@ fn path_glob_restricts_results() {
     }
     std::fs::remove_dir_all(&cache).ok();
 }
+
+#[test]
+fn answers_json_rpc_batches() {
+    let cache = temp_cache("batch");
+    let mut client = Client::start(&cache);
+    client.call(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "1"}}),
+    );
+
+    // A batch of two requests answers with an array of two responses
+    // (previously the whole batch was silently dropped and a batching
+    // client would block forever).
+    client.send(json!([
+        {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}}
+    ]));
+    let mut line = String::new();
+    client.stdout.read_line(&mut line).expect("read batch response");
+    let response: Value = serde_json::from_str(&line).expect("valid JSON");
+    let batch = response.as_array().expect("batch answers with an array");
+    assert_eq!(batch.len(), 2);
+    let ids: Vec<&Value> = batch.iter().map(|r| &r["id"]).collect();
+    assert!(ids.contains(&&json!(2)) && ids.contains(&&json!(3)));
+
+    // An empty batch is an invalid request, not silence.
+    client.send(json!([]));
+    let mut line = String::new();
+    client.stdout.read_line(&mut line).expect("read error response");
+    let response: Value = serde_json::from_str(&line).expect("valid JSON");
+    assert_eq!(response["error"]["code"], -32600);
+
+    // Still alive.
+    let status = client.tool_text(4, "index_status", json!({}));
+    assert!(status.contains("root:"), "{status}");
+
+    std::fs::remove_dir_all(&cache).ok();
+}

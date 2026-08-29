@@ -134,7 +134,10 @@ pub fn build_index_external(
 
     // ---- Phase 1: stream, tokenize, spill ------------------------------
     let phase1_start = std::time::Instant::now();
-    let mut lines: Vec<String> = Vec::with_capacity(CHUNK_DOCS);
+    // Each buffered line carries its own 1-based line number: blank lines
+    // are skipped but still counted, so an arithmetic reconstruction from
+    // the chunk position would point parse errors at the wrong line.
+    let mut lines: Vec<(usize, String)> = Vec::with_capacity(CHUNK_DOCS);
     let mut line_no = 0usize;
     let mut eof = false;
     while !eof {
@@ -148,21 +151,19 @@ pub fn build_index_external(
             }
             line_no += 1;
             if !buf.trim().is_empty() {
-                lines.push(buf.clone());
+                lines.push((line_no, buf.clone()));
             }
         }
         if lines.is_empty() {
             continue;
         }
-        let first_line = line_no - lines.len();
         let parsed: Vec<InputDoc> = std::mem::take(&mut lines)
             .into_par_iter()
-            .enumerate()
-            .map(|(i, line)| {
+            .map(|(no, line)| {
                 // simd-json parses in place (NEON on Apple silicon).
                 let mut bytes = line.into_bytes();
                 simd_json::serde::from_slice::<InputDoc>(&mut bytes)
-                    .with_context(|| format!("invalid JSON on line {}", first_line + i + 1))
+                    .with_context(|| format!("invalid JSON on line {no}"))
             })
             .collect::<anyhow::Result<_>>()?;
 

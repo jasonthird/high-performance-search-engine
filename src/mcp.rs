@@ -124,7 +124,9 @@ impl Server {
         Ok(())
     }
 
-    /// Parse one message and produce its response, if any.
+    /// Parse one line and produce its response, if any. A line may hold a
+    /// single message or a JSON-RPC batch (array); a batch answers with an
+    /// array of the responses to its non-notification members.
     fn handle_line(&mut self, line: &str) -> Option<String> {
         let message: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -134,6 +136,31 @@ impl Server {
                 )
             }
         };
+        match message {
+            Value::Array(items) => {
+                if items.is_empty() {
+                    return Some(
+                        error_response(Value::Null, -32600, "invalid request: empty batch")
+                            .to_string(),
+                    );
+                }
+                let responses: Vec<Value> = items
+                    .into_iter()
+                    .filter_map(|m| self.handle_message(m))
+                    .collect();
+                (!responses.is_empty()).then(|| Value::Array(responses).to_string())
+            }
+            m => self.handle_message(m).map(|v| v.to_string()),
+        }
+    }
+
+    /// Handle one (non-batch) message; None for notifications.
+    fn handle_message(&mut self, message: Value) -> Option<Value> {
+        if !message.is_object() {
+            // A client waiting on a malformed request would block forever
+            // on silence; answer with invalid-request instead.
+            return Some(error_response(Value::Null, -32600, "invalid request"));
+        }
         let id = message.get("id").cloned();
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let params = message.get("params").cloned().unwrap_or(json!({}));
@@ -147,14 +174,12 @@ impl Server {
             "tools/call" => self.on_tools_call(&params),
             "ping" => Ok(json!({})),
             other => {
-                return Some(
-                    error_response(id, -32601, &format!("method not found: {other}")).to_string(),
-                )
+                return Some(error_response(id, -32601, &format!("method not found: {other}")))
             }
         };
         Some(match result {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
-            Err(e) => error_response(id, -32603, &format!("{e:#}")).to_string(),
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(e) => error_response(id, -32603, &format!("{e:#}")),
         })
     }
 
