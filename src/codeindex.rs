@@ -175,7 +175,7 @@ pub fn default_index_dir(root: &Path) -> PathBuf {
     cache_root().join(format!("{name}-{h:016x}"))
 }
 
-fn cache_root() -> PathBuf {
+pub(crate) fn cache_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("CSEARCH_CACHE_DIR") {
         return PathBuf::from(dir);
     }

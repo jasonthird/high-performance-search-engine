@@ -41,6 +41,7 @@ notify = { version = "8.2.0", default-features = false, features = ["macos_fseve
 # Metal for batched document encoding; Accelerate for batch-1 query
 # encoding (Candle Metal is kernel-launch bound on short BERT sequences).
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-ml = { version = "0.3.2", optional = true, default-features = false, features = ["std", "MLModel", "MLModelConfiguration", "MLMultiArray", "MLFeatureValue", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLFeatureDescription", "MLModelDescription", "block2"] }
 candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
 candle-nn = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
 candle-transformers = { version = "0.11", optional = true, features = ["metal"] }
@@ -57,6 +58,9 @@ semantic = [
     "dep:candle-transformers",
     "dep:tokenizers",
     "dep:hf-hub",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-core-ml",
 ]
 
 # Candle fork with fused Metal SDPA in NomicBert attention: 1.7x faster

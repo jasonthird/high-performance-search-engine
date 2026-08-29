@@ -10,6 +10,8 @@ pub mod bm25;
 pub mod cli;
 pub mod codeindex;
 pub mod compress;
+#[cfg(all(target_os = "macos", feature = "semantic"))]
+pub mod coreml;
 #[cfg(feature = "semantic")]
 pub mod embedder;
 pub mod embcache;

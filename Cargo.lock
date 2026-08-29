@@ -1336,6 +1336,7 @@ dependencies = [
  "memmap2",
  "notify",
  "objc2",
+ "objc2-core-ml",
  "objc2-foundation",
  "objc2-metal",
  "rayon",
@@ -2019,6 +2020,17 @@ dependencies = [
  "bitflags 2.13.0",
  "dispatch2",
  "objc2",
+]
+
+[[package]]
+name = "objc2-core-ml"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201b055e6acfa0f9f15568255d3f03ce2b54bc86d1814442dc69138e36813e18"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

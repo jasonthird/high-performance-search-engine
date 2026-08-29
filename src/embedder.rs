@@ -44,9 +44,15 @@ pub enum EmbedUse {
 }
 
 pub struct Embedder {
-    model: NomicBertModel,
+    /// Candle model + device; `None` when CoreML serves every request
+    /// this instance can receive.
+    model: Option<NomicBertModel>,
     tokenizer: Tokenizer,
-    device: Device,
+    device: Option<Device>,
+    /// CoreML/ANE backend, preferred on macOS when compiled models exist
+    /// (see `crate::coreml`). `HIPS_ENCODER=candle` disables it.
+    #[cfg(target_os = "macos")]
+    coreml: Option<crate::coreml::CoreMlEncoder>,
     /// Query-vector LRU: a repeated query costs a map lookup instead of a
     /// ~7-15 ms forward pass. Agents re-issue queries (retries, refinement
     /// loops, "the same search with a different top_k") often enough that
@@ -153,22 +159,47 @@ impl Embedder {
             ..Default::default()
         }));
 
-        // CANDLE_METAL_COMPUTE_PER_BUFFER is set in main() before any
-        // thread exists (calling setenv here would race concurrent getenv
-        // on the rayon/watcher threads — undefined behavior).
-        let (device, dtype) = pick_device(kind);
-        // SAFETY: weights file is not mutated while mapped.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device) }
-            .context("mmap CodeRankEmbed safetensors")?;
+        #[cfg(target_os = "macos")]
+        let coreml = if std::env::var("HIPS_ENCODER").as_deref() == Ok("candle") {
+            None
+        } else {
+            crate::coreml::CoreMlEncoder::load()
+        };
+        // Candle stays the fallback: load it unless CoreML can serve every
+        // request this instance will get (queries need the batch-1 model).
+        #[cfg(target_os = "macos")]
+        let candle_needed = match (&coreml, kind) {
+            (None, _) => true,
+            (Some(cm), EmbedUse::Query) => !cm.has_query_model(),
+            (Some(_), EmbedUse::Index) => false,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let candle_needed = true;
 
-        let model = load_nomic(vb, &config).context(
-            "load NomicBert weights (tried prefixes '', 'bert', 'nomic_bert')",
-        )?;
+        let (model, device) = if candle_needed {
+            // CANDLE_METAL_COMPUTE_PER_BUFFER is set in main() before any
+            // thread exists (calling setenv here would race concurrent
+            // getenv on the rayon/watcher threads — undefined behavior).
+            let (device, dtype) = pick_device(kind);
+            // SAFETY: weights file is not mutated while mapped.
+            let vb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device) }
+                    .context("mmap CodeRankEmbed safetensors")?;
+            let model = load_nomic(vb, &config).context(
+                "load NomicBert weights (tried prefixes '', 'bert', 'nomic_bert')",
+            )?;
+            (Some(model), Some(device))
+        } else {
+            eprintln!("CodeRankEmbed device: ANE (CoreML)");
+            (None, None)
+        };
 
         let embedder = Self {
             model,
             tokenizer,
             device,
+            #[cfg(target_os = "macos")]
+            coreml,
             query_cache: std::sync::Mutex::new(QueryCache::new()),
         };
         // Compile Metal pipelines (first forward is hundreds of ms).
@@ -222,6 +253,17 @@ impl Embedder {
             .unwrap_or(DEFAULT_BATCH)
     }
 
+    /// The batch size for this instance's active backend: the CoreML
+    /// document models' compiled batch when CoreML is serving, else the
+    /// measured candle batch.
+    fn effective_batch(&self) -> usize {
+        #[cfg(target_os = "macos")]
+        if let Some(cm) = &self.coreml {
+            return cm.doc_batch();
+        }
+        Self::batch_size()
+    }
+
     fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         // Length bucketing on by default: measured 73.4 -> 38.6 ms/chunk on
         // real corpus chunks (padding to the batch's longest member wasted
@@ -229,7 +271,7 @@ impl Embedder {
         // shows the vectors match the unbucketed path to within F16 rerun
         // noise. Batch stays 4: larger batches measured slower even
         // bucketed. `HPS_EMBED_BATCH` overrides.
-        self.embed_docs_with(texts, Self::batch_size(), true)
+        self.embed_docs_with(texts, self.effective_batch(), true)
     }
 
     /// Encode with an explicit batch size and optional length bucketing.
@@ -271,6 +313,32 @@ impl Embedder {
             .tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+
+        #[cfg(target_os = "macos")]
+        if let Some(cm) = &self.coreml {
+            // Unpadded rows (mask == 1); CoreML pads to its compiled shape.
+            let rows: Vec<Vec<u32>> = encodings
+                .iter()
+                .map(|e| {
+                    e.get_ids()
+                        .iter()
+                        .zip(e.get_attention_mask())
+                        .take_while(|(_, &m)| m == 1)
+                        .map(|(&t, _)| t)
+                        .collect()
+                })
+                .collect();
+            if rows.len() == 1 {
+                if let Some(result) = cm.encode_query(&rows[0]) {
+                    return Ok(vec![result?]);
+                }
+            }
+            let mut out = Vec::with_capacity(rows.len());
+            for group in rows.chunks(cm.doc_batch()) {
+                out.extend(cm.encode_docs(group)?);
+            }
+            return Ok(out);
+        }
         let seq = encodings.iter().map(|e| e.len()).max().unwrap_or(0);
         let batch = encodings.len();
         let mut ids = vec![0u32; batch * seq];
@@ -285,16 +353,23 @@ impl Embedder {
         }
         let tok_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
-        let ids = Tensor::from_vec(ids, (batch, seq), &self.device)?;
+        let device = self
+            .device
+            .as_ref()
+            .context("candle backend not loaded (CoreML-only instance)")?;
+        let model = self
+            .model
+            .as_ref()
+            .context("candle backend not loaded (CoreML-only instance)")?;
+        let ids = Tensor::from_vec(ids, (batch, seq), device)?;
         // Candle's Metal backend implements where_cond for (U8, F16) but not
         // (U32, F16). NomicBert builds the attention mask with where_cond, so
         // keep the mask as U8 when running F16 on the GPU.
-        let mask = Tensor::from_vec(mask, (batch, seq), &self.device)?;
-        let token_types = Tensor::zeros((batch, seq), DType::U32, &self.device)?;
+        let mask = Tensor::from_vec(mask, (batch, seq), device)?;
+        let token_types = Tensor::zeros((batch, seq), DType::U32, device)?;
         let upload_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = Instant::now();
-        let hidden = self
-            .model
+        let hidden = model
             .forward(&ids, Some(&token_types), Some(&mask))
             .context("nomic-bert forward")?;
         // CLS pooling: first token of each sequence. Sentence-transformers
@@ -302,7 +377,7 @@ impl Embedder {
         let cls = hidden.i((.., 0, ..))?;
         let normed = l2_normalize(&cls)?.to_dtype(DType::F32)?;
         let vecs = if profile() {
-            self.device.synchronize().ok();
+            device.synchronize().ok();
             let fwd_ms = t2.elapsed().as_secs_f64() * 1000.0;
             let t3 = Instant::now();
             let vecs = normed.to_vec2::<f32>()?;

@@ -30,3 +30,10 @@ switched vectors. Until then this stays a measured prototype.
 
 Run: uv venv; uv pip install 'torch==2.7.0' transformers coremltools 'numpy<2' einops
      python ane_convert.py 8 256 && python ane_bench.py && python ane_fidelity.py
+
+**Update 2026-08-30**: shipped as `src/coreml.rs`. The encoder auto-uses
+compiled models from `<cache>/coreml/` when present (this directory's
+scripts produce them); `HIPS_ENCODER=candle` forces the fallback.
+Measured e2e: 810-chunk cold index 28.6s -> 13.0s (2.2x; first-ever run
+adds one-time ANE plan compilation the OS then caches), hybrid query
+0.10s wall including model load.
