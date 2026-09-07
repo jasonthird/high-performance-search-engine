@@ -1,0 +1,12 @@
+[package]
+name = "hips-grammar-csharp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tree-sitter-c-sharp.workspace = true
+

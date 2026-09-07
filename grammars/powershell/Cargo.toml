@@ -1,0 +1,12 @@
+[package]
+name = "hips-grammar-powershell"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tree-sitter-powershell.workspace = true
+

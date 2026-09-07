@@ -1,7 +1,15 @@
 # Algorithms & Theory
 
-Every algorithm implemented in this engine, why it works, and where it comes
-from. File references point at the implementation.
+The algorithms and architecture implemented in this working tree, checked
+against the source on 2026-09-07. File references point at the implementation.
+Historical benchmark results describe the measured corpus, hardware, and
+configuration; they are not fresh measurements of every current build.
+
+The current repository-search path combines declaration chunks from loadable
+tree-sitter grammars, incremental immutable segments, exact BM25 retrieval,
+and optional CodeRankEmbed vectors. Single-layout indexes retain IVF/PQ for
+experiments and bulk corpora. The CLI, REPL, and MCP server share ranked
+retrieval; the HTTP API currently exposes lexical search.
 
 ---
 
@@ -24,13 +32,14 @@ containing none of the query terms are never touched. Sorting by doc_id is
 what enables everything else below: gap compression, binary-searchable
 skipping, and the merge-style cursor advancement in WAND.
 
-Construction here is a parallel fold-and-merge (rayon): tokenize documents in
-parallel, build partial `term -> postings` maps per chunk of documents, merge
-the maps, sort each list by doc_id, then attach block metadata. This is a
-simplified in-memory version of the classic blocked sort-based / merge-based
-indexing used when corpora exceed RAM.
+Construction streams JSONL in batches, parses and tokenizes documents in
+parallel with rayon, interns terms, and scatters per-document term counts
+into ordered posting lists before attaching impact metadata. Raw documents
+do not accumulate for the entire corpus. `src/external.rs` adds a bounded
+spill-to-disk path: sorted posting shards are merged into compressed output
+when the corpus exceeds the in-memory build budget.
 
-The hybrid experiment (§14) reuses this exact posting-list shape a second
+The single-layout hybrid path (§14) reuses this exact posting-list shape a second
 time, with **cluster ids** as the vocabulary: `cluster_id → (doc_id, tf=1)`.
 Both inverted files address the same `doc_id` space.
 
@@ -102,19 +111,20 @@ Ding & Suel, *"Faster top-k document retrieval using block-max indexes"*,
 SIGIR 2011. WAND's weakness is that U_t is one number for an entire posting
 list — usually a wild overestimate for any particular region of it. BMW
 splits each posting list into fixed-size blocks (128 postings here) and
-stores per block exactly the two facts the search path reads:
+stores the block's last document id and an impact pair:
 
 ```
-max_doc_id        (skip whole blocks that end before a target)
-block_max_score   (the safe upper bound that makes skipping exact)
+max_doc_id            skip whole blocks ending before a target
+max_tf, min_doc_len   derive a safe bound under current corpus statistics
 ```
 
-(Block posting ranges are derived from the fixed block size; nothing else
-is stored.) `block_max_score` = max actual BM25 contribution over the
-block's postings,
-computed at index time **with the same formula used at query time** (so the
-bound is exact, not estimated). After WAND picks a pivot, BMW sums the block
-maxima of the blocks containing the pivot doc. If even this refined bound is
+Block posting ranges are derived from the fixed block size. BM25 increases
+with term frequency and decreases with document length, so evaluating the
+pair bounds every posting in the block. The two extrema may belong to
+different documents: this is a conservative bound, not necessarily a score
+any document attains. Query-time evaluation keeps it safe when segment
+updates change idf and average length (§11). After WAND picks a pivot, BMW
+sums these bounds for the blocks containing the pivot doc. If even this refined bound is
 ≤ θ, the engine jumps all prefix cursors past the nearest block boundary —
 skipping whole blocks *without decoding them*. The jump target is capped at
 the next cursor's doc_id, because beyond it another term could contribute.
@@ -171,9 +181,9 @@ partitioned Elias–Fano, SIMD-BP128), trading more complexity for another
 ~1.5–2×.
 
 Why fixed-width per block rather than per-integer codes (varint, gamma)?
-Random access *within* the encoded stream isn't needed — blocks are decoded
-whole — but fixed width keeps decode branch-free and cheap, which matters
-because BMW decodes blocks on the hot path.
+Document gaps are decoded a block at a time, while fixed-width term
+frequencies support random access for only the documents actually scored.
+Fixed width keeps decoding simple and makes lazy tf reads inexpensive.
 
 Decode extracts multiple gaps per unaligned 64-bit load — (64−7)/width
 values regardless of bit alignment (2 for rare terms, dozens for dense
@@ -233,9 +243,11 @@ so heuristics:
 
 The index is split into:
 
-- `meta.bin` — document metadata, term dictionary, per-term statistics and
-  block skip-tables. Small and hot; deserialized into RAM (analogous to the
-  term dictionary/FST that even mmap-based engines keep readily accessible).
+- `meta.bin` — document lengths, the term dictionary, per-term statistics,
+  and impact/skip tables, loaded into RAM. Document text lives separately in
+  `docs.bin`, so scoring does not need to materialize every title or snippet.
+- `docs.bin` — memory-mapped document ids, titles, and snippets; only returned
+  hits need their document-store records resolved.
 - `postings.bin` — all compressed posting blocks. **Memory-mapped**, not
   read: `mmap(2)` maps the file into virtual address space; the OS faults
   4 KiB pages in on first access and evicts them under memory pressure
@@ -251,19 +263,22 @@ The synergy with BMW + compression: a skipped block is never decoded, so its
 bytes are never touched, so its page is never read from disk. Logical
 skipping becomes physical I/O avoidance.
 
-The hybrid experiment (§14) adds three more mmap sidecars in the same
+A single-layout embedded index (§14) adds three more mmap sidecars in the same
 directory — `embeddings.bin` (dense rows), `ivf.bin` (cluster posting
 lists, same block codec as `postings.bin`), `pq.bin` (product-quantized
-codes). The lexical evaluators never open them.
+codes). Lexical scoring does not read vector rows. The default repository
+layout instead stores vectors per segment without IVF/PQ.
 
-## 9. GPU offload experiment (CubeCL / wgpu / Metal)
+## 9. GPU document reordering: Metal and the earlier experiments
 
 **Where:** `src/reorder/gpu.rs` (feature `gpu`, `--reorder bp-gpu`)
 
-An experiment in accelerating index construction with the Mac's GPU, first
-through [Burn](https://burn.dev)'s tensor API, then rewritten as a single
+The shipped optional backend uses zero-copy Metal through `objc2-metal`.
+Burn, wgpu, and CubeCL below describe earlier implementations, not current
+build dependencies. The experiment in accelerating construction began
+with [Burn](https://burn.dev)'s tensor API, then moved to a single
 hand-fused kernel in [CubeCL](https://github.com/tracel-ai/cubecl) (the GPU
-compute DSL underneath Burn). Honest results, on the 108k doc / 19.2M edge
+compute DSL underneath Burn). Historical results, on the 108k doc / 19.2M edge
 home corpus:
 
 | Variant | Index time |
@@ -341,11 +356,10 @@ inverted file plus (optional) product-quantized table lookups on the CPU.
 
 **Where:** `src/indexer.rs` (build), `src/api.rs` (serve)
 
-- **Indexing**: data-parallel map/reduce over documents (rayon work-stealing),
-  then per-term parallel finalization. Deterministic output: term ids are
-  assigned in sorted term order and postings are sorted by doc_id regardless
-  of worker scheduling.
-- **Serving**: the index is immutable after build (`Arc<DiskIndex>` shared
+- **Indexing**: rayon parallelizes document work and finalization. Posting
+  lists are ordered by doc_id; sorted dictionary serialization and stable
+  input ordering make retrieval independent of worker scheduling.
+- **Serving**: the index is immutable after build (`Arc<AppState>` containing an `AnyIndex`, shared
   across handlers, no locks needed). Searches run on tokio's blocking pool so
   CPU-bound scoring doesn't starve the async accept loop. Immutability is
   what makes the whole read path trivially thread-safe — the same reason
@@ -358,7 +372,7 @@ inverted file plus (optional) product-quantized table lookups on the CPU.
 The classic write path of Lucene (and every LSM system): immutability per
 segment, mutability as a collection of segments. New documents form fresh
 segments; deletes are tombstone bitmaps; updates are delete + re-add;
-background merges compact — decode postings, drop tombstoned docs, remap
+explicit or repository-threshold merges compact — decode postings, drop tombstoned docs, remap
 ids densely, re-encode. A merged index scores identically to a rebuild of
 the live documents.
 
@@ -469,7 +483,7 @@ replaces. So the tests pin them against oracles:
 - Reordered indexes vs. natural order — identical scores; document sets may
   differ only among score ties cut by the k boundary (tie-breaking uses
   internal ids, which reordering legitimately renumbers).
-- Property tests: every `block_max_score` ≥ every actual contribution in its
+- Property tests: every impact-derived block bound ≥ every actual contribution in its
   block (the invariant that makes skipping safe), encode/decode round-trips,
   BP outputs a valid permutation and reduces measured log-gap cost.
 - Typo correction: unit tests in `src/spell.rs` pin the OSA distance
@@ -481,274 +495,252 @@ replaces. So the tests pin them against oracles:
   encoder-first merge recovers a document BM25 never returned, that
   spherical k-means separates orthogonal vectors onto different cluster
   lists, and that `nprobe=1` does not open the orthogonal list. The
-  lexical oracle suite is unchanged — hybrid is approximate by construction
-  (unopened clusters, quantized codes) and is not claimed rank-safe.
+  lexical oracle suite is unchanged. IVF/PQ are approximate; segmented
+  semantic search scores all live stored vectors exactly, while hybrid
+  fusion combines bounded candidate pools and has a different ranking goal.
+- Grammar tests: declaration fixtures cover all 41 language variants and
+  nested chunks. Loader tests serve local HTTP artifacts to verify checksums,
+  invalid-library rejection, concurrent atomic publication, and real parsing
+  through a downloaded library. Build the grammar workspace and set
+  `HIPS_GRAMMAR_DIR` before running the suite (see `../grammars/README.md`).
 
 ---
 
-## 14. Hybrid code search: one inverted file, two keys
+## 14. Hybrid retrieval and encoder backends
 
-**Where:** `src/tokenizer.rs` (code analyzer), `src/embeddings.rs`,
-`src/embedder.rs`, `src/ivf.rs`, `src/pq.rs`, `src/hybrid.rs`,
-`src/eval.rs` (feature `semantic`)
+**Where:** `src/query.rs`, `src/hybrid.rs`, `src/embeddings.rs`,
+`src/embedder.rs`, `src/coreml.rs`, `src/ivf.rs`, `src/pq.rs`
 
-This is still **not** a vector database. There is no HNSW graph, no FAISS
-index, no Qdrant collection, and no second document-id space. The lexical
-engine of §§1–13 is unchanged. What the experiment adds is a second
-inverted file over the **same** `doc_id`s, plus a dense sidecar those
-lists select into.
+The `semantic` feature adds CodeRankEmbed inference. Lexical postings and
+vectors share document identities; there is no external vector service.
+The current retrieval paths differ by index layout:
 
-`index --code --embed` writes one directory:
+| Layout | Construction | Vector retrieval |
+|---|---|---|
+| Segmented (repository default) | `index-repo`, watcher, MCP | Exact cosine over every live vector in each segment |
+| Single | `index --embed`, `index-repo --single` | IVF candidate lists when present; full vector scan otherwise |
 
-```
-postings.bin     term_id      →  compressed (doc_id, tf) blocks     BM25 / BMW
-embeddings.bin   doc_id       →  768-d FP16 row                     cosine
-ivf.bin          cluster_id   →  same compressed posting blocks     IVF probe
-pq.bin           doc_id       →  M-byte PQ code                     ADC
-```
+Single-layout files are `embeddings.bin` (768-dimensional FP16 rows),
+`ivf.bin` (cluster postings), and `pq.bin` (codebooks and codes). Row
+`i` has the same `doc_id` as lexical row `i`. In a segmented index,
+alignment is local to each segment; tombstones filter both lexical and
+semantic results. Each embedded segment also has `keys.bin` so merges
+can recover vectors from the content cache.
 
-Row `i` of `embeddings.bin` / `pq.bin` **is** inverted-index `doc_id == i`.
-Cluster lists in `ivf.bin` are built with the same `PostingList::build`
-path as BM25 (delta + bit-pack, block skip tables, impact pairs). The
-vector analogue of "only read the query terms' postings" is "only read
-the `nprobe` nearest clusters' postings".
+### Query modes and fusion
 
-That inverted-file view of vector search is the line from Sivic &
-Zisserman (*"Video Google: A Text Retrieval Approach to Object Matching
-in Videos"*, ICCV 2003) through Jégou, Douze & Schmid (*"Product
-Quantization for Nearest Neighbor Search"*, IEEE TPAMI 2011). A service
-like FAISS IVF-PQ or HNSW is the same *idea* with its own ids, quantizer,
-and (for HNSW) a proximity graph. Here both engines are posting lists
-in one process.
+The CLI, REPL, MCP server, and evaluation tools use `src/query.rs`.
+The HTTP handler in `src/api.rs` currently calls lexical search directly.
 
-### Query path: encoder first, BM25 as helper
+- `hybrid`: retrieve an encoder candidate pool and BM25 candidates, union
+  by document identity, then fuse. BM25 does not gate semantic retrieval.
+- `semantic`: retrieve by the encoder score alone.
+- `rerank`: score and fuse only the BM25 candidate pool.
+- `bm25` / `--lexical`: no query encoder.
 
-`--mode hybrid` is **embedding-first**. BM25 is a bonus signal on the
-union, not a gate.
-`--mode rerank` is the older BM25-then-cosine path, kept for comparison.
-`--mode semantic` is encoder-only through IVF (full mmap scan if
-`ivf.bin` is missing). `--mode bm25` is §§1–13 with no neural work.
+The default candidate pool is 200 (at least `top_k`). Query encoding and
+BM25 overlap on separate threads; vector scoring waits for the query
+embedding. A lexical-only candidate still receives a point cosine score,
+so a missed IVF cluster does not exclude a BM25 hit from hybrid fusion.
+
+Weighted fusion is the default, with `alpha = 0.15`:
 
 ```
-query
-  ├─ CodeRankEmbed(query)  →  768-d, L2-normalized     (Metal, calling thread)
-  └─ BM25 / Block-Max WAND / MaxScore                  (CPU, overlapping thread)
-              ↓  join
-     nearest nprobe centroids                          (needs the query vector)
-     decode those cluster posting lists     (disjoint: clusters partition docs)
-     score survivors: FP16 dot  or  PQ-ADC
-     keep top `pool`  (default 200)
-              ↓
-     union by doc_id
-              ↓
-     weighted min-max  or  RRF
-              ↓
-            top k
+score = alpha * normalized_bm25 + (1 - alpha) * cosine
 ```
 
-BM25 does not need the query vector, so it overlaps with encode
-(`std::thread::scope` in `src/cli.rs`). The encoder stays on the calling
-thread because Metal is where the model was warmed up; WAND runs on a
-helper thread. IVF probe cannot start until encode returns. Wall time is
-`max(embed, bm25) + score`. `--mode rerank` overlaps the same way;
-`--mode semantic` has no BM25 side.
+BM25 is min-max normalized over the candidate union, with lexical misses
+remaining zero. Cosine is already in [-1, 1]. RRF remains available via
+`--fusion rrf`, using the sum of `1 / (rrf_k + rank)` with default
+`rrf_k = 60` (Cormack, Clarke & Buettcher, SIGIR 2009).
 
-Documents the encoder found that WAND never saw still compete
-(`bm25 = 0`). Documents WAND found that sit in an unopened cluster still
-compete after a point cosine against `embeddings.bin`. Fusion cannot
-hide a semantic hit behind a lexical miss, or a lexical hit behind an
-IVF miss. Hybrid currently requires a single (non-segmented) index.
+Historical measurements on 31k code chunks (4,567 natural-language queries,
+800 identifier queries) motivated these defaults:
+
+| Mode | NL Recall@10 | Identifier Recall@10 |
+|---|---:|---:|
+| BM25 | 0.255 | 0.976 |
+| Semantic | 0.716 | 0.974 |
+| Hybrid, weighted alpha 0.15 | 0.696 | 0.993 |
+
+These are retrieval-quality measurements, not proofs that one fusion
+setting is optimal for every repository.
 
 ### Code tokenizer
 
-**Where:** `src/tokenizer.rs`, flag bit 1 of the `meta.bin` flags word
-(`flags |= 2`), so v4 indexes without the bit keep the default analyzer.
+**Where:** `src/tokenizer.rs`
 
-Identifiers are stored **twice**: the full lowercased form
-(`getuserbyorganizationid`, `std.json.utf8parser`) and the camelCase /
-PascalCase / snake_case / SCREAMING_SNAKE / dotted pieces (`get`, `user`,
-`organization`, `id`, `utf`, `8`, `parser`). Digit boundaries split
-(`utf8Parser` → `utf` + `8` + `parser`); acronyms split before the last
-capital (`XMLHttpRequest` → `xml` + `http` + `request`). Exact-name
-queries still get a rare, high-idf term; natural-language queries can
-match the pieces. The original identifier is never stopword-dropped;
-split pieces are.
+The code analyzer indexes full lowercased identifiers plus camelCase,
+PascalCase, snake_case, acronym, digit-boundary, and dotted-name pieces.
+Thus `getUserByOrganizationId` retains an exact-name term while also
+matching ordinary words. Full identifiers bypass stopword removal;
+derived pieces do not. The analyzer flag is persisted in index metadata,
+so queries use the analyzer that built the index.
 
-Queries must use the same analyzer the index was built with
-(`Tokenizer::code(true)`).
+### Encoding, caches, and CoreML
 
-### Offline encoding (Candle / Metal)
+CodeRankEmbed produces 768-dimensional, CLS-pooled, L2-normalized vectors.
+Documents are raw code. Queries receive the prefix
+`Represent this query for searching relevant code: `.
+Document tokenization defaults to 512 tokens; queries to 64.
+`HPS_EMBED_MAX_SEQ` overrides the document cap.
 
-**Where:** `src/embedder.rs`, sidecar layout in `src/embeddings.rs`
+Candle is the portable backend, using Metal F16 when available on macOS
+and CPU F32 otherwise. `HPS_EMBED_DEVICE=cpu|metal` overrides Candle's
+selection; unavailable Metal falls back to CPU. The current Cargo patch
+uses a Candle fork with fused Metal SDPA for NomicBert.
 
-Behind `--features semantic`, Candle loads `nomic-ai/CodeRankEmbed`
-(137M NomicBert: RoPE + SwiGLU, no official ONNX export). Documents are
-encoded as raw code, in inverted-index `doc_id` order, batch 4, truncated
-at 512 tokens. Queries are prefixed with
-`Represent this query for searching relevant code: `; documents are not.
-Pooling is CLS, then L2-normalize — matching the model card and
-`1_Pooling/config.json`. L2-normalized cosine is a plain dot product.
+CoreML/ANE is implemented in `src/coreml.rs`, not merely a prototype.
+On macOS, compiled models under `<csearch cache>/coreml/` are detected
+automatically. The intended family is batch-8 document models at sequence
+64/128/256/512 and a batch-1 query model at sequence 64. Shapes load lazily,
+and documents use the smallest fitting shape. Install the complete document
+family and query model together; a query-only installation cannot encode
+documents. `HIPS_ENCODER=candle` bypasses CoreML.
 
-On macOS the device is Metal F16 (`HPS_EMBED_DEVICE=cpu|metal` overrides);
-elsewhere CPU F32 with Accelerate on Apple. Queries truncate RoPE at 64
-tokens; document indexing keeps 512. Candle's Metal NomicBert is a few
-hundred unfused kernel launches per forward — that, not FLOPs, is why a
-20-token query still costs ~10 ms. CPU+Accelerate was measured *slower*
-(~22 ms) on the same graph. A fused runtime (MLX, CoreML/ANE) is the
-actual encoder speedup; this crate does not ship one. The Metal backend
-implements `where_cond` for `(U8, F16)` but not `(U32, F16)`, so the
-attention mask is stored as U8. `Embedder::load` runs a dummy
-`embed_query("warmup")` so the first real query does not pay shader
-compile. Query encode is the dominant term in end-to-end hybrid latency.
+The Hugging Face model files download on first use into its cache, honoring
+`HF_HOME` and `HF_ENDPOINT`. Compiled CoreML models are produced locally
+with the scripts in `scripts/ane-prototype/`; the runtime does not download
+or convert them. Loading CoreML still uses the Hugging Face configuration,
+tokenizer, and weights paths.
 
-`embeddings.bin` is a 32-byte header (`HPSEMB01`) plus row-major FP16
-vectors, memory-mapped. 768-d costs 1.5 KB/doc. Nothing in the lexical
-files changes.
+Document vectors are cached persistently by chunk content in `embcache.bin`.
+Encoding length-buckets chunks to reduce padding. Repeated query strings
+have a separate 256-entry in-process LRU. `embeddings.bin` stores a
+32-byte header and row-major FP16 vectors: 1,536 bytes per 768-dimensional
+row. Exact scoring means exact dot products over these stored, rounded
+vectors, not equivalence to an unrounded model output.
 
-fastembed-rs was not used because it ships mean-pooled
-`nomic-embed-text`, a different model. ORT was not used because there is
-no official ONNX export of this custom `nomic_bert`.
+### IVF: approximate candidate selection in single-layout indexes
 
-### IVF: cluster ids as terms
+Spherical k-means partitions documents into cluster posting lists using
+the same block codec as lexical postings. Default cluster count is about
+`2 * sqrt(N)`, bounded by corpus size and 256. Centroids are normalized;
+assignment uses cosine. Every document belongs to exactly one cluster.
 
-**Where:** `src/ivf.rs` (`HPSIVF01`)
+A query scores centroids, opens the nearest `nprobe` lists, and scores
+their documents. Automatic probing is `max(K / 2, 1)`, replacing the old
+eight-probe cap. In the historical 31k-chunk sweep, half the clusters
+retained about 0.977 Recall@10 relative to probing all clusters; eight
+probes retained 0.677.
 
-Spherical k-means over the stored embeddings: assignment is cosine to
-the current centroids, centroids are L2-normalized after each mean
-update, init is a deterministic LCG (no `rand` crate), 25 iterations.
-Default `K ≈ 2√N`, clamped to `[2, min(N/2, 256)]`. Each document is
-assigned to exactly one cluster, so the K posting lists **partition**
-the `doc_id` space.
+Unopened clusters can contain relevant documents, so IVF is approximate.
+No WAND pruning is performed inside cluster lists: their uniform
+`tf = 1` and disjoint membership make direct candidate enumeration the
+current implementation. Segmented repository search does not use IVF.
 
-Each cluster is encoded as an ordinary posting list with `tf = 1` for
-every member — a "term" whose df is the cluster size — including the
-same impact pairs (`max_tf`, `min_len`) and block skip tables BM25 uses.
-A query:
+The underlying references are Sivic & Zisserman, *Video Google*, ICCV
+2003, and Jégou, Douze & Schmid, *Product Quantization for Nearest Neighbor
+Search*, IEEE TPAMI 2011.
 
-1. dots the (already L2-normalized) query against the K centroids
-   (cheap: K is tens to hundreds, not N);
-2. opens the `nprobe` nearest lists (`nprobe = 0` → `(K/4).clamp(1, 8)`);
-3. concatenates their decoded `doc_id`s — no merge sort, the lists are
-   disjoint.
+### Product quantization: retained, not automatically selected
 
-This is approximate: a document whose cluster is not among the nprobe
-nearest is **invisible to the encoder side**. On the 70-document labeled
-code-eval set, semantic-only Recall@10 dropped 1.0 → 0.906 versus a full
-scan; the hybrid union recovered the misses because BM25 still returned
-them.
+PQ splits each vector into 16 subspaces and learns up to 256 codewords
+per subspace, yielding a 16-byte code per document. ADC builds query-side
+lookup tables and approximates a dot product by summing 16 entries.
+This implementation quantizes raw vectors, not coarse-centroid residuals.
 
-**WAND on cluster lists.** The on-disk layout is the same as BM25 so a
-future evaluator *could* skip inside a list. Today we do not, and for a
-good reason: a cluster query is a single "term" (or a tiny OR of nprobe
-terms) with uniform `tf = 1`. WAND's pivot math prunes documents that
-cannot beat θ given the *sum of several term upper bounds*; with one
-list there is nothing to pivot against, and the interesting skip is
-already "do not open the other K − nprobe lists". Scoring then walks
-every member of the opened lists (FP16 dot or PQ-ADC). Treating cluster
-ids as WAND query terms would reconstruct the disjoint concat
-`docs_in_clusters` already does.
+`PqMode::Auto` currently selects exact FP16 scoring regardless of candidate
+count. The historical 900-candidate cost threshold in `src/pq.rs` remains
+a benchmark helper, not the live selection policy. On a 31k-chunk benchmark,
+adding PQ reduced semantic Recall@10 from 0.677 to 0.143, while full exact
+scoring cost about 16 ms. `PqMode::Force` retains ADC for experiments;
+`--no-pq` explicitly selects exact scoring.
 
-The sublinear claim is therefore the same one §1 makes for BM25: we do
-not scan documents outside the probed lists. It is **not** rank-safe —
-unlike Block-Max WAND on BM25, which never drops a document that could
-enter the top-k.
+Single-layout rebuilds still retain IVF centroids and PQ codebooks.
+Training is separate from assignment, so unchanged vectors and their
+parameter-tagged codes can be reused. A changed quantizer invalidates
+cached codes. `--retrain` applies to this single-layout path; segmented
+repository indexes have no IVF/PQ quantizers to retrain.
 
-On N = 70 the decode+score overhead lost to a full mmap scan of
-`embeddings.bin`. On 2 500 code chunks (100 clusters) vector scoring
-went 2.53 ms brute-force → 0.76 ms auto-nprobe → 0.31 ms `nprobe=1`.
+### Evaluation and exactness
 
-### Product quantization (ADC)
+`eval-code` computes MRR, Recall@5/10, and graded nDCG@10.
+`eval-gen` creates doc-comment and identifier query sets from repositories.
+The BM25 oracle establishes rank safety for lexical pruning, not for the
+entire hybrid pipeline. IVF candidate selection and forced PQ can change
+semantic top-k; segmented cosine scans have neither approximation, but
+hybrid fusion still works over bounded candidate pools.
 
-**Where:** `src/pq.rs` (`HPSPQ001`)
+## 15. Declaration chunks and loadable grammars
 
-Jégou, Douze & Schmid, TPAMI 2011. Split each 768-d vector into `M = 16`
-subspaces of 48-d. Each subspace is 256-means (1 byte). A document
-becomes 16 bytes instead of 1 536 (FP16) or 3 072 (FP32). Codebooks live
-in the sidecar as FP16; codes are `num_docs × M` raw bytes, `doc_id`-aligned
-with `embeddings.bin`.
+**Where:** `src/repo.rs`, `src/treesit.rs`, `src/grammar.rs`,
+`tree-sitters/`, and the independent `grammars/` Cargo workspace
 
-Query scoring is **asymmetric distance computation (ADC)**: the query
-stays FP32 (no query quantization error), documents are codes. Per
-query, `prepare` fills `M × 256` tables of `q_sub[m] · codebook[m][c]`;
-scoring a document is 16 table lookups and a sum. That sum approximates
-the same L2-normalized dot `embeddings.cosine` would have computed.
+The registry has 41 grammar variants (including separate TypeScript and
+TSX). Extensions choose a language without loading it; `.m` uses content
+to distinguish Objective-C and MATLAB. Only the first parse for a language
+loads its library and compiles its embedded definition query.
 
-PQ is a *scoring* approximation on whatever IVF (or the full scan)
-already retrieved, not a second index. `--no-pq` falls back to FP16
-dots. This is **not** FAISS IVF-PQ: residuals versus the coarse centroid
-are not quantized, so ADC error is the full reconstruction error, not
-the residual.
+The CLI links the tree-sitter runtime, not the grammar parse tables.
+Each grammar is a separate native `cdylib` exporting `hips_language`.
+A `OnceLock` retains each loaded language and library for the process
+lifetime, so query/parser pointers never outlive the code and static tables
+they reference. Errors are cached for that process and warn once per
+language before falling back to keyword-based chunks.
 
-On the same 2 500-chunk index, ADC was about 15% *slower* than FP16
-dots (table build versus saved multiplies). End-to-end hybrid stayed
-~9–11 ms because the encoder (~9 ms after Metal warmup) dominates.
-IVF and PQ only start to matter once N is large enough that scanning
-every 768-d row costs more than encoding the query.
+Library lookup is:
 
-#### Training versus assigning
+1. A packaged library in `HIPS_GRAMMAR_DIR`, used in place.
+2. The versioned user cache under
+   `$XDG_CACHE_HOME/csearch/grammars/<release>/<target>`, defaulting to
+   `~/.cache/csearch/grammars/...`.
+3. An individual download from the pinned grammar release, unless
+   `HIPS_GRAMMAR_OFFLINE=1`.
 
-Both quantizers separate *training* (k-means over the corpus) from
-*assigning* (one pass over the resulting centroids per document). This is
-the same split FAISS draws between `train` and `add`, and it is what makes
-`hips`'s watch-driven rebuilds cheap: centroids and codebooks are trained
-once and then reused while the tree is edited, so a rebuild only assigns the
-chunks whose text changed. `ivf.bin` and `pq.bin` therefore double as the
-persisted quantizer — `read_centroids` / `read_codebooks` load them back,
-and `assign_one` / `encode_one` reproduce exactly what training assigned.
+Maintainers can build and ship no grammars, selected packages, or all of
+them independently of the CLI. Cached downloads contain only encountered,
+unbundled languages. The grammar cache does not currently use
+`CSEARCH_CACHE_DIR`, which configures repository/CoreML caches instead.
 
-Two details make that exactness hold:
+Downloads check a release SHA-256 sidecar, enforce a size limit and timeout,
+validate the exported language and tree-sitter ABI, then publish atomically
+from a unique temporary file without clobbering a concurrent winner.
+Installed libraries take precedence; an invalid installed library warns
+and falls back to heuristic chunking rather than silently replacing it
+with a downloaded one.
 
-- Both k-means loops must end with an **assignment pass against the
-  centroids they return**. A loop that assigns and then updates returns an
-  assignment one step stale, so the stored codes are not the nearest
-  centroids of the stored codebooks and every ADC score is computed against
-  a centroid the encoder would not have picked.
-- `pq.bin` records how many of the 256 codes per subspace were actually
-  trained. With fewer than 256 documents, training fills only part of each
-  codebook, and an encoder that searched all 256 slots would select
-  untrained (all-zero) centroids that training never assigned.
+The release workflow builds 41 libraries per platform for macOS and glibc
+Linux on arm64 and x86_64. `src/grammar.rs` pins `grammars-v1`; its assets
+must be published before that download route is usable. The locally tested
+macOS arm64 default release executable is 10,101,008 bytes (9.6 MiB), with
+about 68 MiB of grammar libraries separately. This is a local default-feature
+measurement, not a size promise for semantic builds or other platforms.
 
-### Fusion
+Definition queries remain small `.scm` files embedded in the CLI.
+Definitions and preceding comments define chunk boundaries; nested units
+keep parent names, adjacent bodyless declarations coalesce, and files stay
+covered without gaps. Markdown uses heading sections; PDFs are extracted
+page by page independently of tree-sitter. Unsupported files and unusable
+parses use the existing heuristic.
 
-**Where:** `src/hybrid.rs`
+## 16. Incremental repository lifecycle
 
-Two combiners, both over the **union** of the encoder pool and the BM25
-helper list (ranks are 0 if a document is absent from one side):
+**Where:** `src/codeindex.rs`, `src/embcache.rs`, `src/watch.rs`,
+`src/daemon.rs`, `src/mcp.rs`
 
-- **Weighted** — min-max normalize BM25 over the union (documents with
-  `bm25 = 0` stay 0), then
-  `α · n_bm25 + (1 − α) · cosine`. Cosine is already in `[-1, 1]`.
-- **RRF** — Cormack, Clarke & Buettcher, *"Reciprocal Rank Fusion
-  Outperforms Condorcet and Individual Rank Learning Methods"*, SIGIR
-  2009: `Σ 1 / (k + rank)` over the two lists. Default `k = 60`.
+Repository indexing defaults to segments. The per-file manifest records
+path, size, mtime, and prior chunk ids. An edit tombstones stale chunks,
+appends changed chunks, and encodes only uncached content. More than 12
+segments triggers compaction; vectors are recovered by content-cache key
+instead of being re-encoded. A writer lock serializes competing writers.
 
-RRF is the CLI default (`--fusion rrf`): it does not require comparable
-raw scores, which BM25 and cosine are not.
+The unchanged-tree shortcut uses path/size/mtime fingerprints, not a fresh
+content hash of every file. The manifest also records a chunker version,
+which can trigger re-chunking after a chunker change. Grammar availability
+and the grammar release are not currently part of that fingerprint:
+installing a missing library alone does not force unchanged files to be
+re-chunked.
 
-### Evaluation
+The session watcher coalesces events after 300 ms of quiet, shares one
+process across leases, exits after the final lease's grace period, and
+unloads the encoder after five idle minutes. The MCP server watches for
+changes itself and rebuilds on the next tool call; it also waits for a
+watcher rebuild and reopens externally updated indexes. Grammar libraries
+remain loaded even when the encoder is unloaded.
 
-**Where:** `src/eval.rs`, CLI `eval-code`
-
-Labeled metrics against graded qrels (`rel ∈ {3, 2, 1}`):
-
-- **MRR** — `1 / rank` of the first relevant hit (`rel > 0`).
-- **Recall@5 / Recall@10** — fraction of all relevant documents appearing
-  in the top k (ungraded: any `rel > 0` counts).
-- **nDCG@10** — DCG with gain `2^rel − 1` and discount `log2(rank + 1)`,
-  divided by the ideal DCG of the qrel sorted by gain.
-
-IVF and PQ are approximate, so semantic-only recall can drop versus a
-brute-force scan of `embeddings.bin`; hybrid's union is the intended
-backstop. The lexical BMW/MaxScore path remains exact and is still
-pinned against the naive BM25 oracle in the test suite.
-
-### What this is not
-
-- Not HNSW / DiskANN / a graph index. Neighbors are not walked.
-- Not a FAISS / Qdrant / LanceDB deployment. No separate vector service,
-  no residual IVF-PQ, no GPU GEMM over the inverted lists.
-- Not rank-safe on the encoder side. Unopened clusters and quantized
-  codes can change the top-k versus exhaustive cosine.
-- Not wired through segmented indexes or the HTTP API yet.
-- Not on by default: without `--features semantic` the binary is still
-  the lexical engine of §§1–13.
+The legacy `--single` path rebuilds an entire index in staging and swaps
+it into place, reusing content vectors and quantizers. It remains useful
+for IVF/PQ experiments, but its indexing work scales with the corpus when
+a file changes. Neither layout provides distributed shards, replication,
+or a continuously mutable in-memory ingestion buffer.

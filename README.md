@@ -1,6 +1,6 @@
 # hips — a small search engine for agents
 
-`hips` is a small, single-binary search engine that coding agents can use:
+`hips` is a small Rust search engine that coding agents can use:
 point it at a repository (or any pile of documents and PDFs) and it gives
 Claude Code, Codex, OpenCode and friends a search tool that answers "where
 is this implemented?" with ranked `path:line` locations, keeps its index
@@ -34,19 +34,24 @@ documented in [docs/THEORY.md](docs/THEORY.md).
 
 ## Status
 
-Small by design: one binary, an index directory under the user's cache, no
-daemon unless an agent session asks for the watcher. It is in daily use as
+Small by design: one executable, separately loadable grammar libraries, and
+index/model caches. Maintainers can package no grammars, a chosen subset, or
+all of them; omitted languages download when first indexed. The watcher runs
+only when requested directly or by an agent session. It is in daily use as
 the code-search tool this repository itself is developed with, and every
-measurement in this README was taken on the author's laptop. It is not a
-hosted search service — no clustering, no replication — and the engine
+benchmark in this README was taken on the author's laptop. Architecture and
+usage were reviewed against the working tree on 2026-09-07; historical
+benchmark numbers are retained with their original corpus and configuration.
+It is not a hosted search service — no clustering, no replication — and the engine
 half doubles as a readable, tested walk through how modern lexical search
 works end to end: indexing, compression, memory-mapped storage, exact
 dynamic pruning, batch updates, benchmarking, and a small HTTP API.
 
 ## Requirements
 
-- Rust stable 1.89 or newer (the segmented writer and the watcher use
-  `std` file locks), edition 2021.
+- A stable Rust toolchain and a C/C++ build toolchain for source builds,
+  edition 2021. The file-lock APIs require at least Rust 1.89; this is not
+  a tested minimum version for every locked dependency.
 - `--features semantic` for hybrid code search: pulls in Candle and the
   tokenizers crate and downloads the ~550 MB CodeRankEmbed weights on first
   use (into the Hugging Face cache). Off by default so the lexical engine
@@ -54,6 +59,9 @@ dynamic pruning, batch updates, benchmarking, and a small HTTP API.
 - macOS with Metal only for the optional `gpu` feature (`--reorder bp-gpu`)
   and for the CoreML/Neural Engine encoder backend; the default build is
   CPU-only and portable, and on Linux the encoder runs through Candle.
+- Grammar downloads target macOS and glibc Linux on arm64/x86_64. A user's
+  machine needs no compiler when using prebuilt libraries. See
+  [grammar packaging](grammars/README.md) for native builds and offline installs.
 - Python 3 for the corpus helper scripts in `scripts/`, and a Python
   environment with coremltools to produce the CoreML models
   (`scripts/ane-prototype/README.md`).
@@ -69,10 +77,23 @@ hips search --root . --query "where do we validate auth tokens"
 hips status --root .                            # what is indexed, watcher, sessions
 ```
 
+The grammar loader pins the `grammars-v1` release. Those assets must be
+published before unbundled first-use downloads can succeed. For a checkout
+before that release, or for offline grammar use:
+
+```sh
+cargo build --manifest-path grammars/Cargo.toml --release --locked
+export HIPS_GRAMMAR_DIR="$PWD/grammars/target/release"
+export HIPS_GRAMMAR_OFFLINE=1
+```
+
+Grammar offline mode does not disable encoder downloads. Use `--lexical`
+when no encoder is available. Missing grammars warn and use heuristic chunks.
+See [tests](#run-the-tests) for the full development setup.
+
 The lexical engine on a JSONL corpus:
 
 ```sh
-cargo test
 cargo run --release -- index --input data/sample_docs.jsonl --out ./index
 cargo run --release -- search --index ./index --query "cheap pizza montreal" --top-k 5
 ```
@@ -114,11 +135,13 @@ cargo run --release -- repl --index ./index --top-k 10
   `src/ivf.rs`, `src/pq.rs`, `src/hybrid.rs` - CodeRankEmbed inference
   (Candle; CoreML/ANE on macOS), FP16 vector storage and scoring, the
   content-keyed embedding cache, IVF/PQ, and score fusion.
-- `src/repo.rs`, `src/treesit.rs`, `src/codeindex.rs`, `tree-sitters/` -
-  source-tree ingestion: gitignore-aware walking, tree-sitter
-  declaration chunking (40 grammars; the per-language definition queries
-  live in `tree-sitters/`), the keyword-heuristic fallback, PDF pages,
-  and incremental segmented rebuilds.
+- `src/repo.rs`, `src/treesit.rs`, `src/grammar.rs`, `src/codeindex.rs`,
+  `tree-sitters/` - repository walking, declaration chunking across 41 grammar
+  variants, lazy library loading, embedded definition queries, heuristic
+  fallback, PDF pages, and incremental segmented rebuilds.
+- `grammars/` - independent Cargo workspace of native grammar libraries;
+  `.github/workflows/grammars.yml` builds/tests four platforms and publishes
+  individual libraries and checksums on a grammar release tag.
 - `src/watch.rs`, `src/daemon.rs`, `src/mcp.rs`, `src/usagelog.rs` -
   filesystem watching, the session-leased background watcher, the MCP
   server over stdio, and the search usage log.
@@ -145,14 +168,14 @@ cargo run --release -- repl --index ./index --top-k 10
 - **Searches** with BM25 (`k1 = 1.2`, `b = 0.75`) using exact top-k dynamic
   pruning: Block-Max WAND for short queries, MaxScore (Turtle & Flood 1995)
   for queries of 5+ unique terms, where WAND's pivot prefix rarely clears
-  the threshold. Both are provably exact; there is no naive or approximate
-  mode in the CLI or HTTP API. A naive BM25 scorer exists *only inside the
-  test suite* as a correctness oracle for both evaluators.
+  the threshold. Both lexical evaluators are exact; a naive BM25 scorer
+  exists only in tests as their oracle. Optional hybrid/vector retrieval
+  has separate candidate-selection and fusion semantics.
 - **Serves** concurrent queries over HTTP from a read-only, `Arc`-shared index.
 
 ### "Sublinear" in the practical retrieval sense
 
-This engine is sublinear in the practical retrieval sense because it does not
+The lexical path is sublinear in the practical retrieval sense because it does not
 scan every document. It retrieves candidates from inverted indexes (only
 documents containing at least one query term can ever be touched) and skips
 non-competitive blocks of postings using Block-Max WAND. Worst-case queries
@@ -191,11 +214,11 @@ WAND then skips most of those candidates too.
 
 ## How Block-Max WAND works
 
-Posting lists are split into fixed-size blocks (128 postings by default). For
-each block the index stores `min_doc_id`, `max_doc_id`, and
-`block_max_score` — the maximum BM25 contribution this term can make for
-*any* document in the block, computed at index time with the exact same
-formula used at query time.
+Posting lists are split into fixed-size blocks (128 postings by default).
+Each block stores `max_doc_id` and the impact pair `(max_tf, min_doc_len)`.
+BM25 increases with tf and decreases with document length, so the pair gives
+an upper bound under the current idf and average length. Computing bounds
+at query time keeps skipping safe when segmented updates change statistics.
 
 Query execution keeps one forward-only cursor per query term and a bounded
 min-heap of the best k results. Once the heap holds k results, its minimum
@@ -219,9 +242,9 @@ Each iteration:
 
 ### Why block max scores allow safe skipping
 
-`block_max_score` is computed as the maximum actual BM25 contribution over
-all postings in the block. So for any document in that block, the term's real
-contribution is ≤ `block_max_score` by construction. Summing these per-term
+The impact-derived `block_max_score` bounds every posting in the block.
+The maximum tf and minimum length can belong to different documents, so the
+bound may be larger than every actual score; it must never be smaller. Summing these per-term
 bounds gives a number the document's real score can never exceed. If that
 bound is ≤ the current k-th best score, the document cannot enter the top-k —
 skipping it cannot change the result.
@@ -233,8 +256,9 @@ upper bound: documents are only skipped when they provably cannot beat the
 current k-th result, and every returned document was scored with the full,
 exact BM25 formula. The output is therefore identical to exhaustively scoring
 every matching document (verified in the test suite against a naive BM25
-oracle on handcrafted and randomized corpora; ranking ties at the k-th score
-boundary are the only permitted variation).
+oracle on handcrafted and randomized corpora). Ties use ascending internal
+doc_id; reordering can therefore change which equally scored hits fit at the
+k-th boundary.
 
 ## Usage
 
@@ -267,7 +291,7 @@ title matches outrank otherwise-equal body matches. Set 1 to disable.
 `--reorder` controls doc_id assignment: `none` (input order), `path` (sort
 by external id — clusters file paths/URLs), or `bp` (recursive graph
 bisection, minimizes the estimated compressed size; slower to build).
-Reordering is a pure renumbering and never changes search results.
+Reordering preserves scores; renumbering can change tie order among equal scores.
 
 There is also an experimental `bp-gpu` strategy (build with
 `--features gpu`, macOS only) that runs BP's gain
@@ -301,7 +325,7 @@ at rank 1 in 0.6ms, scoring 0.3% of the corpus.
 
 ### On-disk format: compressed + memory-mapped
 
-The index directory holds three files:
+A single lexical index (and each immutable lexical segment) has three core files:
 
 - `meta.bin` — the slim RAM-resident core: document lengths, the sorted
   term dictionary (one concatenated string, binary searched), per-term
@@ -348,7 +372,9 @@ cargo run --release -- serve --index ./index --addr 127.0.0.1:8080
 ```
 
 The index is loaded once, shared read-only via `Arc`, and queried
-concurrently; nothing mutates it during searches.
+concurrently; nothing mutates it during searches. This HTTP endpoint runs
+lexical BM25 search over either layout; it does not expose the CLI/MCP
+hybrid modes.
 
 ```
 GET /search?q=cheap+pizza&k=10
@@ -444,8 +470,11 @@ Inference runs in-process, no Python at query time. Two backends:
   Measured on an M3: 25.4k tok/s vs Candle/Metal's 6.3k for document
   batches, an 810-chunk cold index in 13.0 s instead of 28.6 s, a hybrid
   query in 0.10 s wall including model load, and embeddings within mean
-  cosine 0.99968 of the fp32 reference — mixed Candle/CoreML caches are
-  retrieval-safe.
+  cosine 0.99968 of the fp32 reference. That fidelity measurement supports
+  reuse of these embeddings, but is not a recall guarantee for every workload.
+  Model conversion and installation are documented in the
+  [CoreML guide](scripts/ane-prototype/README.md); compiled models are not
+  downloaded automatically.
 
 ```sh
 cargo build --release --features semantic
@@ -458,7 +487,7 @@ cargo build --release --features semantic
 # 2. search
 ./target/release/hips search \
   --index ./index-code --query "retry failed HTTP requests" \
-  --mode hybrid --semantic-candidates 200 --fusion rrf --top-k 10
+  --mode hybrid --semantic-candidates 200 --fusion weighted --alpha 0.15 --top-k 10
 
 # 3. labeled eval (BM25 vs semantic-only vs hybrid)
 ./target/release/hips eval-code \
@@ -475,8 +504,8 @@ cargo build --release --features semantic
 Queries use the model's required prefix (`Represent this query for
 searching relevant code: `) inside the embedder; documents are encoded
 as raw code. Vectors are stored as memory-mapped FP16, 768-d,
-L2-normalized. Score fusion is either min-max weighted BM25+cosine
-(`--fusion weighted --alpha 0.5`) or reciprocal rank fusion
+L2-normalized. Default fusion is min-max weighted BM25+cosine
+(`--fusion weighted --alpha 0.15`); reciprocal rank fusion is optional
 (`--fusion rrf`).
 
 To index a real source tree, use `index-repo` (below) rather than
@@ -492,12 +521,12 @@ non-source files — and splits each file into declaration-sized chunks that
 **keep their line numbers**. A document id is therefore a location:
 `src/searcher.rs:120-165`.
 
-#### Declaration-aware chunking: 40 tree-sitter grammars
+#### Declaration-aware chunking: 41 loadable grammar variants
 
 Chunk boundaries decide everything downstream: what one vector means,
 what BM25's title boost applies to, and how many lines an agent reads
 after a hit. Files are therefore parsed with tree-sitter and cut at real
-definitions. Forty grammars are compiled in (feature `treesitter`, on
+definitions. Forty-one grammar variants load on demand (feature `treesitter`, on
 by default): Python, JavaScript, TypeScript/TSX, Java, C, C++, C#, Go,
 Rust, PHP, Ruby, Swift, Kotlin, Scala, Dart, Lua, Perl, R, Objective-C,
 MATLAB, Bash, PowerShell, SQL, Haskell, Elixir, Erlang, OCaml, Julia, Zig,
@@ -510,8 +539,8 @@ What counts as a definition lives in `tree-sitters/<language>.scm`, one
 small query per language in tree-sitter's own query syntax, embedded at
 compile time: `@definition.<kind>` marks the node, `@name` its identifier.
 The files are seeded from the grammars' own `tags.scm` where they ship one
-and hand-written otherwise, so adding a language is one Cargo dependency,
-one registry line, and one query file. `hips chunks --file X` shows how a
+and hand-written otherwise. Adding a language means a wrapper crate in the
+grammar workspace, one registry line, and one query file. `hips chunks --file X` shows how a
 file is cut (`--sexp` prints the parse tree, for writing queries).
 
 Chunking is generic over languages once definitions are known: each
@@ -545,15 +574,27 @@ C is the headline: a language with no declaration keyword went from
 200-line slabs to one chunk per function. Python, Go and Rust, where the
 keyword heuristic already worked, barely move. Express's remaining
 unnamed chunks are anonymous test callbacks, which are not definitions.
-The price is binary size — the grammars' parse tables are about 63 MB of
-constant data (OCaml 7 MB, Fortran 7, Julia 6; Go, Python, Java under
-1 MB each; F# was dropped for costing 15 MB on its own), taking the
-release binary from 16 MB to about 80 MB — and a one-time query
-compilation per grammar the first time a process meets that language
-(10-60 ms). Parsing itself is cheap:
+Grammar parse tables live in separate `.dylib`/`.so` release artifacts, keeping
+them out of the executable. The first file in a language loads its bundled or
+cached grammar, downloading only that library if needed into
+`~/.cache/csearch/grammars/<release>/<target>` (honoring `XDG_CACHE_HOME`).
+Downloads are checked for SHA-256 integrity and ABI compatibility before use.
+Subsequent runs reuse the cache. Missing or failed loads warn and fall back to
+heuristic chunks. Maintainers can bundle any subset in `HIPS_GRAMMAR_DIR`;
+those libraries take priority, with cache/download fallback for missing languages.
+A broken installed library warns and uses heuristic chunks rather than being
+replaced automatically. `HIPS_GRAMMAR_OFFLINE=1` disables grammar downloads
+while allowing bundled and cached grammars. The local macOS arm64 default
+release build measured 9.6 MiB, with about 68 MiB of grammar libraries separate;
+semantic builds and other platforms have different sizes. See [grammar builds](grammars/README.md)
+for the build commands and four-platform release pipeline. There is still a
+one-time query compilation per language (10–60 ms). Parsing itself is cheap:
 this repository's 57 Rust files index lexically in 0.06 s against 0.03 s
 with the heuristic. An index built by an older chunker is re-chunked in
-full on the next build (the manifest records the chunker version).
+full on the next build when its recorded chunker version differs. Grammar
+installation alone does not invalidate unchanged-file fingerprints, so files
+previously indexed with the fallback are not automatically re-chunked merely
+because a library becomes available.
 `--no-default-features` builds the lean binary with the heuristic only. PDFs still chunk per page, as `report.pdf::page 7`.
 
 ```sh
@@ -746,9 +787,9 @@ tombstones the stale chunks (the manifest remembers which chunk ids each
 file produced), appends the changed chunks as one new segment, and encodes
 only those; a compaction merge runs past `codeindex::MAX_SEGMENTS` and
 rebuilds the merged segment's vectors from the cache by key — no
-re-encoding. A byte-identical tree is detected from a fingerprint of the
+re-encoding. An unchanged tree is detected from a fingerprint of the
 walked file list (path, size, mtime), so an up-to-date rebuild costs only
-the walk. Semantic scoring is exact brute-force per segment (no IVF/PQ).
+the walk. This shortcut does not read and compare every file's content. Semantic scoring is exact brute-force per segment (no IVF/PQ).
 Measured:
 
 ```
@@ -833,10 +874,12 @@ vectorized FP16 scoring of every vector costs ~16 ms. `pq.bin` is still
 built: its codebooks drive the incremental-rebuild cache, and `PqMode::Force`
 keeps ADC available for benchmarks.
 
-**Scoring path.** Product quantization is enabled per query rather than
-always-on, because it is a fixed cost (building `M x 256` lookup tables)
-plus almost nothing per document, while exact scoring is a per-document dot
-product. Measured with `cargo run --release --example pq_scoring_bench`:
+**Scoring path.** Exact FP16 scoring is the current default, including
+`PqMode::Auto`; automatic selection of PQ is disabled for recall reasons.
+The following historical micro-benchmark explains the cost tradeoff, not the
+current selection policy. ADC pays a fixed lookup-table cost and then little
+per document; exact scoring computes a dot product per candidate. Measured
+with `cargo run --release --example pq_scoring_bench`:
 
 ```
 candidates   exact FP16      PQ/ADC
@@ -848,11 +891,11 @@ candidates   exact FP16      PQ/ADC
 
 Both paths are written to vectorize (branch-free f16 decode, four-way
 accumulators); exact FP16 scoring runs at the plain-f32 ceiling. Break-even
-is near 225 candidates, so ADC is used only above `pq::MIN_CANDIDATES`
-(900, deliberately above break-even — below it PQ costs recall and saves
-nothing). A query's candidate count is estimated from the
-IVF geometry, `num_docs * nprobe / num_clusters`, which puts the switch-over
-around 20k chunks at the default `nprobe`. `--no-pq` forces exact scoring.
+was near 225 candidates in that benchmark. `pq::MIN_CANDIDATES` (900) and
+the IVF candidate-count estimate remain benchmark helpers; they no longer
+switch live queries to ADC. `PqMode::Force` is available to experimental
+callers, and `--no-pq` explicitly requests exact scoring. Segmented repository
+retrieval does not use PQ or IVF.
 
 Both the MCP server (rebuild on the next call) and the watcher (rebuild
 after 300 ms of quiet) coalesce a burst of edits — a branch switch, a
@@ -861,9 +904,21 @@ encoder on the thread whose pipelines are already warm.
 
 ### Run the tests
 
+From the repository root, build all native grammars and run tests without
+requiring grammar release downloads:
+
 ```sh
-cargo test
+cargo build --manifest-path grammars/Cargo.toml --release --locked
+export HIPS_GRAMMAR_DIR="$PWD/grammars/target/release"
+export HIPS_GRAMMAR_OFFLINE=1
+cargo test --locked
+cargo test --locked --features semantic
+cargo check --locked --no-default-features
 ```
+
+The loader tests use a localhost HTTP server and the watcher tests need
+filesystem events and child-process access; restrictive sandboxes may block
+those integration checks. CI builds the libraries before testing.
 
 The test suite includes unit tests for the tokenizer, BM25 math, index
 construction, block construction (including the upper-bound invariant), the
@@ -875,9 +930,10 @@ documents, that segmented and external builds persist and migrate, that the
 repo lifecycle (edits, renames, deletions, merges) keeps line numbers right,
 that the MCP server speaks JSON-RPC over a pipe, and that a leased watcher
 follows edits, is shared by two sessions, and exits with the last one.
-Everything that touches the encoder runs lexically in tests, so no model
-download is needed; `cargo test --features semantic` exercises the
-semantic build as well.
+Tests also cover all grammar declaration fixtures, checksum rejection,
+invalid libraries, and concurrent download publication. The suite uses lexical
+execution or synthetic vectors for encoder-related checks, so model downloads
+are not required; the semantic feature run checks that build configuration.
 
 ## Debug counters
 
@@ -908,7 +964,9 @@ Low `num_docs_scored` relative to `num_docs_total`, and high
   at the call site: the `mmap` call in storage (standard accepted risk,
   same as Lucene's MMapDirectory); the NEON f16 dot product in
   `src/embeddings.rs`; the CoreML bindings in `src/coreml.rs` (objc2);
-  the watcher's `setsid`, `kill(pid, 0)` liveness probes and signal
+  native grammar loading and symbol conversion in `src/grammar.rs` (the
+  library owner outlives its language and queries); the watcher's `setsid`,
+  `kill(pid, 0)` liveness probes and signal
   handlers in `src/daemon.rs` (libc); and, behind the `gpu` feature, the
   zero-copy Metal interop in `src/reorder/gpu.rs` (page-aligned shared
   allocations, no-copy buffer wrapping, and disjoint parallel writes).
@@ -950,7 +1008,8 @@ What this engine deliberately does not do:
 - no distributed shards
 - updates are batch-granular (new segment per add; no realtime ingest buffer)
 - no phrase queries
-- no fuzzy search
+- no general fuzzy term expansion; unknown query terms have SymSpell-style
+  typo correction
 - no autocomplete
 - no aggregations
 - no advanced analyzers (no stemming, no synonyms, no language-specific analysis)
@@ -959,7 +1018,8 @@ What this engine deliberately does not do:
   segment, or through IVF cluster postings + PQ on single-layout indexes —
   is sized for repositories, not a vector database)
 - no highlighting
-- no relevance tuning beyond BM25
+- relevance controls include title weighting, candidate pools,
+  and hybrid weighted/RRF fusion; no learned reranker or tuning service
 
 ## License
 

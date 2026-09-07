@@ -9,9 +9,18 @@ jobs:
   test:
     name: build + test (macOS)
     runs-on: macos-14
+    env:
+      HIPS_GRAMMAR_DIR: ${{ github.workspace }}/grammars/target/release
+      HIPS_GRAMMAR_OFFLINE: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            grammars -> target
+      - name: Build shared grammar libraries
+        run: cargo build --manifest-path grammars/Cargo.toml --release --locked
       # Both feature configurations: a cfg() mistake that breaks one but
       # not the other has shipped before (c865a91 fixed one).
       - name: Test (default features)

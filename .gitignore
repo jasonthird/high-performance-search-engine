@@ -1,5 +1,6 @@
 # Build artifacts
 /target
+/grammars/target
 
 # Local OS/editor/tool state
 .DS_Store

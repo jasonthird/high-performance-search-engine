@@ -1,0 +1,75 @@
+name: Grammar libraries
+
+on:
+  push:
+    tags: ['grammars-v*']
+  pull_request:
+    paths: ['grammars/**', 'src/grammar.rs', 'src/treesit.rs', '.github/workflows/grammars.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            extension: dylib
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extension: dylib
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            extension: so
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            extension: so
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            grammars -> target
+      - run: cargo build --manifest-path grammars/Cargo.toml --release --locked
+      - name: Test all grammar fixtures using the shared libraries
+        env:
+          HIPS_GRAMMAR_DIR: ${{ github.workspace }}/grammars/target/release
+          HIPS_GRAMMAR_OFFLINE: '1'
+        run: cargo test --locked --test treesit_langs
+      - name: Package individual libraries and checksums
+        env:
+          GRAMMAR_TARGET: ${{ matrix.target }}
+          GRAMMAR_EXTENSION: ${{ matrix.extension }}
+        run: |
+          mkdir -p dist
+          for library in grammars/target/release/libhips_grammar_*."$GRAMMAR_EXTENSION"; do
+            asset="dist/$GRAMMAR_TARGET-$(basename "$library")"
+            cp "$library" "$asset"
+            shasum -a 256 "$asset" > "$asset.sha256"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grammars-${{ matrix.target }}
+          path: dist/*
+  publish:
+    if: startsWith(github.ref, 'refs/tags/grammars-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: grammars-*
+          merge-multiple: true
+          path: dist
+      - name: Publish immutable grammar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GRAMMAR_TAG: ${{ github.ref_name }}
+        run: gh release create "$GRAMMAR_TAG" dist/* --verify-tag --title "$GRAMMAR_TAG" --notes 'Native grammar libraries for lazy loading by hips.'

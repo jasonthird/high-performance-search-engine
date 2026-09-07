@@ -31,19 +31,33 @@ use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::repo::{self, Chunk};
 
-/// One supported language: how to build its grammar and its query text.
+/// One supported language: its cached library and embedded query text.
 pub struct Lang {
     pub name: &'static str,
     pub exts: &'static [&'static str],
-    language: fn() -> Language,
     query_src: &'static str,
     compiled: OnceLock<Option<Query>>,
+    // Drop queries before unloading their grammar (the global registry lives forever).
+    loaded: OnceLock<Option<crate::grammar::LoadedGrammar>>,
 }
 
 impl Lang {
+    fn language(&self) -> Option<&Language> {
+        self.loaded
+            .get_or_init(|| match crate::grammar::load(self.name) {
+                Ok(grammar) => Some(grammar),
+                Err(e) => {
+                    eprintln!("warning: {} grammar unavailable: {e:#}; using heuristic chunks", self.name);
+                    None
+                }
+            })
+            .as_ref()
+            .map(|g| &g.language)
+    }
+
     fn query(&self) -> Option<&Query> {
         self.compiled
-            .get_or_init(|| match Query::new(&(self.language)(), self.query_src) {
+            .get_or_init(|| match Query::new(self.language()?, self.query_src) {
                 Ok(q) => Some(q),
                 Err(e) => {
                     // A broken query file must not take indexing down; the
@@ -57,64 +71,64 @@ impl Lang {
 }
 
 macro_rules! lang {
-    ($name:literal, [$($ext:literal),*], $lang:expr) => {
-        lang!($name, [$($ext),*], $lang, $name)
+    ($name:literal, [$($ext:literal),*]) => {
+        lang!($name, [$($ext),*], $name)
     };
-    ($name:literal, [$($ext:literal),*], $lang:expr, $query:literal) => {
+    ($name:literal, [$($ext:literal),*], $query:literal) => {
         Lang {
             name: $name,
             exts: &[$($ext),*],
-            language: || $lang.into(),
+            loaded: OnceLock::new(),
             query_src: include_str!(concat!("../tree-sitters/", $query, ".scm")),
             compiled: OnceLock::new(),
         }
     };
 }
 
-/// Every grammar compiled into this binary. Extensions are matched
+/// Every supported grammar, loaded only when first used. Extensions are matched
 /// case-insensitively; `.m` is sniffed between Objective-C and MATLAB.
 pub static LANGUAGES: LazyLock<Vec<Lang>> = LazyLock::new(|| vec![
-    lang!("python", ["py", "pyi"], tree_sitter_python::LANGUAGE),
-    lang!("javascript", ["js", "mjs", "cjs", "jsx"], tree_sitter_javascript::LANGUAGE),
-    lang!("typescript", ["ts", "mts", "cts"], tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
-    lang!("tsx", ["tsx"], tree_sitter_typescript::LANGUAGE_TSX, "typescript"),
-    lang!("java", ["java"], tree_sitter_java::LANGUAGE),
-    lang!("c", ["c"], tree_sitter_c::LANGUAGE),
-    lang!("cpp", ["cpp", "cc", "cxx", "hpp", "hh", "hxx", "h", "ipp", "cu", "cuh"], tree_sitter_cpp::LANGUAGE),
-    lang!("csharp", ["cs"], tree_sitter_c_sharp::LANGUAGE),
-    lang!("go", ["go"], tree_sitter_go::LANGUAGE),
-    lang!("rust", ["rs"], tree_sitter_rust::LANGUAGE),
-    lang!("php", ["php", "phtml"], tree_sitter_php::LANGUAGE_PHP),
-    lang!("ruby", ["rb", "rake", "gemspec"], tree_sitter_ruby::LANGUAGE),
-    lang!("swift", ["swift"], tree_sitter_swift::LANGUAGE),
-    lang!("kotlin", ["kt", "kts"], tree_sitter_kotlin_ng::LANGUAGE),
-    lang!("scala", ["scala", "sc"], tree_sitter_scala::LANGUAGE),
-    lang!("dart", ["dart"], tree_sitter_dart::LANGUAGE),
-    lang!("lua", ["lua"], tree_sitter_lua::LANGUAGE),
-    lang!("perl", ["pl", "pm", "t"], tree_sitter_perl::LANGUAGE),
-    lang!("r", ["r"], tree_sitter_r::LANGUAGE),
-    lang!("objc", ["mm"], tree_sitter_objc::LANGUAGE),
-    lang!("matlab", [], tree_sitter_matlab::LANGUAGE),
-    lang!("bash", ["sh", "bash", "zsh"], tree_sitter_bash::LANGUAGE),
-    lang!("powershell", ["ps1", "psm1", "psd1"], tree_sitter_powershell::LANGUAGE),
-    lang!("sql", ["sql"], tree_sitter_sequel::LANGUAGE),
-    lang!("haskell", ["hs"], tree_sitter_haskell::LANGUAGE),
-    lang!("elixir", ["ex", "exs"], tree_sitter_elixir::LANGUAGE),
-    lang!("erlang", ["erl", "hrl"], tree_sitter_erlang::LANGUAGE),
-    lang!("ocaml", ["ml"], tree_sitter_ocaml::LANGUAGE_OCAML),
-    lang!("julia", ["jl"], tree_sitter_julia::LANGUAGE),
-    lang!("zig", ["zig"], tree_sitter_zig::LANGUAGE),
-    lang!("groovy", ["groovy", "gradle", "gvy"], tree_sitter_groovy::LANGUAGE),
-    lang!("fortran", ["f", "f90", "f95", "f03", "f08", "for"], tree_sitter_fortran::LANGUAGE),
-    lang!("pascal", ["pas", "pp", "dpr"], tree_sitter_pascal::LANGUAGE),
-    lang!("ada", ["adb", "ads"], tree_sitter_ada::LANGUAGE),
-    lang!("solidity", ["sol"], tree_sitter_solidity::LANGUAGE),
-    lang!("hcl", ["tf", "tfvars", "hcl"], tree_sitter_hcl::LANGUAGE),
-    lang!("nix", ["nix"], tree_sitter_nix::LANGUAGE),
-    lang!("elm", ["elm"], tree_sitter_elm::LANGUAGE),
-    lang!("cmake", ["cmake"], tree_sitter_cmake::LANGUAGE),
-    lang!("asm", ["s", "asm"], tree_sitter_asm::LANGUAGE),
-    lang!("markdown", ["md", "markdown"], tree_sitter_md::LANGUAGE),
+    lang!("python", ["py", "pyi"]),
+    lang!("javascript", ["js", "mjs", "cjs", "jsx"]),
+    lang!("typescript", ["ts", "mts", "cts"]),
+    lang!("tsx", ["tsx"], "typescript"),
+    lang!("java", ["java"]),
+    lang!("c", ["c"]),
+    lang!("cpp", ["cpp", "cc", "cxx", "hpp", "hh", "hxx", "h", "ipp", "cu", "cuh"]),
+    lang!("csharp", ["cs"]),
+    lang!("go", ["go"]),
+    lang!("rust", ["rs"]),
+    lang!("php", ["php", "phtml"]),
+    lang!("ruby", ["rb", "rake", "gemspec"]),
+    lang!("swift", ["swift"]),
+    lang!("kotlin", ["kt", "kts"]),
+    lang!("scala", ["scala", "sc"]),
+    lang!("dart", ["dart"]),
+    lang!("lua", ["lua"]),
+    lang!("perl", ["pl", "pm", "t"]),
+    lang!("r", ["r"]),
+    lang!("objc", ["mm"]),
+    lang!("matlab", []),
+    lang!("bash", ["sh", "bash", "zsh"]),
+    lang!("powershell", ["ps1", "psm1", "psd1"]),
+    lang!("sql", ["sql"]),
+    lang!("haskell", ["hs"]),
+    lang!("elixir", ["ex", "exs"]),
+    lang!("erlang", ["erl", "hrl"]),
+    lang!("ocaml", ["ml"]),
+    lang!("julia", ["jl"]),
+    lang!("zig", ["zig"]),
+    lang!("groovy", ["groovy", "gradle", "gvy"]),
+    lang!("fortran", ["f", "f90", "f95", "f03", "f08", "for"]),
+    lang!("pascal", ["pas", "pp", "dpr"]),
+    lang!("ada", ["adb", "ads"]),
+    lang!("solidity", ["sol"]),
+    lang!("hcl", ["tf", "tfvars", "hcl"]),
+    lang!("nix", ["nix"]),
+    lang!("elm", ["elm"]),
+    lang!("cmake", ["cmake"]),
+    lang!("asm", ["s", "asm"]),
+    lang!("markdown", ["md", "markdown"]),
 ]);
 
 /// Extensions that reach a grammar, for the walker's file filter.
@@ -185,7 +199,7 @@ fn is_open_ended(kind: &str) -> bool {
 pub fn definitions(lang: &Lang, text: &str) -> Option<Vec<Def>> {
     let query = lang.query()?;
     let mut parser = Parser::new();
-    parser.set_language(&(lang.language)()).ok()?;
+    parser.set_language(lang.language()?).ok()?;
     let tree = parser.parse(text, None)?;
     let names = query.capture_names();
     let def_idx: Vec<(u32, String)> = names
@@ -501,7 +515,7 @@ pub fn explain(rel: &str, text: &str) -> Option<(&'static str, Vec<Def>)> {
 pub fn sexp(rel: &str, text: &str) -> Option<String> {
     let lang = language_for(rel, text)?;
     let mut parser = Parser::new();
-    parser.set_language(&(lang.language)()).ok()?;
+    parser.set_language(lang.language()?).ok()?;
     Some(parser.parse(text, None)?.root_node().to_sexp())
 }
 

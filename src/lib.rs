@@ -38,6 +38,8 @@ pub mod storage;
 pub mod tokenizer;
 #[cfg(feature = "treesitter")]
 pub mod treesit;
+#[cfg(feature = "treesitter")]
+mod grammar;
 pub mod usagelog;
 
 /// Process-wide verbosity, set once from the CLI's `-v/--verbose`. Off by
