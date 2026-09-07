@@ -215,11 +215,7 @@ fn fuse_union(
         }
     }
 
-    rows.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
+    rows.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
     rows.truncate(k);
     std::mem::take(rows)
 }
@@ -283,9 +279,7 @@ pub fn brute_force_semantic(
         })
         .collect();
     top_k_by(&mut rows, k, |a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.doc_id.cmp(&b.doc_id))
+        b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id))
     });
     rows
 }
@@ -318,8 +312,8 @@ fn min_max(vals: impl Iterator<Item = f32>) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::{l2_normalize, write_f16, EmbeddingStore};
     use crate::block_max_wand::SearchHit;
+    use crate::embeddings::{l2_normalize, write_f16, EmbeddingStore};
 
     fn store() -> (std::path::PathBuf, EmbeddingStore) {
         store_named("hyb")
@@ -413,6 +407,48 @@ mod tests {
         assert!(merged[0].bm25 == 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn segmented_selection_matches_exhaustive_sort_with_ties_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Cross the 4096-row boundaries and repeat scores deliberately.
+        let vectors: Vec<Vec<f32>> = (0..9000)
+            .map(|i| {
+                let mut v = vec![(i % 31) as f32, 1.0, 0.0, 0.0];
+                l2_normalize(&mut v);
+                v
+            })
+            .collect();
+        write_f16(dir.path(), 4, &vectors).unwrap();
+        let stores = SegmentStores {
+            stores: vec![
+                Some(EmbeddingStore::open(dir.path()).unwrap()),
+                None,
+                Some(EmbeddingStore::open(dir.path()).unwrap()),
+            ],
+        };
+        let live = |si: usize, doc: u32| (doc as usize + si) % 7 != 0;
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let mut expected = Vec::new();
+        for (si, store) in stores.stores.iter().enumerate() {
+            if let Some(store) = store {
+                for doc in 0..store.num_docs() {
+                    if live(si, doc) {
+                        expected.push((si, doc, store.cosine(doc, &query)));
+                    }
+                }
+            }
+        }
+        expected.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+        for pool in [0, 1, 10, 200, 4096, 20000] {
+            let actual: Vec<_> = segmented_semantic_pool(&stores, &live, &query, pool)
+                .into_iter()
+                .map(|h| (h.segment, h.doc_id, h.score))
+                .collect();
+            assert_eq!(actual, expected[..pool.min(expected.len())], "pool={pool}");
+        }
+        assert!(segmented_semantic_pool(&stores, &|_, _| false, &query, 10).is_empty());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,19 +482,108 @@ impl SegmentStores {
 }
 
 /// Semantic top-`pool` over every live document of every segment: an exact
-/// brute-force scan, in parallel across segments.
+/// brute-force scan, in parallel across fixed-size document ranges.
 ///
-/// No IVF, deliberately. Segments stay small between merges, and the
-/// measured recall/latency trade at repo scale favors exact scoring — see
-/// the nprobe/PQ measurements in the README. IVF over the merged base
-/// segment can be layered back in when corpora outgrow brute force.
+/// Retained as the exhaustive oracle and benchmark baseline. Ranked retrieval
+/// uses `segmented_semantic_pool_with_options` to select graph or exact paths.
 pub fn segmented_semantic_pool(
     stores: &SegmentStores,
     live: &(dyn Fn(usize, u32) -> bool + Sync),
     query: &[f32],
     pool: usize,
 ) -> Vec<SegHybridHit> {
+    segmented_exact_pool(stores, live, query, pool, &std::collections::HashSet::new()).0
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct VectorSearchStats {
+    pub distance_computations: usize,
+    pub graph_segments: usize,
+    pub exact_segments: usize,
+    pub graph_fallbacks: usize,
+}
+
+/// Route through per-segment HNSW when present; missing/stale graphs and an
+/// explicit exact request use the parallel scan. Dead nodes are routing nodes,
+/// never results. Only candidate generation is approximate; scores stay FP16.
+pub fn segmented_semantic_pool_with_options(
+    stores: &SegmentStores,
+    live: &(dyn Fn(usize, u32) -> bool + Sync),
+    query: &[f32],
+    pool: usize,
+    ef: usize,
+    exact: bool,
+) -> (Vec<SegHybridHit>, VectorSearchStats) {
     use rayon::prelude::*;
+    if pool == 0 {
+        return (Vec::new(), VectorSearchStats::default());
+    }
+    let routed: Vec<_> = stores
+        .stores
+        .par_iter()
+        .enumerate()
+        .filter_map(|(si, store)| {
+            if exact {
+                return None;
+            }
+            let store = store.as_ref()?;
+            let graph = store.hnsw()?;
+            Some((si, graph.search(store, query, pool, ef, &|id| live(si, id))))
+        })
+        .collect();
+    let excluded: std::collections::HashSet<_> = routed.iter().map(|(si, _)| *si).collect();
+    let (mut rows, scored) = segmented_exact_pool(stores, live, query, pool, &excluded);
+    let mut stats = VectorSearchStats {
+        distance_computations: scored,
+        graph_segments: routed.len(),
+        exact_segments: stores
+            .stores
+            .iter()
+            .enumerate()
+            .filter(|(si, s)| s.is_some() && !excluded.contains(si))
+            .count(),
+        graph_fallbacks: 0,
+    };
+    for (si, found) in routed {
+        stats.distance_computations += found.distance_computations;
+        stats.graph_fallbacks += usize::from(found.exact_fallback);
+        rows.extend(found.hits.into_iter().map(|h| SegHybridHit {
+            segment: si,
+            doc_id: h.doc_id,
+            score: h.score,
+            bm25: 0.0,
+            semantic: h.score,
+        }));
+    }
+    top_k_by(&mut rows, pool, |a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.segment.cmp(&b.segment))
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    (rows, stats)
+}
+
+fn segmented_exact_pool(
+    stores: &SegmentStores,
+    live: &(dyn Fn(usize, u32) -> bool + Sync),
+    query: &[f32],
+    pool: usize,
+    excluded: &std::collections::HashSet<usize>,
+) -> (Vec<SegHybridHit>, usize) {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    let scored = AtomicUsize::new(0);
+
+    if pool == 0 {
+        return (Vec::new(), 0);
+    }
+    let compare = |a: &SegHybridHit, b: &SegHybridHit| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.segment.cmp(&b.segment))
+            .then(a.doc_id.cmp(&b.doc_id))
+    };
 
     // Parallelism is over fixed-size doc ranges, not segments: after a
     // compaction merge the index is one big segment, and per-segment
@@ -467,6 +592,9 @@ pub fn segmented_semantic_pool(
     const SCAN_CHUNK: u32 = 4096;
     let mut ranges: Vec<(usize, u32, u32)> = Vec::new();
     for (si, store) in stores.stores.iter().enumerate() {
+        if excluded.contains(&si) {
+            continue;
+        }
         let n = store.as_ref().map(|s| s.num_docs()).unwrap_or(0);
         let mut at = 0u32;
         while at < n {
@@ -481,7 +609,7 @@ pub fn segmented_semantic_pool(
             let store = stores.stores[si]
                 .as_ref()
                 .expect("ranges only cover segments with stores");
-            let mut chunk_rows = Vec::new();
+            let mut chunk_rows = Vec::with_capacity((end - start) as usize);
             for doc_id in start..end {
                 if !live(si, doc_id) {
                     continue;
@@ -497,18 +625,18 @@ pub fn segmented_semantic_pool(
             }
             // Keep only this range's best `pool`; the global merge below
             // cannot need more than that from one range.
-            top_k_by(&mut chunk_rows, pool, |a, b| b.score.total_cmp(&a.score));
+            scored.fetch_add(chunk_rows.len(), AtomicOrdering::Relaxed);
+            // The merge does not require sorted ranges. Use the same total
+            // ordering locally and globally so tied scores keep the right ids.
+            if chunk_rows.len() > pool {
+                chunk_rows.select_nth_unstable_by(pool, compare);
+                chunk_rows.truncate(pool);
+            }
             chunk_rows
         })
         .collect();
-    rows.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.segment.cmp(&b.segment))
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
-    rows.truncate(pool);
-    rows
+    top_k_by(&mut rows, pool, compare);
+    (rows, scored.into_inner())
 }
 
 /// Fuse BM25 hits (as `(segment, doc_id, score)`) with the semantic pool.

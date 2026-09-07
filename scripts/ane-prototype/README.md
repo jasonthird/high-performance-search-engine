@@ -12,7 +12,18 @@ The cache root is `CSEARCH_CACHE_DIR`, otherwise
 Install batch-8 document models at sequence 64/128/256/512 and one batch-1
 query model at sequence 64. Shapes load on first use; document batches use
 the smallest fitting shape. A query-only installation cannot encode
-documents. `HIPS_ENCODER=candle` forces the portable backend.
+documents. The runtime falls back to Candle if the installed shapes cannot
+cover the configured token cap. `HIPS_ENCODER=candle` forces the portable backend.
+Document shapes are checked for batch-permutation equivalence on first use.
+Failed shapes are skipped for larger fitting shapes; if none pass, use Candle
+and regenerate the family. This check caught the locally installed batch-8/64
+artifact during the September 8 scheduler benchmark; installed files were not
+changed. Validation adds cold-start work and is a smoke test, not a full
+comparison against the original weights.
+Document scheduling now uses actual token lengths and a bounded CPU-prefetch
+queue. Recheck the historical timings below with
+`cargo run --release --features semantic --example cold_embed_bench -- . 128`
+from the repository root; use `HIPS_ENCODER=candle` for the other backend.
 
 Compiled CoreML models are not downloaded or converted by hips. The runtime
 still obtains the original Hugging Face model files (configuration,

@@ -81,6 +81,14 @@ pub struct EmbedCache {
 }
 
 impl EmbedCache {
+    /// First row for each uncached content key, preserving input order.
+    pub fn unique_misses(&self, keys: &[u64]) -> Vec<usize> {
+        let mut seen = HashSet::new();
+        keys.iter().enumerate()
+            .filter_map(|(i, &key)| (!self.contains(key) && seen.insert(key)).then_some(i))
+            .collect()
+    }
+
     pub fn new(dim: usize) -> Self {
         Self {
             dim,
@@ -277,6 +285,22 @@ impl EmbedCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_misses_encode_duplicates_once_and_keep_row_order() {
+        let mut cache = EmbedCache::new(2);
+        let keys: Vec<_> = ["same", "other", "same", "third", "other"]
+            .iter().map(|s| key_for(s)).collect();
+        assert_eq!(cache.unique_misses(&keys), vec![0, 1, 3]);
+        for i in cache.unique_misses(&keys) {
+            cache.insert(keys[i], &[i as f32, 1.0]);
+        }
+        assert!(cache.unique_misses(&keys).is_empty());
+        assert_eq!(cache.get(keys[0]), cache.get(keys[2]));
+        assert_eq!(cache.get(keys[1]), cache.get(keys[4]));
+        assert!(cache.unique_misses(&[]).is_empty());
+        assert_eq!(cache.unique_misses(&[keys[0], key_for("new"), key_for("new")]), vec![1]);
+    }
 
     #[test]
     fn roundtrips_vectors_and_codes_through_disk() {

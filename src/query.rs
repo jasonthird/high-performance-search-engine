@@ -25,8 +25,8 @@ use crate::storage;
 // of pure semantic on NL, and keeps a lexical anchor for text the encoder
 // cannot see (string literals, config files, tails of >512-token chunks).
 
-/// Whether ADC scoring is used. `Auto` defers to [`crate::pq::worth_using`]:
-/// below the break-even candidate count PQ costs recall and saves nothing.
+/// Whether ADC scoring is used. `Auto` currently uses exact FP16 scoring;
+/// forced PQ is retained for experiments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PqMode {
     Auto,
@@ -61,17 +61,21 @@ pub struct SearchOpts {
     pub rrf_k: f32,
     pub nprobe: usize,
     pub pq: PqMode,
+    pub ann_ef: usize,
+    pub exact_vectors: bool,
 }
 
-/// Pick the scoring path: ADC only when enough documents will be scored to
-/// amortize its table build. See [`crate::pq::MIN_CANDIDATES`] for the
-/// measurements behind the threshold.
+/// Pick exact FP16 scoring unless PQ is explicitly forced for experiments.
+/// The exhaustive-vector override also disables forced PQ.
 #[cfg(feature = "semantic")]
 fn choose_pq<'a>(
     index: &'a searcher::AnyIndex,
     opts: &SearchOpts,
     top_k: usize,
 ) -> Option<&'a crate::pq::PqIndex> {
+    if opts.exact_vectors {
+        return None;
+    }
     let pq = index.pq()?;
     match opts.pq {
         PqMode::Off => None,
@@ -113,6 +117,8 @@ pub struct RankedRun {
     pub bm25_ms: f64,
     pub embed_ms: f64,
     pub score_ms: f64,
+    /// Candidate-generation work (segmented vector path only).
+    pub vector_stats: Option<crate::hybrid::VectorSearchStats>,
     pub total_ms: f64,
 }
 
@@ -209,7 +215,11 @@ pub fn run_ranked_with(
                 fusion_from(opts),
                 top_k,
                 pool,
-                index.ivf(),
+                if opts.exact_vectors {
+                    None
+                } else {
+                    index.ivf()
+                },
                 opts.nprobe,
                 choose_pq(index, opts, top_k),
             );
@@ -234,7 +244,11 @@ pub fn run_ranked_with(
                 embeddings,
                 &qvec,
                 top_k,
-                index.ivf(),
+                if opts.exact_vectors {
+                    None
+                } else {
+                    index.ivf()
+                },
                 opts.nprobe,
                 choose_pq(index, opts, top_k),
             );
@@ -270,14 +284,14 @@ pub fn run_ranked_with(
         bm25_ms,
         embed_ms,
         score_ms,
+        vector_stats: None,
         total_ms: total.elapsed().as_secs_f64() * 1000.0,
     })
 }
 
 /// Ranked retrieval over a segmented index: BM25 across segments plus an
-/// exact per-segment brute-force semantic pool, fused like the single-index
-/// path. No IVF/PQ — segments stay small between merges, and exact scoring
-/// measured better on both recall and simplicity at repo scale.
+/// graph-routed semantic pool (exact scans for segments without graphs or on
+/// explicit request), fused like the single-index path. No segmented IVF/PQ.
 #[cfg(feature = "semantic")]
 fn run_ranked_segmented(
     index: &searcher::AnyIndex,
@@ -321,18 +335,42 @@ fn run_ranked_segmented(
 
     let t_score = Instant::now();
     let live = |si: usize, doc: u32| seg.is_live(si, doc);
+    let mut vector_stats = None;
     let hits = match opts.mode {
         RankMode::Semantic => {
-            let mut sem = hybrid::segmented_semantic_pool(stores, &live, &qvec, top_k);
+            let (mut sem, work) = hybrid::segmented_semantic_pool_with_options(
+                stores,
+                &live,
+                &qvec,
+                top_k,
+                opts.ann_ef,
+                opts.exact_vectors,
+            );
+            vector_stats = Some(work);
             sem.truncate(top_k);
             sem
         }
         RankMode::Rerank => {
             // Cosine only on the BM25 candidates.
-            hybrid::segmented_fuse(&bm25_hits, Vec::new(), stores, &qvec, fusion_from(opts), top_k)
+            hybrid::segmented_fuse(
+                &bm25_hits,
+                Vec::new(),
+                stores,
+                &qvec,
+                fusion_from(opts),
+                top_k,
+            )
         }
         _ => {
-            let sem = hybrid::segmented_semantic_pool(stores, &live, &qvec, pool);
+            let (sem, work) = hybrid::segmented_semantic_pool_with_options(
+                stores,
+                &live,
+                &qvec,
+                pool,
+                opts.ann_ef,
+                opts.exact_vectors,
+            );
+            vector_stats = Some(work);
             hybrid::segmented_fuse(&bm25_hits, sem, stores, &qvec, fusion_from(opts), top_k)
         }
     };
@@ -358,6 +396,7 @@ fn run_ranked_segmented(
         bm25_ms,
         embed_ms,
         score_ms,
+        vector_stats,
         total_ms: total.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -366,6 +405,13 @@ fn run_ranked_segmented(
 /// into each with `#[command(flatten)]` so adding a knob is one edit.
 #[derive(clap::Args, Clone, Copy)]
 pub struct FusionArgs {
+    /// HNSW search width for segmented vector retrieval (at least the requested
+    /// candidate pool). Larger values trade latency for recall.
+    #[arg(long, default_value_t = crate::hnsw::DEFAULT_EF)]
+    pub ann_ef: usize,
+    /// Exhaustive FP16 vector scoring: bypass HNSW and IVF candidate routing.
+    #[arg(long)]
+    pub exact_vectors: bool,
     /// Pool size: BM25 hits kept as helper, and encoder neighbors kept,
     /// before fusion (`hybrid` / `rerank`).
     #[arg(long, default_value_t = 200)]
@@ -402,6 +448,8 @@ impl Default for SearchOpts {
             rrf_k: 60.0,
             nprobe: 0,
             pq: PqMode::Auto,
+            ann_ef: crate::hnsw::DEFAULT_EF,
+            exact_vectors: false,
         }
     }
 }
@@ -415,7 +463,13 @@ impl FusionArgs {
             alpha: self.alpha,
             rrf_k: self.rrf_k,
             nprobe: self.nprobe,
-            pq: if self.no_pq { PqMode::Off } else { PqMode::Auto },
+            pq: if self.no_pq {
+                PqMode::Off
+            } else {
+                PqMode::Auto
+            },
+            ann_ef: self.ann_ef,
+            exact_vectors: self.exact_vectors,
         }
     }
 }

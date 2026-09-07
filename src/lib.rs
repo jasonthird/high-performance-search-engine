@@ -21,6 +21,7 @@ pub mod eval;
 pub mod external;
 pub mod hash;
 pub mod hybrid;
+pub mod hnsw;
 pub mod indexer;
 pub mod ivf;
 pub mod pq;

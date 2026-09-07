@@ -60,6 +60,7 @@ fn main() -> anyhow::Result<()> {
         rrf_k: 60.0,
         nprobe: 0,
         pq: PqMode::Auto,
+        ..SearchOpts::default()
     };
 
     println!(

@@ -44,7 +44,7 @@ tree-sitter = { version = "0.26", optional = true }
 tree-sitter-language = { version = "0.1", optional = true }
 libloading = { version = "0.8", optional = true }
 ureq = { version = "2.12", optional = true }
-tempfile = { version = "3", optional = true }
+tempfile = "3"
 sha2 = { version = "0.10", optional = true }
 
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
@@ -62,7 +62,7 @@ candle-transformers = { version = "0.11", optional = true, features = ["metal"] 
 default = ["treesitter"]
 # Declaration-aware chunking through tree-sitter for ~40 languages; without it
 # the keyword heuristic in `repo.rs` is used for every file.
-treesitter = ["dep:tree-sitter", "dep:tree-sitter-language", "dep:libloading", "dep:ureq", "dep:tempfile", "dep:sha2"]
+treesitter = ["dep:tree-sitter", "dep:tree-sitter-language", "dep:libloading", "dep:ureq", "dep:sha2"]
 # GPU-accelerated BP document reordering: zero-copy Metal via objc2
 # (macOS only). Off by default.
 gpu = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]

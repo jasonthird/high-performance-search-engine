@@ -60,6 +60,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Build HNSW routing for existing large embedded segments, without
+    /// re-encoding. Small segments keep exact scans. Readers should reopen
+    /// their index after this command completes.
+    BuildAnn {
+        #[arg(long)]
+        index: PathBuf,
+    },
     /// Build an index from a JSONL file of documents.
     Index {
         /// Input JSONL file ({"id": ..., "title": ..., "body": ...} per line).
@@ -437,6 +444,11 @@ pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     crate::verbosity::set(cli.verbose);
     match cli.command {
+        Command::BuildAnn { index } => {
+            let built = crate::hnsw::build_segments(&index)?;
+            println!("built HNSW graphs for {built} segments; reopen readers to use them");
+            Ok(())
+        }
         Command::Index {
             input,
             out,
@@ -1212,6 +1224,10 @@ fn cmd_search(
         );
     }
     let s = &timed.stats;
+    if let Some(v) = &timed.vector_stats {
+        println!("vector candidates: dot_products={} graph_segments={} exact_segments={} graph_fallbacks={}",
+            v.distance_computations, v.graph_segments, v.exact_segments, v.graph_fallbacks);
+    }
     println!(
         "stats: docs_total={} query_terms={} postings_visited={} docs_scored={} blocks_visited={} blocks_skipped={}",
         s.num_docs_total,

@@ -42,6 +42,7 @@ fn main() -> anyhow::Result<()> {
         rrf_k: 60.0,
         nprobe: clusters,
         pq: PqMode::Off,
+        ..SearchOpts::default()
     };
     // Ground truth once per query.
     let mut truth: Vec<HashSet<String>> = Vec::new();

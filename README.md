@@ -453,8 +453,17 @@ vector per document, and `--mode hybrid` (the default on `search`) is
 index built with `index --embed` the encoder probes `ivf.bin` cluster
 posting lists (same inverted-file layout and `doc_id`s as BM25; `--nprobe`
 controls how many clusters to open); on the segmented indexes that
-`index-repo` builds, vectors are scored exactly per segment (see below for
-why exact wins at repository scale).
+`index-repo` builds, large segments use HNSW routing and small segments use
+exact scans. Candidate dot products use the existing FP16 vectors; HNSW
+candidate selection is approximate. `--exact-vectors` requests exhaustive
+vector retrieval, while `--ann-ef 256` increases the graph search beam.
+
+New or compacted segments build graphs automatically at 8,192 vectors.
+Upgrade an existing segmented index without re-encoding with
+`hips build-ann --index <index-directory>`, then reopen readers. Missing or
+invalid graphs safely fall back to exact scans. See
+[the retrieval theory and bibliography](docs/THEORY.md#17-sublinear-vector-retrieval-implementation-and-literature)
+for measured latency/recall, construction costs and limitations.
 
 Inference runs in-process, no Python at query time. Two backends:
 
@@ -466,7 +475,18 @@ Inference runs in-process, no Python at query time. Two backends:
   compiled to static-shape models (batch-8 document models at sequence
   64/128/256/512, a batch-1 query model) under `<cache>/coreml/`, produced
   by `scripts/ane-prototype/ane_convert.py`. Used automatically when the
-  compiled models exist; `HIPS_ENCODER=candle` forces the fallback.
+  compiled models cover the configured token limit; incomplete families fall
+  back to Candle. Document shapes also undergo a once-per-loaded-shape batch-row
+  equivalence check; failed shapes are skipped, and encoding reports an error
+  if no fitting shape passes. `HIPS_ENCODER=candle` forces the fallback.
+
+Cold indexing encodes each missing content key once, groups inputs by actual
+token length, and overlaps CPU tokenization with inference using a bounded
+two-batch queue. The model, token caps and row order are preserved. Compare
+the former byte-bucketed serial scheduler with the new path using
+`cargo run --release --features semantic --example cold_embed_bench -- . 128`.
+This measures uncached encoding after model/shape warmup, not downloads or
+the complete first index build.
   Measured on an M3: 25.4k tok/s vs Candle/Metal's 6.3k for document
   batches, an 810-chunk cold index in 13.0 s instead of 28.6 s, a hybrid
   query in 0.10 s wall including model load, and embeddings within mean
@@ -789,7 +809,9 @@ only those; a compaction merge runs past `codeindex::MAX_SEGMENTS` and
 rebuilds the merged segment's vectors from the cache by key — no
 re-encoding. An unchanged tree is detected from a fingerprint of the
 walked file list (path, size, mtime), so an up-to-date rebuild costs only
-the walk. This shortcut does not read and compare every file's content. Semantic scoring is exact brute-force per segment (no IVF/PQ).
+the walk. This shortcut does not read and compare every file's content. Semantic
+retrieval uses per-segment HNSW where available and exact scans otherwise
+(no segmented IVF/PQ). Compaction rebuilds graphs for large merged segments.
 Measured:
 
 ```
@@ -815,10 +837,10 @@ proportional to the edit:
 
 - **Vectors.** `embcache.bin` keys FP16 embeddings by a hash of the chunk
   text, so only chunks whose content changed are re-encoded. Encoding
-  length-buckets each batch (sorting by size before batching): padding to
-  the batch's longest member wasted 41% of the encoder in file order, and
-  bucketing measured 73.4 -> 38.6 ms/chunk with vectors identical to within
-  F16 rerun noise (`examples/bucket_equiv.rs`).
+  now uses token-length buckets and CPU prefetch. Historical byte-length
+  bucketing measured 73.4 -> 38.6 ms/chunk versus file order; that is not a
+  measurement of the new scheduler. `examples/cold_embed_bench.rs` measures
+  the current implementation and checks vector equivalence.
 - **Quantization.** The IVF centroids and PQ codebooks are *trained once* and
   reused: k-means for IVF plus 16 x 256-centroid k-means for PQ costs ~1 s on
   a small repo and scales with the corpus, yet none of it depends on which
@@ -993,7 +1015,7 @@ corpus skips unchanged documents, replaces changed ones, and adds new
 ones — re-crawling a source and piping it through `add --upsert` only
 writes what actually changed.
 
-Search remains globally exact across segments: queries score under
+Lexical search remains globally exact across segments: queries score under
 corpus-wide statistics (live N, global average length, df summed across
 segments), which the impact-based block bounds make safe. One documented
 deviation, shared with Lucene: df counts tombstoned documents until a
@@ -1013,10 +1035,8 @@ What this engine deliberately does not do:
 - no autocomplete
 - no aggregations
 - no advanced analyzers (no stemming, no synonyms, no language-specific analysis)
-- no distributed vector search / HNSW (the optional encoder-first hybrid
-  behind `--features semantic` — CodeRankEmbed vectors scored exactly per
-  segment, or through IVF cluster postings + PQ on single-layout indexes —
-  is sized for repositories, not a vector database)
+- no distributed or SSD-native graph search; per-segment HNSW topology is
+  RAM-resident and approximate, with an explicit exact-vector fallback
 - no highlighting
 - relevance controls include title weighting, candidate pools,
   and hybrid weighted/RRF fusion; no learned reranker or tuning service

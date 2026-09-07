@@ -630,18 +630,17 @@ impl RepoIndexer {
         progress: bool,
     ) -> anyhow::Result<(Vec<u64>, Vec<Vec<f32>>, usize, usize)> {
         let keys: Vec<u64> = texts.iter().map(|t| crate::embcache::key_for(t)).collect();
-        let misses: Vec<usize> = (0..texts.len())
-            .filter(|&i| !cache.contains(keys[i]))
-            .collect();
+        let misses = cache.unique_misses(&keys);
         let encoded = misses.len();
         let cached = texts.len() - encoded;
         if encoded > 0 {
             self.log(format!(
-                "encoding {encoded} changed chunks ({cached} unchanged, from cache)"
+                "encoding {encoded} unique chunks ({cached} rows reused from cache or duplicates)"
             ));
             let embedder = self.embedder()?;
             let mut done = 0usize;
-            for chunk in misses.chunks(batch) {
+            // Give token-aware scheduling a larger, bounded lookahead window.
+            for chunk in misses.chunks(batch.max(4096)) {
                 let refs: Vec<&str> = chunk.iter().map(|&i| texts[i].as_str()).collect();
                 let vectors = embedder.embed_docs(&refs)?;
                 for (&i, vector) in chunk.iter().zip(vectors.iter()) {
@@ -684,6 +683,7 @@ impl RepoIndexer {
         let (keys, vectors, encoded, cached) = self.encode_cached(&mut cache, &texts, 256, false)?;
         crate::embeddings::write_f16(seg_dir, CODERANK_DIM as u32, &vectors)?;
         write_keys(seg_dir, &keys)?;
+        crate::hnsw::build_if_large(seg_dir)?;
         // NOTE: the cache is *not* pruned here — stale entries are trimmed
         // at merge time, when the set of live keys is enumerated anyway.
         cache.save(&self.index_dir)?;
@@ -759,6 +759,7 @@ impl RepoIndexer {
         }
         crate::embeddings::write_f16(seg_dir, CODERANK_DIM as u32, &vectors)?;
         write_keys(seg_dir, keys)?;
+        crate::hnsw::build_if_large(seg_dir)?;
         // The merged segment is the whole corpus: prune the cache to it.
         let live: HashSet<u64> = keys.iter().copied().collect();
         cache.retain_keys(&live);

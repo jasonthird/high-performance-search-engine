@@ -39,9 +39,33 @@ struct ShapeModel {
     seq: usize,
     path: PathBuf,
     model: std::cell::OnceCell<Retained<MLModel>>,
+    batch_valid: std::cell::OnceCell<bool>,
 }
 
 impl ShapeModel {
+    /// A compiled model must preserve row identity under batch permutation.
+    /// Some traced artifacts specialize masking/unpadding to example inputs.
+    fn batch_stable(&self) -> anyhow::Result<bool> {
+        if let Some(&valid) = self.batch_valid.get() { return Ok(valid); }
+        let rows: Vec<Vec<u32>> = (0..self.batch).map(|i| {
+            let len = (4 + i * 5).min(self.seq);
+            let mut row = vec![2000 + i as u32; len];
+            if len >= 2 { row[0] = 101; row[len - 1] = 102; }
+            row
+        }).collect();
+        let forward: Vec<_> = rows.iter().map(Vec::as_slice).collect();
+        let backward: Vec<_> = forward.iter().copied().rev().collect();
+        let a = run(self, &forward)?;
+        let b = run(self, &backward)?;
+        let valid = a.iter().zip(b.iter().rev()).all(|(a,b)| {
+            let dot: f32 = a.iter().zip(b).map(|(x,y)| x*y).sum();
+            dot.is_finite() && dot > 0.995
+        });
+        self.batch_valid.set(valid).ok();
+        if !valid { eprintln!("warning: {} failed batch-equivalence validation; skipping this CoreML shape", self.path.display()); }
+        Ok(valid)
+    }
+
     fn model(&self) -> anyhow::Result<&Retained<MLModel>> {
         if let Some(m) = self.model.get() {
             return Ok(m);
@@ -52,11 +76,34 @@ impl ShapeModel {
 }
 
 pub struct CoreMlEncoder {
-    /// Document models, ascending by sequence length. All share one batch
-    /// size (8 in the shipped family).
+    /// Document models, ascending by sequence length. Scheduling uses their
+    /// minimum batch capacity (8 in the intended family).
     docs: Vec<ShapeModel>,
     /// Batch-1 short-sequence model for queries, when present.
     query: Option<ShapeModel>,
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    fn shape(batch: usize, seq: usize) -> ShapeModel {
+        ShapeModel { batch, seq, path: PathBuf::new(), model: std::cell::OnceCell::new(), batch_valid: std::cell::OnceCell::new() }
+    }
+
+    #[test]
+    fn partial_families_cannot_silently_shorten_documents() {
+        let query_only = CoreMlEncoder { docs: vec![], query: Some(shape(1, 64)) };
+        assert!(!query_only.supports_documents(512));
+        assert!(query_only.supports_queries(64));
+        assert!(!query_only.supports_queries(128));
+        let partial = CoreMlEncoder { docs: vec![shape(8, 128)], query: None };
+        assert!(!partial.supports_documents(512));
+        assert!(partial.encode_docs(&[vec![1; 129]]).is_err());
+        let mixed = CoreMlEncoder { docs: vec![shape(8, 64), shape(4, 512)], query: None };
+        assert!(mixed.supports_documents(512));
+        assert_eq!(mixed.doc_batch(), 4);
+    }
 }
 
 /// Where compiled models live: `<csearch cache>/coreml`.
@@ -92,14 +139,16 @@ impl CoreMlEncoder {
             let (Ok(batch), Ok(seq)) = (b.parse::<usize>(), s.parse::<usize>()) else {
                 continue;
             };
+            if batch == 0 || seq == 0 { continue; }
             let sm = ShapeModel {
                 batch,
                 seq,
                 path: entry.path(),
                 model: std::cell::OnceCell::new(),
+                batch_valid: std::cell::OnceCell::new(),
             };
             if batch == 1 {
-                query = Some(sm);
+                if query.as_ref().is_none_or(|q| q.seq < seq) { query = Some(sm); }
             } else {
                 docs.push(sm);
             }
@@ -115,8 +164,17 @@ impl CoreMlEncoder {
         self.query.is_some()
     }
 
+    /// Only select CoreML when installed shapes preserve the requested cap.
+    pub fn supports_documents(&self, cap: usize) -> bool {
+        self.docs.iter().any(|m| m.seq >= cap)
+    }
+
+    pub fn supports_queries(&self, cap: usize) -> bool {
+        self.query.as_ref().is_some_and(|m| m.seq >= cap)
+    }
+
     pub fn doc_batch(&self) -> usize {
-        self.docs.first().map(|m| m.batch).unwrap_or(8)
+        self.docs.iter().map(|m| m.batch).min().unwrap_or(8)
     }
 
     /// Encode one query's token ids (already truncated to the query cap).
@@ -129,19 +187,18 @@ impl CoreMlEncoder {
         Some(run(m, &[ids]).map(|mut v| v.pop().expect("one row")))
     }
 
-    /// Encode up to `doc_batch()` documents. Rows longer than the largest
-    /// compiled sequence are truncated to it (matching the 512 cap the
-    /// candle path uses). Picks the smallest model that fits the batch's
-    /// longest row.
+    /// Encode up to `doc_batch()` documents, choosing the smallest fitting
+    /// shape. Never silently truncate when the installed family is incomplete.
     pub fn encode_docs(&self, ids: &[Vec<u32>]) -> anyhow::Result<Vec<Vec<f32>>> {
         anyhow::ensure!(!self.docs.is_empty(), "no CoreML document models");
         let max_seq = self.docs.last().expect("non-empty").seq;
-        let longest = ids.iter().map(|r| r.len().min(max_seq)).max().unwrap_or(1);
-        let m = self
-            .docs
-            .iter()
-            .find(|m| m.seq >= longest)
-            .unwrap_or_else(|| self.docs.last().expect("non-empty"));
+        let longest = ids.iter().map(|r| r.len()).max().unwrap_or(1);
+        anyhow::ensure!(longest <= max_seq, "CoreML document exceeds installed shapes");
+        let mut selected = None;
+        for m in self.docs.iter().filter(|m| m.seq >= longest) {
+            if m.batch_stable()? { selected = Some(m); break; }
+        }
+        let m = selected.context("no CoreML shape passed batch-equivalence validation; use HIPS_ENCODER=candle and regenerate the compiled family")?;
         anyhow::ensure!(
             ids.len() <= m.batch,
             "batch {} exceeds compiled batch {}",

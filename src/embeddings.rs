@@ -39,6 +39,9 @@ pub struct EmbeddingStore {
     num_docs: u32,
     dim: u32,
     dtype: u32,
+    modified_ns: u128,
+    graph_dir: std::path::PathBuf,
+    graph: std::sync::OnceLock<Option<crate::hnsw::HnswIndex>>,
 }
 
 impl EmbeddingStore {
@@ -46,7 +49,12 @@ impl EmbeddingStore {
         let path = dir.join(EMBEDDINGS_FILE);
         let file = File::open(&path)
             .with_context(|| format!("failed to open {} (run `embed` first)", path.display()))?;
-        let size = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        let size = metadata.len();
+        let modified_ns = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
         // SAFETY: the sidecar is immutable after `embed` writes it, same
         // mmap assumption as postings.bin / docs.bin.
         let mmap = unsafe { Mmap::map(&file) }
@@ -57,11 +65,17 @@ impl EmbeddingStore {
             path.display()
         );
         let version = u32_le(&mmap[8..12]);
-        anyhow::ensure!(version == VERSION, "unsupported embeddings version {version}");
+        anyhow::ensure!(
+            version == VERSION,
+            "unsupported embeddings version {version}"
+        );
         let num_docs = u32_le(&mmap[12..16]);
         let dim = u32_le(&mmap[16..20]);
         let dtype = u32_le(&mmap[20..24]);
-        anyhow::ensure!(dtype == DTYPE_F16 || dtype == DTYPE_F32, "unknown dtype {dtype}");
+        anyhow::ensure!(
+            dtype == DTYPE_F16 || dtype == DTYPE_F32,
+            "unknown dtype {dtype}"
+        );
         let width = if dtype == DTYPE_F16 { 2usize } else { 4 };
         let expected = HEADER_LEN as u64 + num_docs as u64 * dim as u64 * width as u64;
         anyhow::ensure!(
@@ -73,6 +87,9 @@ impl EmbeddingStore {
             num_docs,
             dim,
             dtype,
+            modified_ns,
+            graph_dir: dir.to_path_buf(),
+            graph: std::sync::OnceLock::new(),
         })
     }
 
@@ -90,6 +107,33 @@ impl EmbeddingStore {
 
     pub fn size_bytes(&self) -> u64 {
         self.mmap.len() as u64
+    }
+
+    /// Generation guard for derived sidecars. Immutable vector files must not
+    /// be edited while mapped. A rewritten file must keep its new mtime.
+    pub fn generation(&self) -> (u64, u128) {
+        (self.size_bytes(), self.modified_ns)
+    }
+
+    /// Optional topology loads once, only for ANN queries. Exact and lexical
+    /// callers never pay its allocation or validation cost.
+    pub fn hnsw(&self) -> Option<&crate::hnsw::HnswIndex> {
+        self.graph
+            .get_or_init(
+                || match crate::hnsw::HnswIndex::open(&self.graph_dir, self) {
+                    Ok(graph) => Some(graph),
+                    Err(e) => {
+                        if self.graph_dir.join(crate::hnsw::FILE).exists() {
+                            eprintln!(
+                                "warning: {}: {e:#}; using exact vector search",
+                                self.graph_dir.join(crate::hnsw::FILE).display()
+                            );
+                        }
+                        None
+                    }
+                },
+            )
+            .as_ref()
     }
 
     /// Cosine similarity = dot product of L2-normalized vectors.

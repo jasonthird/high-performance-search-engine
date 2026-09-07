@@ -495,8 +495,8 @@ replaces. So the tests pin them against oracles:
   encoder-first merge recovers a document BM25 never returned, that
   spherical k-means separates orthogonal vectors onto different cluster
   lists, and that `nprobe=1` does not open the orthogonal list. The
-  lexical oracle suite is unchanged. IVF/PQ are approximate; segmented
-  semantic search scores all live stored vectors exactly, while hybrid
+  lexical oracle suite is unchanged. IVF/PQ and HNSW routing are approximate;
+  `--exact-vectors` scores all live stored vectors, while hybrid
   fusion combines bounded candidate pools and has a different ranking goal.
 - Grammar tests: declaration fixtures cover all 41 language variants and
   nested chunks. Loader tests serve local HTTP artifacts to verify checksums,
@@ -517,7 +517,7 @@ The current retrieval paths differ by index layout:
 
 | Layout | Construction | Vector retrieval |
 |---|---|---|
-| Segmented (repository default) | `index-repo`, watcher, MCP | Exact cosine over every live vector in each segment |
+| Segmented (repository default) | `index-repo`, watcher, MCP | HNSW candidates on large indexed segments; exact scan otherwise (§17) |
 | Single | `index --embed`, `index-repo --single` | IVF candidate lists when present; full vector scan otherwise |
 
 Single-layout files are `embeddings.bin` (768-dimensional FP16 rows),
@@ -525,7 +525,8 @@ Single-layout files are `embeddings.bin` (768-dimensional FP16 rows),
 `i` has the same `doc_id` as lexical row `i`. In a segmented index,
 alignment is local to each segment; tombstones filter both lexical and
 semantic results. Each embedded segment also has `keys.bin` so merges
-can recover vectors from the content cache.
+can recover vectors from the content cache. Large segments also store optional
+`hnsw.bin` routing topology, without duplicating their FP16 vectors.
 
 ### Query modes and fusion
 
@@ -596,7 +597,17 @@ automatically. The intended family is batch-8 document models at sequence
 64/128/256/512 and a batch-1 query model at sequence 64. Shapes load lazily,
 and documents use the smallest fitting shape. Install the complete document
 family and query model together; a query-only installation cannot encode
-documents. `HIPS_ENCODER=candle` bypasses CoreML.
+documents. Incomplete families fall back to Candle when they cannot cover the
+configured token cap; CoreML does not silently shorten inputs to fit.
+Before using a document shape, a one-time mixed-length batch-permutation probe
+checks that outputs keep their row identities (cosine > 0.995). Failed shapes
+are skipped for a larger fitting shape; if none pass, encoding fails clearly
+and recommends Candle or regenerating the compiled family. This smoke test
+does not prove equivalence to the original weights. It caught the locally
+installed batch-8/64-token artifact during scheduler validation. No installed
+model files are modified. Existing embedding caches are not rebuilt by this
+check; indexes produced using a rejected artifact need a separate fresh
+embedding rebuild. `HIPS_ENCODER=candle` bypasses CoreML.
 
 The Hugging Face model files download on first use into its cache, honoring
 `HF_HOME` and `HF_ENDPOINT`. Compiled CoreML models are produced locally
@@ -605,11 +616,44 @@ or convert them. Loading CoreML still uses the Hugging Face configuration,
 tokenizer, and weights paths.
 
 Document vectors are cached persistently by chunk content in `embcache.bin`.
-Encoding length-buckets chunks to reduce padding. Repeated query strings
+Cold indexing deduplicates missing content keys before inference: repeated
+rows share one encoded vector even before the persistent cache is populated.
+The scheduler tokenizes once without padding, sorts by actual token length
+within 1,024-row windows, and pads only the accelerator batch. One CPU worker
+prepares ahead through a bounded two-batch channel while inference stays on
+the calling thread. Error paths release the queue before joining the worker.
+Queries and inputs fitting one batch avoid worker startup. Backend batch sizes
+remain unchanged (Candle default 4; installed CoreML family typically 8),
+rather than assuming larger batches are faster. Indexing supplies up to 4,096
+rows per scheduling call. This bounds preparation memory, not the entire
+indexer's vector/cache memory. Repeated query strings
 have a separate 256-entry in-process LRU. `embeddings.bin` stores a
 32-byte header and row-major FP16 vectors: 1,536 bytes per 768-dimensional
 row. Exact scoring means exact dot products over these stored, rounded
 vectors, not equivalence to an unrounded model output.
+
+`examples/cold_embed_bench.rs` compares the former byte-sorted, 256-row-window
+serial scheduler with token-aware prefetch using the same backend batch size.
+It bypasses embedding caches, alternates execution order over three rounds,
+reports model load and shape warmup separately, and checks vector dimensions,
+finiteness and row-wise cosine (>0.995). Local September 8 measurements:
+
+| Backend | Sample rows | Serial median | Prefetch median | Speedup | Minimum row cosine |
+|---|---:|---:|---:|---:|---:|
+| CoreML, validated shapes | 64 | 0.999 s | 0.794 s | 1.26× | 0.997605 |
+| Candle/Metal, batch 4 | 64 | 1.859 s | 1.736 s | 1.07× | 0.998804 |
+| CoreML, partial final batch | 65 | 1.211 s | 1.014 s | 1.19× | 0.997605 |
+
+Both CoreML comparison paths exclude the rejected 64-token artifact. These
+small, sampled-repository measurements exclude downloads, model loading,
+shape warmup/validation, lexical building, graph construction and disk writes.
+They do not isolate token bucketing from prefetch, measure retrieval relevance,
+or promise the same improvement for every corpus. Duplicate-input savings
+are additional but depend on the proportion of repeated content keys.
+Use `HIPS_ENCODER=candle CANDLE_METAL_COMPUTE_PER_BUFFER=200` for the Candle
+comparison; CoreML is automatic with a usable local model family. Accelerator
+benchmarks must have access to macOS accelerator services: a sandboxed run
+here executed CPU kernels and was stopped rather than reported as ANE timing.
 
 ### IVF: approximate candidate selection in single-layout indexes
 
@@ -658,9 +702,9 @@ repository indexes have no IVF/PQ quantizers to retrain.
 `eval-code` computes MRR, Recall@5/10, and graded nDCG@10.
 `eval-gen` creates doc-comment and identifier query sets from repositories.
 The BM25 oracle establishes rank safety for lexical pruning, not for the
-entire hybrid pipeline. IVF candidate selection and forced PQ can change
-semantic top-k; segmented cosine scans have neither approximation, but
-hybrid fusion still works over bounded candidate pools.
+entire hybrid pipeline. IVF/HNSW candidate selection and forced PQ can change
+semantic top-k. `--exact-vectors` bypasses graph/IVF routing and PQ, but hybrid
+fusion still works over bounded candidate pools.
 
 ## 15. Declaration chunks and loadable grammars
 
@@ -744,3 +788,98 @@ it into place, reusing content vectors and quantizers. It remains useful
 for IVF/PQ experiments, but its indexing work scales with the corpus when
 a file changes. Neither layout provides distributed shards, replication,
 or a continuously mutable in-memory ingestion buffer.
+
+## 17. Sublinear vector retrieval: implementation and literature
+
+**Where:** `src/hnsw.rs`, `src/hybrid.rs`, `src/embeddings.rs`,
+`examples/ann_bench.rs`, `examples/seg_scan_bench.rs`.
+
+An exhaustive vector scan costs O(ND), even with SIMD, mmap and parallelism.
+Lexical Block-Max WAND already skips documents using safe score bounds;
+high-dimensional vector retrieval needs a different candidate-selection index.
+We implement **HNSW**, a mature graph-routing foundation, not a claim to the
+newest benchmark leader or universally guaranteed sublinear search.
+
+### Implemented behavior
+
+- Newly embedded or compacted segments with at least **8,192 vectors** build
+  an immutable graph. Smaller segments retain parallel exact FP16 scans.
+  Existing indexes can be upgraded without re-encoding:
+  `hips build-ann --index <segmented-index-directory>`. Reopen existing readers
+  afterward; their lazy graph lookup is cached for the store's lifetime.
+- Construction uses deterministic geometric levels, M=16, at most 32 neighbors
+  at the bottom level, and construction beam 128. Diversified neighbor selection
+  and reciprocal bounded links follow the HNSW algorithm.
+- Queries greedily descend upper levels, then beam-search the bottom level.
+  `--ann-ef` defaults to 128; effective width is at least the semantic candidate
+  pool. This is **not** a hard cap on visited vectors or dot products.
+  Candidate scores are exact dot products over stored FP16 values, but routing
+  may miss a better candidate. Increasing the beam trades work for recall.
+- Deleted nodes remain traversable, but only live nodes enter the result heap.
+  An underfilled search falls back to an exact scan. Missing, stale or invalid
+  graphs also fall back to exact scans. `--exact-vectors` explicitly bypasses
+  ANN, including IVF/PQ on single-layout indexes.
+- Graph topology is loaded into RAM once on first use; vectors remain mmap-backed
+  and are not duplicated in the graph. Sparse visited sets avoid clearing an
+  N-sized array per query. Graph storage is O(NM), with additional in-memory
+  adjacency-container overhead. Atomic publication and the index writer lock
+  protect construction. Loading validates edges and a source generation guard
+  (vector count, dimensions, file length and nanosecond mtime); this guard is
+  not a cryptographic content checksum and assumes immutable vector files.
+- Segments are queried in parallel and their bounded pools merged. Many small
+  segments, heavy deletion, difficult vector distributions or large requested
+  pools can still approach a full scan. Compaction rebuilds topology and adds
+  indexing latency. This is not SSD-native DiskANN or distributed routing.
+
+Verbose ranked search reports candidate-stage dot products, graph/exact segment
+counts and graph fallbacks. Counters include repeated routing dot products, not
+just unique visited vectors; they exclude subsequent hybrid fusion scoring and
+encoder inference. HNSW has no general worst-case sublinear guarantee here.
+
+### Reproducible measurements
+
+Run `cargo run --release --example ann_bench -- synthetic 10000,100000 32 200`
+for a deterministic 768-dimensional clustered-vector sweep. Or replace
+`synthetic` with an existing segment directory and choose sizes smaller than
+its vector count minus 32. The benchmark copies vectors to temporary storage,
+holds out query rows, and compares against exhaustive stored-FP16 top-k. It
+does not modify the source index. These are candidate-search timings, not
+end-to-end query timings or a natural-language relevance evaluation.
+
+Local Apple Silicon measurements (32 held-out queries, default beam 128):
+
+| Corpus | Vectors | Pool | Exact p50 | HNSW p50 | Recall@pool | Mean dot products |
+|---|---:|---:|---:|---:|---:|---:|
+| Clustered synthetic | 10,000 | 200 | 0.442 ms | 0.233 ms | 99.42% | 877 (8.77%) |
+| Clustered synthetic | 100,000 | 200 | 3.097 ms | 0.484 ms | 96.75% | 949 (0.95%) |
+| Cached code embeddings, document-query proxy | 18,000 | 10 | 0.565 ms | 0.267 ms | 98.44% | 1,261 (7.01%) |
+
+At 100,000 synthetic vectors, beam 256 recovered 99.94% of the pool using
+986 mean dot products; measured p50 was 0.464 ms (small timing differences
+are noise, not evidence that a larger beam is faster). Graph construction
+took 115.7 seconds and serialized topology occupied 10.24 MiB. At 18,000
+real vectors, beam 256 recovered all held-out top-10 results but raised p50
+to 0.483 ms. These small samples establish useful pruning, not universal
+recall or asymptotic proofs. Natural-language relevance, larger corpora,
+memory/RSS and indexing throughput remain necessary deployment evaluations.
+
+Tests cover held-out recall, graph round trips, corrupt/stale generations,
+tombstone filtering/fallback, mixed graph/exact segments and exact overrides.
+The exact scanner additionally has a multi-segment exhaustive top-k oracle.
+
+### Bibliography and next directions
+
+| Method | Relevant contribution and boundary |
+|---|---|
+| [Andoni & Razenshteyn, STOC 2015](https://arxiv.org/abs/1501.01062) | Data-dependent hashing supplies a formal approximate Euclidean near-neighbor bound: query O(d n^(rho+o(1))), rho=1/(2c²−1), for approximation c>1, with superlinear space. Those assumptions do not establish exact sublinear cosine top-k here. |
+| [Malkov & Yashunin, HNSW](https://arxiv.org/abs/1603.09320) | Hierarchical proximity graphs, greedy descent and beam search. Foundation implemented here; empirical efficiency is distribution- and recall-dependent. |
+| [Subramanya et al., DiskANN, NeurIPS 2019](https://www.microsoft.com/en-us/research/?p=634449) | SSD-oriented graph search for billion-point collections. A potential future storage architecture, not equivalent to merely mmap-ing vectors. |
+| [Singh et al., FreshDiskANN, 2021](https://arxiv.org/abs/2105.09613) | Streaming insert/delete maintenance for large ANN graphs. Relevant if immutable-segment rebuild cost becomes dominant. |
+| [Sun et al., SOAR, 2024](https://arxiv.org/abs/2404.00774) | Redundant assignments with orthogonality-amplified residuals improve partition-based routing; an alternative direction for the existing single-layout IVF path. |
+| [Gao & Long, RaBitQ, 2024](https://arxiv.org/abs/2405.12497) | Randomized vector quantization with theoretical distance-estimation error bounds. Can reduce scoring/storage cost, but quantization alone does not make candidate discovery sublinear. |
+| [Gong, Zeng & Chen, SHG, PVLDB 2025](https://www.vldb.org/pvldb/vol18/p3518-chen.pdf) | Compressed hierarchy and learned shortcuts target graph-routing overhead; a newer research direction to evaluate against this baseline. |
+
+Only HNSW is added by this implementation. DiskANN, FreshDiskANN, SOAR,
+RaBitQ and SHG remain research directions, not shipped capabilities. Compare
+alternatives at matched recall, including p95 latency, build/update time,
+peak RSS and bytes per vector, before replacing the current routing layer.

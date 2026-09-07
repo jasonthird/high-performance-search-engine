@@ -20,7 +20,7 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::nomic_bert::{l2_normalize, Config, NomicBertModel};
 
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
 use crate::embeddings::CODERANK_DIM;
 
@@ -169,12 +169,8 @@ impl Embedder {
 
         let mut tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
-        let _ = tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            pad_id: 0,
-            pad_token: "[PAD]".into(),
-            ..Default::default()
-        }));
+        // Tokenize once without padding; the consumer pads only its actual batch.
+        tokenizer.with_padding(None);
         let _ = tokenizer.with_truncation(Some(TruncationParams {
             max_length: cap,
             ..Default::default()
@@ -184,7 +180,10 @@ impl Embedder {
         let coreml = if std::env::var("HIPS_ENCODER").as_deref() == Ok("candle") {
             None
         } else {
-            crate::coreml::CoreMlEncoder::load()
+            crate::coreml::CoreMlEncoder::load().filter(|cm| match kind {
+                EmbedUse::Index => cm.supports_documents(cap),
+                EmbedUse::Query => cm.supports_queries(cap),
+            })
         };
         // Candle stays the fallback: load it unless CoreML can serve every
         // request this instance will get (queries need the batch-1 model).
@@ -206,9 +205,8 @@ impl Embedder {
             let vb =
                 unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device) }
                     .context("mmap CodeRankEmbed safetensors")?;
-            let model = load_nomic(vb, &config).context(
-                "load NomicBert weights (tried prefixes '', 'bert', 'nomic_bert')",
-            )?;
+            let model = load_nomic(vb, &config)
+                .context("load NomicBert weights (tried prefixes '', 'bert', 'nomic_bert')")?;
             (Some(model), Some(device))
         } else {
             if crate::verbosity::verbose() {
@@ -236,7 +234,7 @@ impl Embedder {
         anyhow::ensure!(!texts.is_empty(), "no documents to embed");
         let n = texts.len();
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
-        for (i, chunk) in texts.chunks(DEFAULT_BATCH).enumerate() {
+        for (i, chunk) in texts.chunks(4096).enumerate() {
             let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
             vectors.extend(self.embed_docs(&refs)?);
             let done = vectors.len();
@@ -279,7 +277,7 @@ impl Embedder {
     /// The batch size for this instance's active backend: the CoreML
     /// document models' compiled batch when CoreML is serving, else the
     /// measured candle batch.
-    fn effective_batch(&self) -> usize {
+    pub fn effective_batch(&self) -> usize {
         #[cfg(target_os = "macos")]
         if let Some(cm) = &self.coreml {
             return cm.doc_batch();
@@ -288,12 +286,8 @@ impl Embedder {
     }
 
     fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        // Length bucketing on by default: measured 73.4 -> 38.6 ms/chunk on
-        // real corpus chunks (padding to the batch's longest member wasted
-        // 41% of the encoder in file order), and `examples/bucket_equiv.rs`
-        // shows the vectors match the unbucketed path to within F16 rerun
-        // noise. Batch stays 4: larger batches measured slower even
-        // bucketed. `HPS_EMBED_BATCH` overrides.
+        // Token-length bucketing with bounded CPU lookahead. Preserve the
+        // measured backend batch size; larger is not always faster on Metal.
         self.embed_docs_with(texts, self.effective_batch(), true)
     }
 
@@ -314,28 +308,64 @@ impl Embedder {
             return Ok(Vec::new());
         }
         let batch = batch.max(1);
-        let mut order: Vec<usize> = (0..texts.len()).collect();
-        if bucket_by_length {
-            // Byte length is a good enough proxy for token count here, and
-            // far cheaper than tokenizing twice.
-            order.sort_by_key(|&i| texts[i].len());
+        if texts.len() <= batch {
+            // Queries and tiny edits should not pay for a worker thread.
+            let rows = self
+                .tokenizer
+                .encode_batch(texts.to_vec(), true)
+                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            return self.embed_encodings(&rows);
         }
-        let mut out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
-        for group in order.chunks(batch) {
-            let sub: Vec<&str> = group.iter().map(|&i| texts[i]).collect();
-            for (&i, vector) in group.iter().zip(self.embed_chunk(&sub)?) {
-                out[i] = vector;
-            }
-        }
-        Ok(out)
+        // Keep the accelerator/model on the calling thread (CoreML is not Sync).
+        // Only the tokenizer and borrowed input text cross the thread boundary.
+        let tokenizer = self.tokenizer.clone();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            let producer = scope.spawn(move || {
+                for (window, texts) in texts.chunks(1024).enumerate() {
+                    let rows =
+                        match prepare_window(&tokenizer, texts, window * 1024, bucket_by_length) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                return;
+                            }
+                        };
+                    let mut rows = rows.into_iter();
+                    loop {
+                        let group: Vec<_> = rows.by_ref().take(batch).collect();
+                        if group.is_empty() {
+                            break;
+                        }
+                        if tx.send(Ok(group)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            let result = (|| {
+                let mut out = vec![Vec::new(); texts.len()];
+                // IntoIter owns the receiver: on inference error it is dropped
+                // before join, releasing a producer blocked on the bounded queue.
+                for group in rx {
+                    let (ids, encodings): (Vec<_>, Vec<_>) = group?.into_iter().unzip();
+                    let vectors = self.embed_encodings(&encodings)?;
+                    anyhow::ensure!(vectors.len() == ids.len(), "embedding batch size mismatch");
+                    for (id, vector) in ids.into_iter().zip(vectors) {
+                        out[id] = vector;
+                    }
+                }
+                Ok(out)
+            })();
+            producer
+                .join()
+                .map_err(|_| anyhow::anyhow!("tokenizer worker panicked"))?;
+            result
+        })
     }
 
-    fn embed_chunk(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn embed_encodings(&self, encodings: &[Encoding]) -> anyhow::Result<Vec<Vec<f32>>> {
         let t0 = Instant::now();
-        let encodings = self
-            .tokenizer
-            .encode_batch(texts.to_vec(), true)
-            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
 
         #[cfg(target_os = "macos")]
         if let Some(cm) = &self.coreml {
@@ -406,7 +436,7 @@ impl Embedder {
             let vecs = normed.to_vec2::<f32>()?;
             let down_ms = t3.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
-                "  embed seq={seq} batch={batch}  tok {tok_ms:.2} ms  upload {upload_ms:.2} ms  forward {fwd_ms:.2} ms  download {down_ms:.2} ms"
+                "  embed seq={seq} batch={batch}  pad {tok_ms:.2} ms  upload {upload_ms:.2} ms  forward {fwd_ms:.2} ms  download {down_ms:.2} ms"
             );
             vecs
         } else {
@@ -421,11 +451,94 @@ impl Embedder {
     }
 }
 
+fn prepare_window(
+    tokenizer: &Tokenizer,
+    texts: &[&str],
+    offset: usize,
+    bucket: bool,
+) -> anyhow::Result<Vec<(usize, Encoding)>> {
+    let mut rows: Vec<_> = tokenizer
+        .encode_batch(texts.to_vec(), true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| (offset + i, row))
+        .collect();
+    if bucket {
+        rows.sort_by_key(|(_, row)| row.len());
+    }
+    Ok(rows)
+}
+
 fn profile() -> bool {
     matches!(
         std::env::var("HPS_EMBED_PROFILE").as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn token_bucketing_preserves_rows_ids_masks_and_truncation() {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[UNK]".to_owned(), 0)].into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 3,
+                ..Default::default()
+            }))
+            .unwrap();
+        // Byte length gives the opposite order to actual token length.
+        let texts = ["a b c d e", "long_identifier_without_spaces", "a b"];
+        let plain = prepare_window(&tokenizer, &texts, 1024, false).unwrap();
+        let sorted = prepare_window(&tokenizer, &texts, 1024, true).unwrap();
+        assert_eq!(
+            sorted.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1025, 1026, 1024]
+        );
+        for (i, encoding) in sorted {
+            assert_eq!(encoding.get_ids(), plain[i - 1024].1.get_ids());
+            assert_eq!(
+                encoding.get_attention_mask(),
+                plain[i - 1024].1.get_attention_mask()
+            );
+            assert!(encoding.len() <= 3);
+        }
+    }
+
+    #[test]
+    fn inference_error_releases_prefetch_worker() {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([("[UNK]".to_owned(), 0)].into_iter().collect())
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut encoder = Embedder {
+            model: None,
+            device: None,
+            tokenizer: Tokenizer::new(model),
+            #[cfg(target_os = "macos")]
+            coreml: None,
+            query_cache: std::sync::Mutex::new(QueryCache::new()),
+        };
+        assert!(encoder.embed_docs_with(&[], 4, true).unwrap().is_empty());
+        // More batches than queue capacity: consumer fails on the first one.
+        // Returning proves join does not wait forever on a blocked sender.
+        let inputs = vec!["fixture"; 2049];
+        let error = encoder.embed_docs_with(&inputs, 4, true).unwrap_err();
+        assert!(error.to_string().contains("backend not loaded"));
+        encoder.tokenizer = Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        let error = encoder.embed_docs_with(&inputs, 4, true).unwrap_err();
+        assert!(error.to_string().contains("tokenize"));
+    }
 }
 
 fn cpu_device() -> (Device, DType) {
