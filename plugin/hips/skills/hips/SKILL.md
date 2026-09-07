@@ -57,7 +57,7 @@ running, and which sessions hold it; `hips watch --root .` runs one by hand.
 - `--root .` from a subdirectory of an indexed repository finds the
   repository's index; hits are then printed relative to that subdirectory.
 - Honours `.gitignore`; skips `target/`, `node_modules/`, `.venv/`, symlinks.
-- Chunks are real declarations: 41 tree-sitter grammars (C, C++, Java, Go,
+- Chunks are real declarations: 40 tree-sitter grammars (C, C++, Java, Go,
   Python, JS/TS, Rust, C#, Ruby, PHP, Swift, Kotlin, ... and Markdown by
   heading) cut files at functions, classes and methods, so a hit is one
   unit and its name is qualified (`path::Class::method`). Other files use

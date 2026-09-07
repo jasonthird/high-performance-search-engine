@@ -1503,7 +1503,6 @@ dependencies = [
  "tree-sitter-elm",
  "tree-sitter-erlang",
  "tree-sitter-fortran",
- "tree-sitter-fsharp",
  "tree-sitter-go",
  "tree-sitter-groovy",
  "tree-sitter-haskell",
@@ -3591,16 +3590,6 @@ name = "tree-sitter-fortran"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea5fea41363a9b59666001dc26c4b356d4e164da27c6ce31145e00aba6bf9b16"
-dependencies = [
- "cc",
- "tree-sitter-language",
-]
-
-[[package]]
-name = "tree-sitter-fsharp"
-version = "0.3.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b069005841682d258b95e9ee8cb0c0a0f16b77318ff56000504169c80690c67b"
 dependencies = [
  "cc",
  "tree-sitter-language",

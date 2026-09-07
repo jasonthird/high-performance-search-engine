@@ -80,7 +80,6 @@ tree-sitter-solidity = { version = "1.2", optional = true }
 tree-sitter-hcl = { version = "1.1", optional = true }
 tree-sitter-nix = { version = "0.3", optional = true }
 tree-sitter-elm = { version = "5.9", optional = true }
-tree-sitter-fsharp = { version = "0.3", optional = true }
 tree-sitter-cmake = { version = "0.7", optional = true }
 tree-sitter-asm = { version = "0.24", optional = true }
 tree-sitter-md = { version = "0.5", optional = true }
@@ -139,7 +138,6 @@ treesitter = [
     "dep:tree-sitter-hcl",
     "dep:tree-sitter-nix",
     "dep:tree-sitter-elm",
-    "dep:tree-sitter-fsharp",
     "dep:tree-sitter-cmake",
     "dep:tree-sitter-asm",
     "dep:tree-sitter-md",

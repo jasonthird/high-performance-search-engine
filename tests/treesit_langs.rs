@@ -51,7 +51,6 @@ const EXPECT: &[(&str, &str, &[&str])] = &[
     ("main.tf", "hcl", &["resource", "variable"]),
     ("sample.nix", "nix", &["computeTotal", "render"]),
     ("Sample.elm", "elm", &["computeTotal", "render"]),
-    ("Sample.fs", "fsharp", &["computeTotal", "render"]),
     ("CMakeLists.txt", "cmake", &["compute_total", "render"]),
     ("sample.s", "asm", &["compute_total", "render"]),
     ("README.md", "markdown", &["Sample", "Widget", "Render", "Compute total"]),

@@ -116,7 +116,7 @@ cargo run --release -- repl --index ./index --top-k 10
   content-keyed embedding cache, IVF/PQ, and score fusion.
 - `src/repo.rs`, `src/treesit.rs`, `src/codeindex.rs`, `tree-sitters/` -
   source-tree ingestion: gitignore-aware walking, tree-sitter
-  declaration chunking (41 grammars; the per-language definition queries
+  declaration chunking (40 grammars; the per-language definition queries
   live in `tree-sitters/`), the keyword-heuristic fallback, PDF pages,
   and incremental segmented rebuilds.
 - `src/watch.rs`, `src/daemon.rs`, `src/mcp.rs`, `src/usagelog.rs` -
@@ -492,17 +492,17 @@ non-source files — and splits each file into declaration-sized chunks that
 **keep their line numbers**. A document id is therefore a location:
 `src/searcher.rs:120-165`.
 
-#### Declaration-aware chunking: 41 tree-sitter grammars
+#### Declaration-aware chunking: 40 tree-sitter grammars
 
 Chunk boundaries decide everything downstream: what one vector means,
 what BM25's title boost applies to, and how many lines an agent reads
 after a hit. Files are therefore parsed with tree-sitter and cut at real
-definitions. Forty-one grammars are compiled in (feature `treesitter`, on
+definitions. Forty grammars are compiled in (feature `treesitter`, on
 by default): Python, JavaScript, TypeScript/TSX, Java, C, C++, C#, Go,
 Rust, PHP, Ruby, Swift, Kotlin, Scala, Dart, Lua, Perl, R, Objective-C,
 MATLAB, Bash, PowerShell, SQL, Haskell, Elixir, Erlang, OCaml, Julia, Zig,
-Groovy, Fortran, Pascal, Ada, Solidity, HCL/Terraform, Nix, Elm, F#,
-CMake, assembly, and Markdown (chunked by heading, sections nesting by
+Groovy, Fortran, Pascal, Ada, Solidity, HCL/Terraform, Nix, Elm, CMake,
+assembly, and Markdown (chunked by heading, sections nesting by
 level). Every grammar depends on the ABI-stable `tree-sitter-language`
 crate, so one core version serves all of them.
 
@@ -545,11 +545,12 @@ C is the headline: a language with no declaration keyword went from
 200-line slabs to one chunk per function. Python, Go and Rust, where the
 keyword heuristic already worked, barely move. Express's remaining
 unnamed chunks are anonymous test callbacks, which are not definitions.
-The price is binary size — the grammars' parse tables are about 78 MB of
-constant data (F# 15 MB, OCaml 7, Fortran 7, Julia 6; Go, Python, Java
-under 1 MB each), taking the release binary from 16 MB to 95 MB — and a
-one-time query compilation per grammar the first time a process meets
-that language (10-120 ms; F# is the slowest). Parsing itself is cheap:
+The price is binary size — the grammars' parse tables are about 63 MB of
+constant data (OCaml 7 MB, Fortran 7, Julia 6; Go, Python, Java under
+1 MB each; F# was dropped for costing 15 MB on its own), taking the
+release binary from 16 MB to about 80 MB — and a one-time query
+compilation per grammar the first time a process meets that language
+(10-60 ms). Parsing itself is cheap:
 this repository's 57 Rust files index lexically in 0.06 s against 0.03 s
 with the heuristic. An index built by an older chunker is re-chunked in
 full on the next build (the manifest records the chunker version).

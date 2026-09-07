@@ -112,7 +112,6 @@ pub static LANGUAGES: LazyLock<Vec<Lang>> = LazyLock::new(|| vec![
     lang!("hcl", ["tf", "tfvars", "hcl"], tree_sitter_hcl::LANGUAGE),
     lang!("nix", ["nix"], tree_sitter_nix::LANGUAGE),
     lang!("elm", ["elm"], tree_sitter_elm::LANGUAGE),
-    lang!("fsharp", ["fs", "fsi", "fsx"], tree_sitter_fsharp::LANGUAGE_FSHARP),
     lang!("cmake", ["cmake"], tree_sitter_cmake::LANGUAGE),
     lang!("asm", ["s", "asm"], tree_sitter_asm::LANGUAGE),
     lang!("markdown", ["md", "markdown"], tree_sitter_md::LANGUAGE),

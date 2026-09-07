@@ -40,7 +40,7 @@ pub const SOURCE_EXTS: &[&str] = &[
     "pyi", "mts", "cts", "hxx", "ipp", "cu", "cuh", "phtml", "rake", "gemspec", "sc", "dart",
     "pl", "pm", "r", "m", "mm", "ps1", "psm1", "psd1", "hrl", "jl", "zig", "groovy", "gradle",
     "gvy", "f", "f90", "f95", "f03", "f08", "for", "pas", "pp", "dpr", "adb", "ads", "sol",
-    "tfvars", "hcl", "nix", "elm", "fs", "fsi", "fsx", "cmake", "s", "asm", "markdown", "mli",
+    "tfvars", "hcl", "nix", "elm", "cmake", "s", "asm", "markdown", "mli",
 ];
 
 /// Byte cap for a file, by name: PDFs get their own, larger limit.
