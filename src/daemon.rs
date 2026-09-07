@@ -92,6 +92,25 @@ pub struct Status {
     pub leases: Vec<String>,
     pub events: u64,
     pub encoder_loaded: bool,
+    /// Identity of the binary running the watcher, so a `session start`
+    /// after `cargo install` can replace a watcher whose chunker,
+    /// extension list or index format is out of date.
+    #[serde(default)]
+    pub exe: String,
+    #[serde(default)]
+    pub exe_mtime: u64,
+}
+
+/// Path and modification time of the running executable.
+fn exe_identity() -> (String, u64) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mtime = fs::metadata(&exe)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (exe.to_string_lossy().to_string(), mtime)
 }
 
 /// Where a repository's watcher keeps its lock, leases, log, and status.
@@ -367,7 +386,15 @@ pub fn session_start(
         },
     )?;
     let (spawned, watcher_pid) = match running(&state) {
-        Some(s) => (false, s.pid),
+        Some(s) if !watcher_is_stale(&s) => (false, s.pid),
+        Some(s) => {
+            // The binary was replaced under a running watcher (an upgrade):
+            // its chunker or file list may differ from ours, and two
+            // chunkers alternating on one index undo each other. Retire it
+            // and start a fresh one; the index carries over.
+            replace_watcher(&state, s.pid);
+            (true, spawn_watcher(&root, &state, opts)?)
+        }
         None => (true, spawn_watcher(&root, &state, opts)?),
     };
     Ok(Some(StartReport {
@@ -380,6 +407,31 @@ pub fn session_start(
         watcher_pid,
     }))
 }
+
+/// A watcher whose executable differs from ours (or was rebuilt since it
+/// started) should not keep serving.
+fn watcher_is_stale(status: &Status) -> bool {
+    if status.exe.is_empty() {
+        return true; // pre-upgrade watcher that recorded no identity
+    }
+    let (exe, mtime) = exe_identity();
+    status.exe != exe || status.exe_mtime != mtime
+}
+
+/// Stop a watcher and wait (briefly) for it to release the lock.
+#[cfg(unix)]
+fn replace_watcher(state: &Path, pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && lock_is_held(state) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(unix))]
+fn replace_watcher(_state: &Path, _pid: u32) {}
 
 fn live_leases_count(state: &Path) -> usize {
     // Do not reap here: `running()` above may have raced a watcher that is
@@ -537,7 +589,10 @@ pub fn run_watch(root: &Path, opts: WatchOpts) -> anyhow::Result<()> {
     install_signals(opts.leased);
     STOP.store(false, Ordering::Release);
 
+    let (exe, exe_mtime) = exe_identity();
     let mut status = Status {
+        exe,
+        exe_mtime,
         pid: std::process::id(),
         root: root.to_string_lossy().to_string(),
         index_dir: index_dir.to_string_lossy().to_string(),

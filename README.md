@@ -638,7 +638,9 @@ have the same repository open at once. The plugin's `SessionStart` hook runs
   (the watcher holds a `flock`, so a second session attaches instead of
   starting a second process), and
 - answers the hook with one line of context telling the agent the index is
-  handled.
+  handled. If the running watcher was started by a different `hips`
+  binary (you ran `cargo install`), it is retired and a fresh one started,
+  so an old chunker never alternates with a new one on the same index.
 
 The watcher builds the index if it is missing, then rebuilds after each burst
 of relevant filesystem events (300 ms quiet), incrementally: only changed
