@@ -36,6 +36,11 @@ pub const SOURCE_EXTS: &[&str] = &[
     "cpp", "cc", "cxx", "hpp", "hh", "cs", "swift", "scala", "php", "sh", "bash", "zsh", "sql",
     "lua", "ml", "hs", "ex", "exs", "erl", "clj", "vue", "svelte", "proto", "tf", "md", "toml",
     "yaml", "yml", "pdf",
+    // Grammar-covered languages beyond the original list (see treesit.rs).
+    "pyi", "mts", "cts", "hxx", "ipp", "cu", "cuh", "phtml", "rake", "gemspec", "sc", "dart",
+    "pl", "pm", "r", "m", "mm", "ps1", "psm1", "psd1", "hrl", "jl", "zig", "groovy", "gradle",
+    "gvy", "f", "f90", "f95", "f03", "f08", "for", "pas", "pp", "dpr", "adb", "ads", "sol",
+    "tfvars", "hcl", "nix", "elm", "fs", "fsi", "fsx", "cmake", "s", "asm", "markdown", "mli",
 ];
 
 /// Byte cap for a file, by name: PDFs get their own, larger limit.
@@ -84,6 +89,12 @@ pub struct Chunk {
     pub end_line: usize,
     /// Declaration name, when one was found.
     pub name: Option<String>,
+    /// Declaration kind (`function`, `class`, `method`, `section`, ...)
+    /// when a grammar identified it.
+    pub kind: Option<String>,
+    /// Name of the enclosing declaration, for nested units (a method's
+    /// class, a subsection's section).
+    pub parent: Option<String>,
     pub body: String,
 }
 
@@ -95,9 +106,10 @@ impl Chunk {
 
     /// Human-facing label: the declaration name qualified by its file.
     pub fn title(&self) -> String {
-        match &self.name {
-            Some(name) => format!("{}::{}", self.path, name),
-            None => self.path.clone(),
+        match (&self.parent, &self.name) {
+            (Some(parent), Some(name)) => format!("{}::{}::{}", self.path, parent, name),
+            (None, Some(name)) => format!("{}::{}", self.path, name),
+            _ => self.path.clone(),
         }
     }
 
@@ -768,7 +780,7 @@ pub fn chunk_text(rel: &str, text: &str) -> Vec<Chunk> {
 }
 
 /// Lines that document or annotate the declaration below them.
-fn is_doc_or_attr(line: &str) -> bool {
+pub(crate) fn is_doc_or_attr(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with("///")
         || t.starts_with("//!")
@@ -788,6 +800,21 @@ fn push_split(
     start: usize,
     end: usize,
     name: Option<String>,
+) {
+    push_split_full(out, rel, lines, start, end, name, None, None)
+}
+
+/// As [`push_split`], carrying the grammar-derived kind and parent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_split_full(
+    out: &mut Vec<Chunk>,
+    rel: &str,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    name: Option<String>,
+    kind: Option<String>,
+    parent: Option<String>,
 ) {
     let mut at = start;
     while at < end {
@@ -810,6 +837,8 @@ fn push_split(
                 end_line: stop,
                 // Only the first slice of a split declaration keeps the name.
                 name: if at == start { name.clone() } else { None },
+                kind: if at == start { kind.clone() } else { None },
+                parent: if at == start { parent.clone() } else { None },
                 body,
             });
         }
@@ -889,7 +918,7 @@ pub fn chunk_files(files: &[SourceFile]) -> Vec<Chunk> {
                 return chunk_pdf(&file.rel, &file.abs);
             }
             match fs::read_to_string(&file.abs) {
-                Ok(text) => chunk_text(&file.rel, &text),
+                Ok(text) => chunk_source(&file.rel, &text),
                 // Binary or non-UTF-8: skip it, as the walker's extension
                 // filter cannot rule this out on its own.
                 Err(_) => Vec::new(),
@@ -899,6 +928,16 @@ pub fn chunk_files(files: &[SourceFile]) -> Vec<Chunk> {
     // `collect` on an indexed parallel iterator preserves input order, so
     // flattening here yields the same sequence a serial walk would.
     per_file.into_iter().flatten().collect()
+}
+
+/// Chunk one file: grammar-aware when a tree-sitter grammar covers it and
+/// finds definitions, the keyword heuristic otherwise.
+pub fn chunk_source(rel: &str, text: &str) -> Vec<Chunk> {
+    #[cfg(feature = "treesitter")]
+    if let Some(chunks) = crate::treesit::chunk(rel, text) {
+        return chunks;
+    }
+    chunk_text(rel, text)
 }
 
 /// Chunk a tree into `InputDoc`s, de-duplicating ids defensively.

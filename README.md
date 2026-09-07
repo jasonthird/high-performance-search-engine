@@ -114,9 +114,11 @@ cargo run --release -- repl --index ./index --top-k 10
   `src/ivf.rs`, `src/pq.rs`, `src/hybrid.rs` - CodeRankEmbed inference
   (Candle; CoreML/ANE on macOS), FP16 vector storage and scoring, the
   content-keyed embedding cache, IVF/PQ, and score fusion.
-- `src/repo.rs`, `src/codeindex.rs` - source-tree ingestion: gitignore-aware
-  walking, declaration chunking with line numbers, PDF pages, and
-  incremental segmented rebuilds.
+- `src/repo.rs`, `src/treesit.rs`, `src/codeindex.rs`, `tree-sitters/` -
+  source-tree ingestion: gitignore-aware walking, tree-sitter
+  declaration chunking (41 grammars; the per-language definition queries
+  live in `tree-sitters/`), the keyword-heuristic fallback, PDF pages,
+  and incremental segmented rebuilds.
 - `src/watch.rs`, `src/daemon.rs`, `src/mcp.rs`, `src/usagelog.rs` -
   filesystem watching, the session-leased background watcher, the MCP
   server over stdio, and the search usage log.
@@ -486,10 +488,72 @@ eval corpus, and its ids carry no line numbers.
 `index-repo` walks a repository the way git does — honouring nested
 `.gitignore` files, the user's global excludes file and `.git/info/exclude`,
 skipping hidden directories, `target/`, `node_modules/`, symlinks, and
-non-source files (about 40 source extensions plus `.md`, `.toml`, `.yaml`
-and `.pdf` are indexed) — and splits each file into declaration-sized
-chunks that **keep their line numbers**. A document id is therefore a
-location: `src/searcher.rs:120-165`.
+non-source files — and splits each file into declaration-sized chunks that
+**keep their line numbers**. A document id is therefore a location:
+`src/searcher.rs:120-165`.
+
+#### Declaration-aware chunking: 41 tree-sitter grammars
+
+Chunk boundaries decide everything downstream: what one vector means,
+what BM25's title boost applies to, and how many lines an agent reads
+after a hit. Files are therefore parsed with tree-sitter and cut at real
+definitions. Forty-one grammars are compiled in (feature `treesitter`, on
+by default): Python, JavaScript, TypeScript/TSX, Java, C, C++, C#, Go,
+Rust, PHP, Ruby, Swift, Kotlin, Scala, Dart, Lua, Perl, R, Objective-C,
+MATLAB, Bash, PowerShell, SQL, Haskell, Elixir, Erlang, OCaml, Julia, Zig,
+Groovy, Fortran, Pascal, Ada, Solidity, HCL/Terraform, Nix, Elm, F#,
+CMake, assembly, and Markdown (chunked by heading, sections nesting by
+level). Every grammar depends on the ABI-stable `tree-sitter-language`
+crate, so one core version serves all of them.
+
+What counts as a definition lives in `tree-sitters/<language>.scm`, one
+small query per language in tree-sitter's own query syntax, embedded at
+compile time: `@definition.<kind>` marks the node, `@name` its identifier.
+The files are seeded from the grammars' own `tags.scm` where they ship one
+and hand-written otherwise, so adding a language is one Cargo dependency,
+one registry line, and one query file. `hips chunks --file X` shows how a
+file is cut (`--sexp` prints the parse tree, for writing queries).
+
+Chunking is generic over languages once definitions are known: each
+definition's span, plus the comment block above it (across one blank
+line), is a cut point; the segments between cut points become chunks. A
+nested definition is its own chunk with `parent` set, so a method's title
+is `path::Class::method`; the class chunk keeps its header and fields. A
+closing brace after the last method joins the chunk before it. Runs of
+bodyless one-liners of header-like kinds — prototypes in C headers,
+`#define`s, typedefs — merge into chunks of up to 24 lines so a header does
+not become a thousand documents, while one-line functions in
+expression-bodied languages (OCaml, Haskell, Kotlin) stay separate. A
+file with no grammar, or whose parse yields no definitions, falls through
+to the keyword heuristic that preceded all this, so the worst case is what
+hips did before.
+
+Measured against that heuristic on real checkouts (unnamed = chunks
+carrying no declaration name; lines = per-chunk size):
+
+```
+                  files   chunks          unnamed       median lines   p90 lines
+gin (Go)             99   1312 -> 1687     8% -> 7%      12 -> 10       35 -> 27
+express (JS)        141    312 -> 627     59% -> 46%     41 -> 13      200 -> 104
+spring-petclinic     50    124 -> 285     19% -> 16%     22 -> 12       61 -> 28
+redis (C)           786   3207 -> 22741   65% -> 26%    126 -> 7       200 -> 37
+flask (Python)       83   1764 -> 1960     5% -> 5%       6 -> 5        23 -> 21
+this repo (Rust)     57   1072 -> 1104     5% -> 7%      10 -> 10       43 -> 42
+```
+
+C is the headline: a language with no declaration keyword went from
+200-line slabs to one chunk per function. Python, Go and Rust, where the
+keyword heuristic already worked, barely move. Express's remaining
+unnamed chunks are anonymous test callbacks, which are not definitions.
+The price is binary size — the grammars' parse tables are about 78 MB of
+constant data (F# 15 MB, OCaml 7, Fortran 7, Julia 6; Go, Python, Java
+under 1 MB each), taking the release binary from 16 MB to 95 MB — and a
+one-time query compilation per grammar the first time a process meets
+that language (10-120 ms; F# is the slowest). Parsing itself is cheap:
+this repository's 57 Rust files index lexically in 0.06 s against 0.03 s
+with the heuristic. An index built by an older chunker is re-chunked in
+full on the next build (the manifest records the chunker version).
+`--no-default-features` builds the lean binary with the heuristic only. PDFs still chunk per page, as `report.pdf::page 7`.
 
 ```sh
 cargo build --release --features semantic

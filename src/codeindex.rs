@@ -48,7 +48,16 @@ pub struct Manifest {
     /// Empty for single-index (rebuild-the-world) layouts.
     #[serde(default)]
     pub files: Vec<FileRecord>,
+    /// Which chunker produced the chunks (see [`CHUNKER_VERSION`]). A
+    /// build by a different chunker re-chunks every file, since file
+    /// fingerprints alone would call the old boundaries current.
+    #[serde(default)]
+    pub chunker: u32,
 }
+
+/// Bumped whenever chunk boundaries or names can change for unchanged
+/// files: 1 was the keyword heuristic, 2 added tree-sitter grammars.
+pub const CHUNKER_VERSION: u32 = if cfg!(feature = "treesitter") { 2 } else { 1 };
 
 impl Manifest {
     /// A manifest for an index that does not exist yet: what the MCP server
@@ -64,6 +73,7 @@ impl Manifest {
             cached: 0,
             tree_fingerprint: 0,
             files: Vec::new(),
+            chunker: CHUNKER_VERSION,
         }
     }
 }
@@ -354,6 +364,7 @@ impl RepoIndexer {
                 if existing.tree_fingerprint == tree_fingerprint
                     && existing.tree_fingerprint != 0
                     && existing.embedded == self.opts.embed
+                    && existing.chunker == CHUNKER_VERSION
                 {
                     self.log(format!(
                         "index up to date ({} chunks, fingerprint unchanged)",
@@ -409,6 +420,7 @@ impl RepoIndexer {
             cached,
             tree_fingerprint,
             files: Vec::new(),
+            chunker: CHUNKER_VERSION,
         };
         manifest.save(&staging)?;
         self.install(&staging)?;
@@ -437,10 +449,15 @@ impl RepoIndexer {
         timer.mark("walk");
         let tree_fingerprint = repo::fingerprint(&files);
         let previous = Manifest::load(&self.index_dir).ok();
+        let rechunk = previous.as_ref().is_some_and(|p| p.chunker != CHUNKER_VERSION);
+        if rechunk {
+            self.log("chunker changed: re-chunking every file".to_string());
+        }
         if let Some(prev) = &previous {
             if prev.tree_fingerprint == tree_fingerprint
                 && prev.tree_fingerprint != 0
                 && prev.embedded == self.opts.embed
+                && !rechunk
             {
                 self.log(format!(
                     "index up to date ({} chunks, fingerprint unchanged)",
@@ -461,7 +478,7 @@ impl RepoIndexer {
         let current: HashSet<&str> = files.iter().map(|f| f.rel.as_str()).collect();
         for file in &files {
             match prev_files.get(file.rel.as_str()) {
-                Some(prev) if prev.len == file.len && prev.mtime_ns == file.mtime_ns => {
+                Some(prev) if !rechunk && prev.len == file.len && prev.mtime_ns == file.mtime_ns => {
                     records.push((*prev).clone());
                 }
                 _ => changed.push(file),
@@ -586,6 +603,7 @@ impl RepoIndexer {
             cached,
             tree_fingerprint,
             files: records,
+            chunker: CHUNKER_VERSION,
         };
         manifest.save(&self.index_dir)?;
         self.log(format!(

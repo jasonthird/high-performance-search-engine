@@ -340,6 +340,17 @@ enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Show how hips cuts one file into chunks: the grammar used, each
+    /// chunk's lines, kind, name and parent. `--sexp` prints the parse
+    /// tree, for writing `tree-sitters/<language>.scm` queries.
+    Chunks {
+        /// File to chunk.
+        #[arg(long)]
+        file: PathBuf,
+        /// Print the tree-sitter parse tree instead of the chunks.
+        #[arg(long)]
+        sexp: bool,
+    },
     /// Index and watcher status for a repository: what is indexed, whether
     /// a watcher is running, and which sessions hold it.
     Status {
@@ -568,6 +579,7 @@ pub fn run() -> anyhow::Result<()> {
             stop,
         } => cmd_watch(&root, !lexical, leased, grace_secs, unload_secs, title_weight, stop),
         Command::Session { action } => cmd_session(action),
+        Command::Chunks { file, sexp } => cmd_chunks(&file, sexp),
         Command::Status { root, json } => cmd_status(&root, json),
         Command::Bench {
             index,
@@ -1450,6 +1462,70 @@ fn parent_pid() -> u32 {
 #[cfg(not(unix))]
 fn parent_pid() -> u32 {
     0
+}
+
+fn cmd_chunks(file: &Path, sexp: bool) -> anyhow::Result<()> {
+    let text = fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+    let rel = file.to_string_lossy().replace('\\', "/");
+    #[cfg(feature = "treesitter")]
+    {
+        if sexp {
+            match crate::treesit::sexp(&rel, &text) {
+                Some(tree) => println!("{tree}"),
+                None => println!("no grammar for {}", file.display()),
+            }
+            return Ok(());
+        }
+        match crate::treesit::explain(&rel, &text) {
+            Some((lang, defs)) => {
+                println!(
+                    "grammar: {lang} ({} definition{})",
+                    defs.len(),
+                    if defs.len() == 1 { "" } else { "s" }
+                );
+                if crate::verbosity::verbose() {
+                    for d in &defs {
+                        println!(
+                            "  def {:>5}-{:<5} {:<12} {}{}",
+                            d.start_line,
+                            d.end_line,
+                            d.kind,
+                            d.name,
+                            if d.doc_line < d.start_line { format!(" (doc from {})", d.doc_line) } else { String::new() }
+                        );
+                    }
+                }
+            }
+            None => println!("grammar: none (keyword heuristic)"),
+        }
+    }
+    #[cfg(not(feature = "treesitter"))]
+    {
+        if sexp {
+            anyhow::bail!("this binary was built without the `treesitter` feature");
+        }
+        println!("grammar: none (built without the `treesitter` feature)");
+    }
+    let chunks = crate::repo::chunk_source(&rel, &text);
+    let total_lines = text.lines().count();
+    let unnamed = chunks.iter().filter(|c| c.name.is_none()).count();
+    println!(
+        "{} chunks over {} lines, {} unnamed",
+        chunks.len(),
+        total_lines,
+        unnamed
+    );
+    for c in &chunks {
+        println!(
+            "{:>5}-{:<5} {:<10} {}{}",
+            c.start_line,
+            c.end_line,
+            c.kind.as_deref().unwrap_or("-"),
+            c.parent.as_deref().map(|p| format!("{p}::")).unwrap_or_default(),
+            c.name.as_deref().unwrap_or("-")
+        );
+    }
+    Ok(())
 }
 
 fn cmd_status(root: &Path, json: bool) -> anyhow::Result<()> {

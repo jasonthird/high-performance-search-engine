@@ -4,7 +4,7 @@ description: Primary code-search tool. Use it FIRST, before grep/ripgrep/find, f
 compatibility: Requires the `hips` binary (`cargo install --git https://github.com/jasonthird/high-performance-search-engine --features semantic`). First use in a repo builds an index under ~/.cache/csearch.
 allowed-tools: Bash(hips *)
 metadata:
-  version: "0.5.1"
+  version: "0.5.2"
   argument-hint: <describe what the code does>
 ---
 
@@ -57,7 +57,11 @@ running, and which sessions hold it; `hips watch --root .` runs one by hand.
 - `--root .` from a subdirectory of an indexed repository finds the
   repository's index; hits are then printed relative to that subdirectory.
 - Honours `.gitignore`; skips `target/`, `node_modules/`, `.venv/`, symlinks.
-- Indexes ~40 source extensions plus `.md`, `.toml`, `.yaml`, and `.pdf`
-  (PDFs are chunked per page; a hit reads `report.pdf::page 7`).
+- Chunks are real declarations: 41 tree-sitter grammars (C, C++, Java, Go,
+  Python, JS/TS, Rust, C#, Ruby, PHP, Swift, Kotlin, ... and Markdown by
+  heading) cut files at functions, classes and methods, so a hit is one
+  unit and its name is qualified (`path::Class::method`). Other files use
+  a keyword heuristic; `.toml`/`.yaml` are indexed whole; PDFs per page
+  (`report.pdf::page 7`). `hips chunks --file X` shows how a file is cut.
 - Every search appends one JSON line to `~/.cache/csearch/usage.jsonl` for
   later analysis. `HIPS_NO_LOG=1` disables it.

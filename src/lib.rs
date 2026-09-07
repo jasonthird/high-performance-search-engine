@@ -36,6 +36,8 @@ pub mod segments;
 pub mod spell;
 pub mod storage;
 pub mod tokenizer;
+#[cfg(feature = "treesitter")]
+pub mod treesit;
 pub mod usagelog;
 
 /// Process-wide verbosity, set once from the CLI's `-v/--verbose`. Off by

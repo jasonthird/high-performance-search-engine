@@ -1,7 +1,7 @@
 {
   "name": "hips",
   "description": "Semantic + lexical code search: the hips skill, a routing hint on code-navigation prompts (including subagents), and a background index watcher leased per session so every open session searches a fresh index, and the hips MCP server (search_code, index_status, reindex).",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "author": {
     "name": "Iason Malkotsis"
   }

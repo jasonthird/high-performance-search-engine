@@ -9,7 +9,7 @@
     {
       "name": "hips",
       "description": "hips code search as a skill, a per-prompt routing hint, a session-leased background index watcher, and the hips MCP server",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "source": "./plugin/hips",
       "keywords": [
         "search",
