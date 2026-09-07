@@ -9,6 +9,7 @@ pub mod block_max_wand;
 pub mod bm25;
 pub mod cli;
 pub mod codeindex;
+pub mod daemon;
 pub mod compress;
 #[cfg(all(target_os = "macos", feature = "semantic"))]
 pub mod coreml;
@@ -35,4 +36,19 @@ pub mod segments;
 pub mod spell;
 pub mod storage;
 pub mod tokenizer;
+pub mod usagelog;
+
+/// Process-wide verbosity, set once from the CLI's `-v/--verbose`. Off by
+/// default: an agent reading the output pays for every line in context,
+/// so the CLI prints only what changes the caller's next action.
+pub mod verbosity {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static VERBOSE: AtomicBool = AtomicBool::new(false);
+    pub fn set(on: bool) {
+        VERBOSE.store(on, Ordering::Relaxed);
+    }
+    pub fn verbose() -> bool {
+        VERBOSE.load(Ordering::Relaxed)
+    }
+}
 pub mod watch;

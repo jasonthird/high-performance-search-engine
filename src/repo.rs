@@ -19,6 +19,10 @@ use crate::indexer::InputDoc;
 /// Files larger than this are skipped: generated bundles and vendored blobs
 /// dominate retrieval otherwise.
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
+/// PDFs are mostly fonts and images, so the text-file cap would reject
+/// nearly every real document. Extraction cost is bounded by page count,
+/// not bytes, so the cap is generous.
+pub const MAX_PDF_BYTES: u64 = 64 << 20;
 /// A chunk longer than this many lines is split, so one huge function does
 /// not swallow a whole file's worth of ranking mass.
 pub const MAX_CHUNK_LINES: usize = 200;
@@ -31,8 +35,23 @@ pub const SOURCE_EXTS: &[&str] = &[
     "rs", "py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "java", "kt", "kts", "rb", "c", "h",
     "cpp", "cc", "cxx", "hpp", "hh", "cs", "swift", "scala", "php", "sh", "bash", "zsh", "sql",
     "lua", "ml", "hs", "ex", "exs", "erl", "clj", "vue", "svelte", "proto", "tf", "md", "toml",
-    "yaml", "yml",
+    "yaml", "yml", "pdf",
 ];
+
+/// Byte cap for a file, by name: PDFs get their own, larger limit.
+pub fn max_file_bytes(name: &str) -> u64 {
+    if is_pdf(name) {
+        MAX_PDF_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
+}
+
+pub fn is_pdf(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+}
 
 /// Directories never worth walking, even when not gitignored.
 const ALWAYS_SKIP_DIRS: &[&str] = &[
@@ -104,7 +123,13 @@ pub fn parse_id(id: &str) -> Option<(&str, usize, usize)> {
 /// gone or the range no longer exists (a stale hit after an edit).
 pub fn snippet_for(root: &Path, id: &str, max_lines: usize) -> Option<String> {
     let (path, start, end) = parse_id(id)?;
-    let text = fs::read_to_string(root.join(path)).ok()?;
+    let text = if is_pdf(path) {
+        // A PDF hit's line range is over the extracted text, so re-extract
+        // to show it. Slower than a file read, but only on the snippet path.
+        pdf_text(&root.join(path))?
+    } else {
+        fs::read_to_string(root.join(path)).ok()?
+    };
     let take = (end + 1).saturating_sub(start).min(max_lines);
     let body: Vec<&str> = text
         .lines()
@@ -377,7 +402,7 @@ fn walk_dir(dir: &Path, prefix: &str, ignores: &IgnoreSet, out: &mut Vec<SourceF
                 continue;
             }
             let Ok(meta) = entry.metadata() else { continue };
-            if meta.len() == 0 || meta.len() > MAX_FILE_BYTES {
+            if meta.len() == 0 || meta.len() > max_file_bytes(&name) {
                 continue;
             }
             let mtime_ns = meta
@@ -611,6 +636,90 @@ fn read_ident(s: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PDF
+// ---------------------------------------------------------------------------
+
+/// Text of every page of a PDF, in order. `None` when the file is not a
+/// parseable PDF (encrypted, malformed, or a PDF that makes the extractor
+/// panic — it has known panics on exotic fonts, and one bad file must not
+/// take the whole index build down).
+fn pdf_pages(path: &Path) -> Option<Vec<String>> {
+    let bytes = fs::read(path).ok()?;
+    let result = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes));
+    match result {
+        Ok(Ok(pages)) => Some(pages),
+        Ok(Err(e)) => {
+            eprintln!("warning: skipping {}: {e}", path.display());
+            None
+        }
+        Err(_) => {
+            eprintln!("warning: skipping {}: extractor panicked", path.display());
+            None
+        }
+    }
+}
+
+/// The whole PDF as one text in the same line layout `chunk_pdf` indexed,
+/// so a chunk's line range slices it correctly.
+pub fn pdf_text(path: &Path) -> Option<String> {
+    let pages = pdf_pages(path)?;
+    Some(
+        pages
+            .iter()
+            .map(|p| normalize_pdf_page(p))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Extracted PDF text is ragged: runs of blank lines between text objects,
+/// trailing spaces, and the occasional form feed. Collapse blank runs so a
+/// 200-line chunk holds a page's worth of prose rather of whitespace.
+fn normalize_pdf_page(page: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut blank_run = false;
+    for line in page.lines() {
+        let line = line.trim_end_matches(|c: char| c.is_whitespace() || c == '\x0c');
+        if line.trim().is_empty() {
+            if !blank_run && !out.is_empty() {
+                out.push("");
+            }
+            blank_run = true;
+        } else {
+            out.push(line);
+            blank_run = false;
+        }
+    }
+    while out.last() == Some(&"") {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// Chunk a PDF page by page. Ids are line ranges over the extracted text
+/// (see `pdf_text`), and each chunk is named by its page so a hit reads as
+/// `report.pdf::page 7`.
+pub fn chunk_pdf(rel: &str, abs: &Path) -> Vec<Chunk> {
+    let Some(pages) = pdf_pages(abs) else {
+        return Vec::new();
+    };
+    let normalized: Vec<String> = pages.iter().map(|p| normalize_pdf_page(p)).collect();
+    let text = normalized.join("\n");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut chunks = Vec::new();
+    let mut at = 0usize;
+    for (i, page) in normalized.iter().enumerate() {
+        // `join("\n")` puts every page's lines back to back; an empty page
+        // still contributes one (empty) line.
+        let n = page.lines().count().max(1);
+        let end = (at + n).min(lines.len());
+        push_split(&mut chunks, rel, &lines, at, end, Some(format!("page {}", i + 1)));
+        at = end;
+    }
+    chunks
+}
+
 /// Split one file's text into chunks with line ranges.
 pub fn chunk_text(rel: &str, text: &str) -> Vec<Chunk> {
     let lines: Vec<&str> = text.lines().collect();
@@ -775,11 +884,16 @@ pub fn collect_chunks(root: &Path) -> anyhow::Result<Vec<Chunk>> {
 pub fn chunk_files(files: &[SourceFile]) -> Vec<Chunk> {
     let per_file: Vec<Vec<Chunk>> = files
         .par_iter()
-        .map(|file| match fs::read_to_string(&file.abs) {
-            Ok(text) => chunk_text(&file.rel, &text),
-            // Binary or non-UTF-8: skip it, as the walker's extension filter
-            // cannot rule this out on its own.
-            Err(_) => Vec::new(),
+        .map(|file| {
+            if is_pdf(&file.rel) {
+                return chunk_pdf(&file.rel, &file.abs);
+            }
+            match fs::read_to_string(&file.abs) {
+                Ok(text) => chunk_text(&file.rel, &text),
+                // Binary or non-UTF-8: skip it, as the walker's extension
+                // filter cannot rule this out on its own.
+                Err(_) => Vec::new(),
+            }
         })
         .collect();
     // `collect` on an indexed parallel iterator preserves input order, so
@@ -954,5 +1068,53 @@ mod walk_tests {
         let rels: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(rels, ["src/main.rs"], "walked: {rels:?}");
         fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod pdf_tests {
+    use super::*;
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/two_pages.pdf")
+    }
+
+    #[test]
+    fn pdf_chunks_one_per_page_with_line_ranges() {
+        let chunks = chunk_pdf("docs/two_pages.pdf", &fixture());
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks[0].name.as_deref(), Some("page 1"));
+        assert_eq!(chunks[1].name.as_deref(), Some("page 2"));
+        assert!(chunks[0].body.contains("backoff"), "{}", chunks[0].body);
+        assert!(chunks[1].body.contains("Bearer"), "{}", chunks[1].body);
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[1].start_line, chunks[0].end_line + 1);
+        assert_eq!(chunks[1].title(), "docs/two_pages.pdf::page 2");
+    }
+
+    #[test]
+    fn pdf_snippet_slices_the_same_text_that_was_indexed() {
+        let chunks = chunk_pdf("tests/fixtures/two_pages.pdf", &fixture());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let snippet = snippet_for(root, &chunks[1].id(), 100).unwrap();
+        assert_eq!(snippet, chunks[1].body);
+    }
+
+    #[test]
+    fn pdf_is_walked_and_gets_the_larger_cap() {
+        assert!(is_source("report.pdf"));
+        assert!(is_pdf("REPORT.PDF"));
+        assert_eq!(max_file_bytes("a.pdf"), MAX_PDF_BYTES);
+        assert_eq!(max_file_bytes("a.rs"), MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn garbage_pdf_is_skipped_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("hips-pdf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bad.pdf");
+        fs::write(&p, b"%PDF-1.4 this is not really a pdf").unwrap();
+        assert!(chunk_pdf("bad.pdf", &p).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

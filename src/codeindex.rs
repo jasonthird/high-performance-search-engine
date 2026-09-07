@@ -50,6 +50,24 @@ pub struct Manifest {
     pub files: Vec<FileRecord>,
 }
 
+impl Manifest {
+    /// A manifest for an index that does not exist yet: what the MCP server
+    /// reports between the handshake and the first search that builds it.
+    pub fn pending(root: &Path, embedded: bool) -> Self {
+        Self {
+            root: root.to_string_lossy().to_string(),
+            num_docs: 0,
+            num_files: 0,
+            embedded,
+            build_secs: 0.0,
+            encoded: 0,
+            cached: 0,
+            tree_fingerprint: 0,
+            files: Vec::new(),
+        }
+    }
+}
+
 /// One indexed file's identity and the chunk ids it produced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -112,6 +130,12 @@ impl Default for BuildOpts {
 /// overhead while keeping merges rare.
 pub const MAX_SEGMENTS: usize = 12;
 
+/// How long a rebuild waits for another writer to release the index. An
+/// incremental rebuild takes well under this; a full first build of a
+/// large repository can exceed it, in which case the caller is told who
+/// holds the lock.
+const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// `keys.bin`: one embcache key (u64 LE) per doc_id, per segment.
 pub fn write_keys(seg_dir: &Path, keys: &[u64]) -> anyhow::Result<()> {
     let mut bytes = Vec::with_capacity(keys.len() * 8);
@@ -173,6 +197,22 @@ pub fn default_index_dir(root: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
     cache_root().join(format!("{name}-{h:016x}"))
+}
+
+/// The nearest ancestor of `root` (excluding `root` itself) that has an
+/// index, as `(ancestor, index_dir)`. Lets a caller in a subdirectory of an
+/// indexed repository search without naming the repository.
+pub fn find_ancestor_index(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let abs = root.canonicalize().ok()?;
+    let mut dir = abs.parent();
+    while let Some(d) = dir {
+        let index = default_index_dir(d);
+        if crate::daemon::index_exists(&index) {
+            return Some((d.to_path_buf(), index));
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 pub(crate) fn cache_root() -> PathBuf {
@@ -250,6 +290,28 @@ impl RepoIndexer {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether the encoder is resident. The watcher uses this to decide
+    /// when an idle process is holding the model's memory for nothing.
+    pub fn encoder_loaded(&self) -> bool {
+        #[cfg(feature = "semantic")]
+        {
+            self.embedder.get().is_some()
+        }
+        #[cfg(not(feature = "semantic"))]
+        {
+            false
+        }
+    }
+
+    /// Drop the encoder; the next rebuild that needs it reloads it (about
+    /// a second). Frees the model's memory in a long-idle watcher.
+    pub fn unload_embedder(&mut self) {
+        #[cfg(feature = "semantic")]
+        {
+            self.embedder.take();
+        }
     }
 
     pub fn index_dir(&self) -> &Path {
@@ -444,12 +506,11 @@ impl RepoIndexer {
                 }
             }
         }
-        let mut writer = crate::segments::SegmentedWriter::open_or_create_ex(
-            &self.index_dir,
-            true,
-            self.opts.title_weight,
-            true, // code tokenizer, matching the single-index repo path
-        )?;
+        // Another writer (the background watcher, or a second agent's
+        // `index-repo`) may hold the index. Its rebuild is incremental and
+        // short, so wait for it rather than fail; whoever runs second
+        // usually finds the tree fingerprint already current.
+        let mut writer = self.open_writer_waiting(WRITER_WAIT)?;
         // 1. Tombstone chunks that no longer exist: every id a removed file
         //    had, and every id of a changed file that its new chunking no
         //    longer produces (line shifts rename ids).
@@ -935,6 +996,36 @@ impl RepoIndexer {
                     std::fs::rename(&retired, &self.index_dir).ok();
                 }
                 Err(e).with_context(|| format!("cannot install {}", self.index_dir.display()))
+            }
+        }
+    }
+
+    /// Open the segmented writer, retrying while another process holds
+    /// `writer.lock`, for up to `max`.
+    fn open_writer_waiting(
+        &self,
+        max: std::time::Duration,
+    ) -> anyhow::Result<crate::segments::SegmentedWriter> {
+        let deadline = Instant::now() + max;
+        let mut waited = false;
+        loop {
+            match crate::segments::SegmentedWriter::open_or_create_ex(
+                &self.index_dir,
+                true,
+                self.opts.title_weight,
+                true, // code tokenizer, matching the single-index repo path
+            ) {
+                Ok(w) => return Ok(w),
+                Err(e) if e.is::<crate::segments::LockedByAnotherWriter>()
+                    && Instant::now() < deadline =>
+                {
+                    if !waited {
+                        self.log("index is being written by another process; waiting".to_string());
+                        waited = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(e),
             }
         }
     }

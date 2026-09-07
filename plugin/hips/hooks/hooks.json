@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/session.sh SessionStart", "timeout": 15 } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/session.sh SessionEnd", "timeout": 10 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/hint.sh UserPromptSubmit" } ] }
+    ],
+    "SubagentStart": [
+      { "hooks": [ { "type": "command", "command": "sh ${CLAUDE_PLUGIN_ROOT}/hooks/hint.sh SubagentStart" } ] }
+    ]
+  }
+}

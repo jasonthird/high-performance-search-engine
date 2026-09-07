@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::indexer::SearchableIndex;
 use crate::postings::DEFAULT_BLOCK_SIZE;
 use crate::reorder::ReorderStrategy;
-use crate::{api, bench, indexer, searcher, storage};
+use crate::{api, bench, indexer, searcher, storage, usagelog};
 
 /// CLI-facing document reordering choice.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -50,6 +50,10 @@ pub use crate::query::run_ranked_with;
     about = "MVP search engine: BM25 over an inverted index with exact Block-Max WAND"
 )]
 struct Cli {
+    /// Print progress, device, timing, score and stats lines. Off by
+    /// default so agent-driven calls do not fill their context with them.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -144,9 +148,11 @@ enum Command {
     /// Run the Model Context Protocol server over stdio, exposing code
     /// search to an MCP client such as Claude Code.
     Mcp {
-        /// Repository root (default: the current directory).
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
+        /// Repository root. Default: the git work tree enclosing the
+        /// current directory (MCP clients start the server in the project
+        /// directory), else the current directory itself.
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Index directory (default: per-repo directory under the user cache).
         #[arg(long)]
         index: Option<PathBuf>,
@@ -198,6 +204,13 @@ enum Command {
         /// Also accepted as an alias for `--mode hybrid`.
         #[arg(long)]
         hybrid: bool,
+        /// Alias for `--mode bm25`: lexical only, no encoder. Agents carry
+        /// the flag over from `index-repo --lexical`, so accept it here too.
+        #[arg(long, conflicts_with = "hybrid")]
+        lexical: bool,
+        /// Emit results as one JSON object per line: {"id","path","start","end","name","score"}.
+        #[arg(long)]
+        json: bool,
 #[command(flatten)]
         knobs: FusionArgs,
     },
@@ -290,6 +303,53 @@ enum Command {
         #[arg(long)]
         index: PathBuf,
     },
+    /// Keep a repository's index fresh: build it if missing, then rebuild
+    /// after every burst of edits until stopped (Ctrl-C). One watcher per
+    /// repository; a second start is refused. `session start` runs this
+    /// detached for agent sessions.
+    Watch {
+        /// Repository root (default: the current directory).
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Lexical-only index: no encoder, no model download.
+        #[arg(long)]
+        lexical: bool,
+        /// Exit once no live session lease remains (after the grace
+        /// period). Without this the watcher runs until stopped.
+        #[arg(long)]
+        leased: bool,
+        /// Seconds to linger after the last lease is released.
+        #[arg(long, default_value_t = crate::daemon::DEFAULT_GRACE_SECS)]
+        grace_secs: u64,
+        /// Idle seconds before the encoder is unloaded to free memory.
+        #[arg(long, default_value_t = crate::daemon::DEFAULT_UNLOAD_SECS)]
+        unload_secs: u64,
+        /// BM25F-lite title boost (used when the index is first created).
+        #[arg(long, default_value_t = 2)]
+        title_weight: u32,
+        /// Stop the running watcher for `--root` instead of starting one.
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Agent-session lifecycle for the background watcher. `start` takes a
+    /// lease and launches the watcher if none runs; `end` releases the
+    /// lease (the watcher exits after the last one); `list` shows leases.
+    /// Meant for editor/agent hooks: the Claude Code plugin calls `start`
+    /// on SessionStart and `end` on SessionEnd.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+    /// Index and watcher status for a repository: what is indexed, whether
+    /// a watcher is running, and which sessions hold it.
+    Status {
+        /// Repository root (default: the current directory).
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Emit one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Benchmark queries against an index.
     Bench {
         /// Index directory.
@@ -314,8 +374,58 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Take a lease for a session and ensure the watcher runs. Watches the
+    /// enclosing git work tree of `--root`; outside a git repository it
+    /// does nothing unless `--any-dir` is given.
+    Start {
+        /// Directory the session was opened in (default: current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Session id (default: taken from `--hook` input).
+        #[arg(long)]
+        id: Option<String>,
+        /// Pid of the agent process; the lease is dropped when it exits.
+        /// Default: the parent process (the shell or agent that ran this).
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Read a Claude Code hook payload from stdin (`session_id`, `cwd`)
+        /// and answer with hook JSON. Never fails the hook.
+        #[arg(long)]
+        hook: bool,
+        /// Lexical-only index for this repository's watcher.
+        #[arg(long)]
+        lexical: bool,
+        /// Watch even outside a git repository.
+        #[arg(long)]
+        any_dir: bool,
+        #[arg(long, default_value_t = crate::daemon::DEFAULT_GRACE_SECS)]
+        grace_secs: u64,
+        #[arg(long, default_value_t = crate::daemon::DEFAULT_UNLOAD_SECS)]
+        unload_secs: u64,
+    },
+    /// Release a session's lease.
+    End {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        id: Option<String>,
+        /// Read the session id and cwd from a Claude Code hook payload.
+        #[arg(long)]
+        hook: bool,
+    },
+    /// List the sessions leasing a repository's watcher.
+    List {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
+}
+
 pub fn run() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    crate::verbosity::set(cli.verbose);
+    match cli.command {
         Command::Index {
             input,
             out,
@@ -368,7 +478,10 @@ pub fn run() -> anyhow::Result<()> {
             top_k,
             knobs,
         } => cmd_mcp(
-            &root,
+            &root.unwrap_or_else(|| {
+                crate::daemon::project_root(Path::new("."))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            }),
             index.as_deref(),
             !lexical,
             rebuild,
@@ -385,13 +498,23 @@ pub fn run() -> anyhow::Result<()> {
             url,
             mode,
             hybrid,
+            lexical,
+            json,
             knobs,
         } => cmd_search(
             &resolve_index(index.as_deref(), root.as_deref())?,
+            root.as_deref(),
             &query,
             top_k,
             url.as_deref(),
-            knobs.to_opts(if hybrid { RankMode::Hybrid } else { mode }),
+            json,
+            knobs.to_opts(if hybrid {
+                RankMode::Hybrid
+            } else if lexical {
+                RankMode::Bm25
+            } else {
+                mode
+            }),
         ),
         Command::Embed { index, input } => cmd_embed(&index, &input),
         Command::EvalCode {
@@ -435,6 +558,17 @@ pub fn run() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Watch {
+            root,
+            lexical,
+            leased,
+            grace_secs,
+            unload_secs,
+            title_weight,
+            stop,
+        } => cmd_watch(&root, !lexical, leased, grace_secs, unload_secs, title_weight, stop),
+        Command::Session { action } => cmd_session(action),
+        Command::Status { root, json } => cmd_status(&root, json),
         Command::Bench {
             index,
             queries,
@@ -714,13 +848,36 @@ fn resolve_index(index: Option<&Path>, root: Option<&Path>) -> anyhow::Result<Pa
     }
     let root = root.unwrap_or_else(|| Path::new("."));
     let dir = crate::codeindex::default_index_dir(root);
-    anyhow::ensure!(
-        dir.join("meta.bin").exists() || crate::segments::is_segmented(&dir),
+    if crate::daemon::index_exists(&dir) {
+        return Ok(dir);
+    }
+    // An agent launched in a subdirectory of an indexed repository: the
+    // watcher indexes the git work tree, so look upwards before giving up.
+    if let Some((_, ancestor)) = crate::codeindex::find_ancestor_index(root) {
+        return Ok(ancestor);
+    }
+    // A watcher may be building this very index right now.
+    if let Some(status) = crate::daemon::wait_for_idle(&dir, std::time::Duration::from_secs(10))
+    {
+        if crate::daemon::index_exists(&dir) {
+            return Ok(dir);
+        }
+        anyhow::bail!(
+            "the background watcher (pid {}) is still building the index for {}; retry in a moment{}",
+            status.pid,
+            root.display(),
+            status
+                .last_error
+                .as_deref()
+                .map(|e| format!(" (last error: {e})"))
+                .unwrap_or_default()
+        );
+    }
+    anyhow::bail!(
         "no index for {} yet — build one with `hips index-repo --root {}`",
         root.display(),
         root.display()
-    );
-    Ok(dir)
+    )
 }
 
 /// Build (or rebuild) a code-search index for a source tree.
@@ -744,10 +901,24 @@ fn cmd_index_repo(
         ivf_clusters,
         retrain,
         segmented,
-        quiet: false,
+        quiet: !crate::verbosity::verbose(),
     };
     let indexer = crate::codeindex::RepoIndexer::new(root, &index_dir, opts)?;
     let manifest = indexer.build()?;
+    if !crate::verbosity::verbose() {
+        println!(
+            "indexed {} chunks from {} files in {:.1}s ({})",
+            manifest.num_docs,
+            manifest.num_files,
+            manifest.build_secs,
+            if manifest.embedded {
+                format!("{} embedded, {} cached", manifest.encoded, manifest.cached)
+            } else {
+                "lexical only".to_string()
+            }
+        );
+        return Ok(());
+    }
     println!(
         "indexed {} chunks from {} files in {:.2}s",
         manifest.num_docs, manifest.num_files, manifest.build_secs
@@ -892,32 +1063,124 @@ fn cmd_mcp(
 
 fn cmd_search(
     index_dir: &Path,
+    root: Option<&Path>,
     query: &str,
     top_k: usize,
     url_template: Option<&str>,
+    json: bool,
     opts: SearchOpts,
 ) -> anyhow::Result<()> {
+    // If the watcher is mid-rebuild after an edit, a search issued right
+    // now should see the edit: wait for it before opening. A segmented
+    // rebuild tombstones stale chunks before appending their replacements,
+    // so reading mid-rebuild can miss both; the bound only guards against
+    // a wedged watcher (steady-state rebuilds measure 20-170 ms, a cold
+    // encoder 3-5 s).
+    crate::daemon::wait_for_idle(index_dir, std::time::Duration::from_secs(20));
     let index = searcher::AnyIndex::open(index_dir)?;
     let mut opts = opts;
+    // Ids are `path:start-end` relative to the indexed root. When the
+    // caller's `--root` is a subdirectory of it, show paths relative to the
+    // caller so the printed location opens from where the caller stands.
+    let rebase = id_rebaser(index_dir, root);
+    let log = |mode: RankMode, took_ms: f64, hits: Vec<String>| {
+        usagelog::record(&usagelog::UsageEvent {
+            ts: usagelog::now_secs(),
+            source: "cli",
+            agent: usagelog::detect_agent(),
+            cwd: usagelog::cwd_string(),
+            root: usagelog::path_string(root),
+            index_dir: index_dir.to_string_lossy().to_string(),
+            query,
+            mode: format!("{mode:?}").to_lowercase(),
+            top_k,
+            path_glob: None,
+            n_hits: hits.len(),
+            took_ms,
+            hits,
+        });
+    };
     // Hybrid is the default, but it needs an encoder build and stored
     // vectors; fall back to lexical BM25 (with a note) rather than fail.
+    let verbose = crate::verbosity::verbose();
     if opts.mode != RankMode::Bm25 && (!cfg!(feature = "semantic") || !index.has_vectors()) {
-        eprintln!(
-            "note: {} — using lexical BM25 (pass --mode bm25 to silence)",
-            if cfg!(feature = "semantic") {
-                "index has no embeddings"
-            } else {
-                "built without --features semantic"
-            }
-        );
+        if verbose {
+            eprintln!(
+                "note: {} — using lexical BM25 (pass --mode bm25 to silence)",
+                if cfg!(feature = "semantic") {
+                    "index has no embeddings"
+                } else {
+                    "built without --features semantic"
+                }
+            );
+        }
         opts.mode = RankMode::Bm25;
     }
+    // The encoder needs its weights on disk (or a network to fetch them).
+    // Offline with an empty cache, degrade to BM25 and say so: that note
+    // changes how the caller should read the results.
+    #[cfg(feature = "semantic")]
+    let embedder = if opts.mode != RankMode::Bm25 {
+        match crate::embedder::Embedder::load() {
+            Ok(e) => Some(e),
+            Err(err) => {
+                eprintln!(
+                    "note: CodeRankEmbed unavailable ({}); using lexical BM25 only",
+                    root_cause_line(&err)
+                );
+                opts.mode = RankMode::Bm25;
+                None
+            }
+        }
+    } else {
+        None
+    };
     if opts.mode == RankMode::Bm25 {
-        let outcome = index.search(query, top_k);
-        print_outcome(query, &outcome, url_template);
+        let mut outcome = index.search(query, top_k);
+        for r in outcome.results.iter_mut() {
+            r.id = rebase(&r.id);
+        }
+        if json {
+            print_json(outcome.results.iter().map(|r| (r.id.as_str(), r.title.as_str(), r.score)));
+        } else if verbose {
+            print_outcome(query, &outcome, url_template);
+        } else {
+            print_compact(outcome.results.iter().map(|r| (r.id.as_str(), r.title.as_str())));
+        }
+        log(
+            RankMode::Bm25,
+            outcome.took_ms,
+            outcome.results.iter().map(|r| r.id.clone()).collect(),
+        );
         return Ok(());
     }
+    #[cfg(feature = "semantic")]
+    let timed = crate::query::run_ranked_with(
+        &index,
+        embedder.as_ref().expect("encoder loaded above"),
+        query,
+        top_k,
+        &opts,
+    )?;
+    #[cfg(not(feature = "semantic"))]
     let timed = run_ranked(&index, query, top_k, &opts)?;
+    let mut timed = timed;
+    for r in timed.results.iter_mut() {
+        r.id = rebase(&r.id);
+    }
+    log(
+        opts.mode,
+        timed.total_ms,
+        timed.results.iter().map(|r| r.id.clone()).collect(),
+    );
+    if json {
+        print_json(timed.results.iter().map(|r| (r.id.as_str(), r.title.as_str(), r.score)));
+        return Ok(());
+    }
+    if !verbose {
+        print_compact(timed.results.iter().map(|r| (r.id.as_str(), r.title.as_str())));
+        return Ok(());
+    }
     println!(
         "query: {query:?}  ({:.3} ms  bm25 {:.3} + embed {:.3} + score {:.3})  mode={:?}",
         timed.total_ms, timed.bm25_ms, timed.embed_ms, timed.score_ms, opts.mode
@@ -947,6 +1210,389 @@ fn cmd_search(
         s.num_blocks_skipped
     );
     Ok(())
+}
+
+/// Default search output: one hit per line, location then declaration name.
+/// The title is `path::name`; the path is already the id's prefix, so only
+/// the name is repeated.
+/// A function mapping index ids to ids relative to `root`, for callers
+/// standing in a subdirectory of the indexed tree. Identity otherwise.
+fn id_rebaser(index_dir: &Path, root: Option<&Path>) -> Box<dyn Fn(&str) -> String> {
+    let identity: Box<dyn Fn(&str) -> String> = Box::new(|id: &str| id.to_string());
+    let Some(root) = root else {
+        return identity;
+    };
+    let Ok(here) = root.canonicalize() else {
+        return identity;
+    };
+    let Ok(manifest) = crate::codeindex::Manifest::load(index_dir) else {
+        return identity;
+    };
+    let indexed = PathBuf::from(&manifest.root);
+    let Ok(sub) = here.strip_prefix(&indexed) else {
+        return identity;
+    };
+    if sub.as_os_str().is_empty() {
+        return identity;
+    }
+    let sub: Vec<String> = sub
+        .to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Box::new(move |id: &str| match crate::repo::parse_id(id) {
+        Some((path, start, end)) => format!("{}:{start}-{end}", relative_to(&sub, path)),
+        None => id.to_string(),
+    })
+}
+
+/// `path` (relative to a root) rewritten relative to the subdirectory
+/// `from` of that root: drop the shared prefix, climb the rest with `..`.
+fn relative_to(from: &[String], path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    let shared = from
+        .iter()
+        .zip(parts.iter())
+        .take_while(|(a, b)| a.as_str() == **b)
+        .count();
+    let mut out: Vec<&str> = vec![".."; from.len() - shared];
+    out.extend_from_slice(&parts[shared..]);
+    out.join("/")
+}
+
+fn cmd_watch(
+    root: &Path,
+    embed: bool,
+    leased: bool,
+    grace_secs: u64,
+    unload_secs: u64,
+    title_weight: u32,
+    stop: bool,
+) -> anyhow::Result<()> {
+    if stop {
+        let index_dir = crate::codeindex::default_index_dir(root);
+        if crate::daemon::stop_watcher(&index_dir) {
+            println!("stopping the watcher for {}", root.display());
+        } else {
+            println!("no watcher running for {}", root.display());
+        }
+        return Ok(());
+    }
+    crate::daemon::run_watch(
+        root,
+        crate::daemon::WatchOpts {
+            embed: embed_or_degrade(embed),
+            leased,
+            grace_secs,
+            unload_secs,
+            title_weight,
+        },
+    )
+}
+
+/// Read a hook payload from stdin (when `--hook`), else nothing.
+fn hook_input(hook: bool) -> crate::daemon::HookInput {
+    if !hook {
+        return crate::daemon::HookInput::default();
+    }
+    let mut text = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text);
+    crate::daemon::HookInput::parse(&text).unwrap_or_default()
+}
+
+/// `session start` under `--hook` must never break the agent's startup:
+/// errors go to stderr and the exit code stays 0.
+fn hook_guard(hook: bool, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    match result {
+        Err(e) if hook => {
+            eprintln!("hips: {e:#}");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+fn cmd_session(action: SessionAction) -> anyhow::Result<()> {
+    match action {
+        SessionAction::Start {
+            root,
+            id,
+            pid,
+            hook,
+            lexical,
+            any_dir,
+            grace_secs,
+            unload_secs,
+        } => {
+            let input = hook_input(hook);
+            let cwd = root
+                .or_else(|| (!input.cwd.is_empty()).then(|| PathBuf::from(&input.cwd)))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let session = id
+                .or_else(|| (!input.session_id.is_empty()).then(|| input.session_id.clone()));
+            let Some(session) = session else {
+                return hook_guard(hook, Err(anyhow::anyhow!("no session id: pass --id or --hook")));
+            };
+            let pid = pid.unwrap_or_else(parent_pid);
+            let opts = crate::daemon::StartOpts {
+                lexical: lexical || env_flag("HIPS_WATCH_LEXICAL"),
+                grace_secs,
+                unload_secs,
+                any_dir: any_dir || env_flag("HIPS_WATCH_ANY_DIR"),
+            };
+            let report = match crate::daemon::session_start(&cwd, &session, pid, &opts) {
+                Ok(r) => r,
+                Err(e) => return hook_guard(hook, Err(e)),
+            };
+            let Some(report) = report else {
+                if !hook {
+                    println!(
+                        "{} is not inside a git repository; nothing to watch (use --any-dir to force)",
+                        cwd.display()
+                    );
+                }
+                return Ok(());
+            };
+            if hook {
+                // Tell the agent the index is handled, so it neither runs
+                // `index-repo` nor falls back to grep while it is built.
+                let context = if report.index_exists {
+                    format!(
+                        "[hips] The code index for {} is kept fresh by a background watcher; \
+                         search with `hips search --root . --query \"<what the code does>\"`. \
+                         Do not run `hips index-repo`.",
+                        report.root.display()
+                    )
+                } else {
+                    format!(
+                        "[hips] A background watcher is building the code index for {} now; \
+                         `hips search --root . --query \"<what the code does>\"` waits for it. \
+                         Do not run `hips index-repo`.",
+                        report.root.display()
+                    )
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": context,
+                        }
+                    })
+                );
+            } else {
+                println!(
+                    "watching {} (watcher pid {}, {}; {} session{}; index {})",
+                    report.root.display(),
+                    report.watcher_pid,
+                    if report.spawned { "started" } else { "already running" },
+                    report.live_leases,
+                    if report.live_leases == 1 { "" } else { "s" },
+                    if report.index_exists { "ready" } else { "building" }
+                );
+            }
+            Ok(())
+        }
+        SessionAction::End { root, id, hook } => {
+            let input = hook_input(hook);
+            let cwd = root
+                .or_else(|| (!input.cwd.is_empty()).then(|| PathBuf::from(&input.cwd)))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let session = id
+                .or_else(|| (!input.session_id.is_empty()).then(|| input.session_id.clone()));
+            let Some(session) = session else {
+                return hook_guard(hook, Err(anyhow::anyhow!("no session id: pass --id or --hook")));
+            };
+            let removed = match crate::daemon::session_end(&cwd, &session) {
+                Ok(r) => r,
+                Err(e) => return hook_guard(hook, Err(e)),
+            };
+            if !hook {
+                println!(
+                    "{}",
+                    if removed { "lease released" } else { "no lease held" }
+                );
+            }
+            Ok(())
+        }
+        SessionAction::List { root } => {
+            let root = crate::daemon::project_root(&root).unwrap_or(root);
+            let state = crate::daemon::state_dir(&crate::codeindex::default_index_dir(&root));
+            let leases = crate::daemon::read_leases(&state);
+            if leases.is_empty() {
+                println!("no sessions lease {}", root.display());
+            }
+            for l in leases {
+                println!(
+                    "{:<40} {:<12} pid {:<7} {}",
+                    l.session,
+                    l.agent,
+                    l.pid,
+                    if l.pid == 0 || crate::daemon::pid_alive(l.pid) { "live" } else { "dead" }
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+#[cfg(unix)]
+fn parent_pid() -> u32 {
+    unsafe { libc::getppid() as u32 }
+}
+
+#[cfg(not(unix))]
+fn parent_pid() -> u32 {
+    0
+}
+
+fn cmd_status(root: &Path, json: bool) -> anyhow::Result<()> {
+    let root = crate::daemon::project_root(root)
+        .or_else(|| root.canonicalize().ok())
+        .unwrap_or_else(|| root.to_path_buf());
+    let index_dir = crate::codeindex::default_index_dir(&root);
+    let state = crate::daemon::state_dir(&index_dir);
+    let manifest = crate::codeindex::Manifest::load(&index_dir).ok();
+    let watcher = crate::daemon::running(&state);
+    let leases = crate::daemon::read_leases(&state);
+    let now = crate::daemon::now_secs();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "root": root,
+                "index_dir": index_dir,
+                "index": manifest.as_ref().map(|m| serde_json::json!({
+                    "chunks": m.num_docs, "files": m.num_files, "embedded": m.embedded,
+                    "build_secs": m.build_secs,
+                })),
+                "watcher": watcher,
+                "sessions": leases,
+                "log": crate::daemon::log_path(&state),
+            })
+        );
+        return Ok(());
+    }
+    println!("root:     {}", root.display());
+    match &manifest {
+        Some(m) => {
+            let age = std::fs::metadata(index_dir.join(crate::codeindex::MANIFEST_FILE))
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| format!(", updated {} ago", human_secs(d.as_secs())))
+                .unwrap_or_default();
+            println!(
+                "index:    {} chunks from {} files, {}{age}\n          {}",
+                m.num_docs,
+                m.num_files,
+                if m.embedded { "hybrid" } else { "lexical" },
+                index_dir.display()
+            );
+        }
+        None => println!("index:    none (hips index-repo --root . or hips session start)"),
+    }
+    match &watcher {
+        Some(w) => {
+            println!(
+                "watcher:  running, pid {} for {}, {} ({}), {} rebuild{}{}{}{}",
+                w.pid,
+                human_secs(now.saturating_sub(w.since)),
+                w.state,
+                if w.leased { "leased" } else { "foreground" },
+                w.rebuilds,
+                if w.rebuilds == 1 { "" } else { "s" },
+                if w.last_rebuild > 0 {
+                    format!(
+                        ", last {} ago in {:.2}s",
+                        human_secs(now.saturating_sub(w.last_rebuild)),
+                        w.last_rebuild_secs
+                    )
+                } else {
+                    String::new()
+                },
+                if w.encoder_loaded { ", encoder loaded" } else { "" },
+                w.last_error
+                    .as_deref()
+                    .map(|e| format!("\n          last error: {e}"))
+                    .unwrap_or_default()
+            );
+            println!("log:      {}", crate::daemon::log_path(&state).display());
+        }
+        None => println!("watcher:  not running"),
+    }
+    if leases.is_empty() {
+        println!("sessions: none");
+    } else {
+        println!("sessions: {}", leases.len());
+        for l in &leases {
+            println!(
+                "          {} ({}, pid {}, {}{})",
+                l.session,
+                l.agent,
+                l.pid,
+                if l.pid == 0 || crate::daemon::pid_alive(l.pid) { "live" } else { "dead" },
+                if l.since > 0 {
+                    format!(", {} ago", human_secs(now.saturating_sub(l.since)))
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn human_secs(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{}s", s / 60, s % 60),
+        s if s < 86_400 => format!("{}h{}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d{}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+fn print_compact<'a>(hits: impl ExactSizeIterator<Item = (&'a str, &'a str)>) {
+    if hits.len() == 0 {
+        println!("no results");
+        return;
+    }
+    for (id, title) in hits {
+        match title.rsplit_once("::") {
+            Some((_, name)) => println!("{id:<28} {name}"),
+            None => println!("{id}"),
+        }
+    }
+}
+
+/// `--json`: one object per hit, one per line (JSONL), so a caller can
+/// stream or `head` it. Empty output means no results.
+fn print_json<'a>(hits: impl Iterator<Item = (&'a str, &'a str, f32)>) {
+    for (id, title, score) in hits {
+        let (path, start, end) = crate::repo::parse_id(id)
+            .map(|(p, s, e)| (p, Some(s), Some(e)))
+            .unwrap_or((id, None, None));
+        let name = title.rsplit_once("::").map(|(_, n)| n);
+        println!(
+            "{}",
+            serde_json::json!({
+                "id": id, "path": path, "start": start, "end": end,
+                "name": name, "score": score,
+            })
+        );
+    }
+}
+
+/// The innermost message of an error chain, single-line.
+#[cfg(feature = "semantic")]
+fn root_cause_line(err: &anyhow::Error) -> String {
+    err.root_cause().to_string().lines().next().unwrap_or("").to_string()
 }
 
 fn print_outcome(query: &str, outcome: &searcher::SearchOutcome, url_template: Option<&str>) {
@@ -1483,5 +2129,19 @@ fn rss_human() -> String {
         format!("{:.1} MB", kb as f64 / 1024.0)
     } else {
         format!("{kb} KB")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_to;
+
+    #[test]
+    fn rebases_hit_paths_to_the_callers_subdirectory() {
+        let from = |s: &str| -> Vec<String> { s.split('/').map(str::to_string).collect() };
+        assert_eq!(relative_to(&from("src/deep"), "src/lib.rs"), "../lib.rs");
+        assert_eq!(relative_to(&from("src/deep"), "src/deep/x.rs"), "x.rs");
+        assert_eq!(relative_to(&from("src"), "docs/a.md"), "../docs/a.md");
+        assert_eq!(relative_to(&[], "src/lib.rs"), "src/lib.rs");
     }
 }

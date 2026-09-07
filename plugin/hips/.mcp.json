@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hips": {
+      "command": "hips",
+      "args": ["mcp"]
+    }
+  }
+}

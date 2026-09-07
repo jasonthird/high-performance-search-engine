@@ -204,6 +204,24 @@ fn write_tombstones(dir: &Path, name: &str, words: &[u64]) -> anyhow::Result<()>
 }
 
 /// Does this directory hold a segmented index?
+/// `writer.lock` is held by another process. Typed so callers that can
+/// afford to wait (a rebuild racing the background watcher) can tell it
+/// apart from a real failure.
+#[derive(Debug)]
+pub struct LockedByAnotherWriter(pub PathBuf);
+
+impl std::fmt::Display for LockedByAnotherWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is locked by another writer (writer.lock held)",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for LockedByAnotherWriter {}
+
 pub fn is_segmented(dir: &Path) -> bool {
     dir.join(MANIFEST_FILE).exists()
 }
@@ -489,10 +507,9 @@ impl SegmentedWriter {
         let lock = File::create(dir.join("writer.lock")).context("failed to create writer.lock")?;
         match lock.try_lock() {
             Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-                "{} is locked by another writer (writer.lock held)",
-                dir.display()
-            ),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(anyhow::Error::new(LockedByAnotherWriter(dir.to_path_buf())))
+            }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(e).context("failed to lock writer.lock")
             }

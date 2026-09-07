@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use crate::codeindex::{BuildOpts, Manifest, RepoIndexer};
 use crate::repo;
+use crate::usagelog;
 use crate::searcher::AnyIndex;
 use crate::watch::TreeWatcher;
 
@@ -53,11 +54,19 @@ pub struct ServerConfig {
 
 pub struct Server {
     indexer: RepoIndexer,
-    index: AnyIndex,
+    /// `None` until the first build. A repository with no index yet is
+    /// built on the first tool call, not at startup: a cold hybrid build
+    /// takes tens of seconds, and building before `initialize` would trip
+    /// the client's connect timeout on every first launch in a new repo.
+    index: Option<AnyIndex>,
     watcher: Option<TreeWatcher>,
     manifest: Manifest,
     config: ServerConfig,
     rebuilds: u64,
+    /// Modification time of the on-disk manifest when `index` was opened.
+    /// The background watcher (or another agent's `index-repo`) rebuilds
+    /// the index behind this process; a changed mtime means reopen.
+    manifest_mtime: Option<std::time::SystemTime>,
 }
 
 impl Server {
@@ -73,18 +82,20 @@ impl Server {
         if std::env::var_os("HIPS_PRELOAD").is_some_and(|v| v == "1") {
             indexer.preload_embedder()?;
         }
-        let needs_build = config.force_rebuild || !index_exists(&config.index_dir);
-        let manifest = if needs_build {
-            indexer.build()?
+        // An existing, loadable index is opened now. Anything else (absent,
+        // pre-manifest, or a forced rebuild) is deferred to the first call.
+        let existing = if config.force_rebuild || !index_exists(&config.index_dir) {
+            None
         } else {
-            match Manifest::load(&config.index_dir) {
-                Ok(m) => m,
-                // Index directory exists but predates the manifest, or was
-                // built for a different tree: rebuild rather than guess.
-                Err(_) => indexer.build()?,
-            }
+            Manifest::load(&config.index_dir).ok()
         };
-        let index = AnyIndex::open(&config.index_dir)?;
+        let (manifest, index) = match existing {
+            Some(m) => {
+                let idx = AnyIndex::open(&config.index_dir)?;
+                (m, Some(idx))
+            }
+            None => (Manifest::pending(&config.root, config.build.embed), None),
+        };
         let watcher = if config.watch {
             match TreeWatcher::start(&config.root) {
                 Ok(w) => Some(w),
@@ -98,6 +109,7 @@ impl Server {
         } else {
             None
         };
+        let manifest_mtime = manifest_mtime(&config.index_dir);
         Ok(Self {
             indexer,
             index,
@@ -105,6 +117,7 @@ impl Server {
             manifest,
             config,
             rebuilds: 0,
+            manifest_mtime,
         })
     }
 
@@ -112,16 +125,23 @@ impl Server {
     pub fn serve(&mut self) -> anyhow::Result<()> {
         let stdin = std::io::stdin();
         let mut stdout = std::io::stdout();
-        eprintln!(
-            "hips MCP server ready: {} chunks from {} ({} search)",
-            self.manifest.num_docs,
-            self.config.root.display(),
-            if self.manifest.embedded {
-                "hybrid"
-            } else {
-                "lexical"
-            }
-        );
+        if self.index.is_some() {
+            eprintln!(
+                "hips MCP server ready: {} chunks from {} ({} search)",
+                self.manifest.num_docs,
+                self.config.root.display(),
+                if self.manifest.embedded {
+                    "hybrid"
+                } else {
+                    "lexical"
+                }
+            );
+        } else {
+            eprintln!(
+                "hips MCP server ready: {} has no index yet; it is built on the first search",
+                self.config.root.display()
+            );
+        }
         for line in stdin.lock().lines() {
             let line = line.context("stdin read failed")?;
             let line = line.trim();
@@ -211,12 +231,19 @@ impl Server {
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "hips", "version": env!("CARGO_PKG_VERSION")},
             "instructions": format!(
-                "Code search over {} ({} chunks, {} retrieval). Use search_code with a \
-                 natural-language description of what you are looking for, or with exact \
-                 identifiers — both work. Results are `path:startLine-endLine` locations you \
-                 can open directly. The index follows the working tree automatically.",
+                "Code search over {} ({}, {} retrieval). For ANY question about where \
+                 something is implemented, how a mechanism works, or which file is \
+                 responsible, call search_code FIRST, before grep or file listing. Describe \
+                 what the code does; exact identifiers work too. Results are \
+                 `path:startLine-endLine` locations you can open directly. The index follows \
+                 the working tree automatically. Use grep only for an exact literal you \
+                 already know.",
                 self.config.root.display(),
-                self.manifest.num_docs,
+                if self.index.is_some() {
+                    format!("{} chunks", self.manifest.num_docs)
+                } else {
+                    "indexed on first call".to_string()
+                },
                 if self.manifest.embedded { "hybrid BM25 + CodeRankEmbed" } else { "BM25" },
             ),
         })
@@ -344,11 +371,23 @@ impl Server {
 
     /// Rebuild if the watcher saw a change since the last call.
     fn ensure_fresh(&mut self) -> anyhow::Result<()> {
+        // A session-leased watcher may be rebuilding right now; let it
+        // finish rather than race it for the writer lock.
+        crate::daemon::wait_for_idle(&self.config.index_dir, std::time::Duration::from_secs(20));
         let dirty = self.watcher.as_ref().is_some_and(|w| w.take_dirty());
-        if dirty {
+        if dirty || self.index.is_none() {
             self.rebuild()?;
+        } else if manifest_mtime(&self.config.index_dir) != self.manifest_mtime {
+            // Rebuilt by someone else: pick up their index.
+            self.manifest = Manifest::load(&self.config.index_dir)?;
+            self.index = Some(AnyIndex::open(&self.config.index_dir)?);
+            self.manifest_mtime = manifest_mtime(&self.config.index_dir);
         }
         Ok(())
+    }
+
+    fn index(&self) -> anyhow::Result<&AnyIndex> {
+        self.index.as_ref().context("index not built yet")
     }
 
     fn rebuild(&mut self) -> anyhow::Result<()> {
@@ -358,7 +397,8 @@ impl Server {
     fn rebuild_with(&mut self, retrain: bool) -> anyhow::Result<()> {
         self.manifest = self.indexer.build_with(retrain)?;
         // Reopen after the swap: the old handle still maps the retired files.
-        self.index = AnyIndex::open(&self.config.index_dir)?;
+        self.index = Some(AnyIndex::open(&self.config.index_dir)?);
+        self.manifest_mtime = manifest_mtime(&self.config.index_dir);
         self.rebuilds += 1;
         Ok(())
     }
@@ -395,6 +435,7 @@ impl Server {
         } else {
             top_k
         };
+        let started = std::time::Instant::now();
         let hits = self.retrieve(&query, fetch, mode)?;
         let hits: Vec<Hit> = hits
             .into_iter()
@@ -404,6 +445,23 @@ impl Server {
             })
             .take(top_k)
             .collect();
+        usagelog::record(&usagelog::UsageEvent {
+            ts: usagelog::now_secs(),
+            source: "mcp",
+            agent: usagelog::detect_agent(),
+            cwd: usagelog::cwd_string(),
+            root: usagelog::path_string(Some(&self.config.root)),
+            index_dir: self.config.index_dir.to_string_lossy().to_string(),
+            query: &query,
+            mode: mode
+                .map(str::to_string)
+                .unwrap_or_else(|| if self.manifest.embedded { "hybrid" } else { "lexical" }.to_string()),
+            top_k,
+            path_glob: path_glob.as_deref(),
+            n_hits: hits.len(),
+            took_ms: started.elapsed().as_secs_f64() * 1e3,
+            hits: hits.iter().map(|h| h.id.clone()).collect(),
+        });
 
         if hits.is_empty() {
             return Ok(format!(
@@ -425,7 +483,7 @@ impl Server {
             None => !self.manifest.embedded,
         };
         if lexical {
-            let outcome = self.index.search(query, k);
+            let outcome = self.index()?.search(query, k);
             return Ok(outcome
                 .results
                 .into_iter()
@@ -453,7 +511,7 @@ impl Server {
             _ => crate::query::RankMode::Hybrid,
         };
         let embedder = self.indexer.embedder()?;
-        let run = crate::query::run_ranked_with(&self.index, embedder, query, k, &opts)?;
+        let run = crate::query::run_ranked_with(self.index()?, embedder, query, k, &opts)?;
         Ok(run
             .results
             .into_iter()
@@ -488,15 +546,12 @@ impl Server {
                 hit.end_line
             ));
             if let Some(name) = &hit.name {
-                out.push_str(&format!("  ({name})"));
+                out.push_str(&format!("  {name}"));
             }
-            match hit.components {
-                Some((bm25, semantic)) => out.push_str(&format!(
-                    "\n   score {:.4}  bm25 {:.3}  semantic {:.3}\n",
-                    hit.score, bm25, semantic
-                )),
-                None => out.push_str(&format!("\n   score {:.4}\n", hit.score)),
-            }
+            out.push('\n');
+            // Scores are logged (usagelog) rather than shown: they are for
+            // tuning, not for deciding which hit to open.
+            let _ = (hit.score, hit.components);
             if include_snippet && rank < SNIPPET_HITS {
                 if let Some(snippet) =
                     repo::snippet_for(&self.config.root, &hit.id, SNIPPET_LINES)
@@ -566,6 +621,12 @@ impl Hit {
             components,
         })
     }
+}
+
+fn manifest_mtime(index_dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(index_dir.join(crate::codeindex::MANIFEST_FILE))
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 fn index_exists(dir: &Path) -> bool {

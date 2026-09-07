@@ -19,7 +19,7 @@ use anyhow::Context;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::nomic_bert::{l2_normalize, Config, NomicBertModel};
-use hf_hub::api::sync::Api;
+
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::embeddings::CODERANK_DIM;
@@ -108,8 +108,29 @@ impl Embedder {
     }
 
     pub fn load_for(kind: EmbedUse) -> anyhow::Result<Self> {
-        eprintln!("loading {MODEL_ID} via Candle (first run downloads ~550 MB)...");
-        let api = Api::new().context("huggingface hub client")?;
+        // Say something only when it matters: a first-run download is slow
+        // and network-bound, and its absence offline explains a failure.
+        // A cached load is routine and stays silent unless `-v`.
+        // `Cache::from_env` honours HF_HOME; `Api::new` does not (it always
+        // uses ~/.cache/huggingface). `ApiBuilder::from_env` uses the same
+        // cache (and HF_ENDPOINT), so the presence check and the download
+        // agree on one directory.
+        let cache = hf_hub::Cache::from_env();
+        let model_cache = cache.model(MODEL_ID.to_string());
+        let cached = ["config.json", "tokenizer.json", "model.safetensors"]
+            .iter()
+            .all(|f| model_cache.get(f).is_some());
+        if !cached {
+            eprintln!(
+                "downloading {MODEL_ID} (~550 MB, once) into {}...",
+                cache.path().display()
+            );
+        } else if crate::verbosity::verbose() {
+            eprintln!("loading {MODEL_ID} from cache");
+        }
+        let api = hf_hub::api::sync::ApiBuilder::from_env()
+            .build()
+            .context("huggingface hub client")?;
         let repo = api.model(MODEL_ID.to_string());
         let config_path = repo.get("config.json").context("download config.json")?;
         let tokenizer_path = repo
@@ -190,7 +211,9 @@ impl Embedder {
             )?;
             (Some(model), Some(device))
         } else {
-            eprintln!("CodeRankEmbed device: ANE (CoreML)");
+            if crate::verbosity::verbose() {
+                eprintln!("CodeRankEmbed device: ANE (CoreML)");
+            }
             (None, None)
         };
 
@@ -406,10 +429,12 @@ fn profile() -> bool {
 }
 
 fn cpu_device() -> (Device, DType) {
-    #[cfg(target_os = "macos")]
-    eprintln!("CodeRankEmbed device: CPU (F32, Accelerate)");
-    #[cfg(not(target_os = "macos"))]
-    eprintln!("CodeRankEmbed device: CPU (F32)");
+    if crate::verbosity::verbose() {
+        #[cfg(target_os = "macos")]
+        eprintln!("CodeRankEmbed device: CPU (F32, Accelerate)");
+        #[cfg(not(target_os = "macos"))]
+        eprintln!("CodeRankEmbed device: CPU (F32)");
+    }
     (Device::Cpu, DType::F32)
 }
 
@@ -418,7 +443,9 @@ fn metal_or_cpu() -> (Device, DType) {
     {
         match Device::new_metal(0) {
             Ok(device) => {
-                eprintln!("CodeRankEmbed device: Metal (F16)");
+                if crate::verbosity::verbose() {
+                    eprintln!("CodeRankEmbed device: Metal (F16)");
+                }
                 return (device, DType::F16);
             }
             Err(err) => eprintln!("Metal unavailable ({err}); falling back to CPU"),
