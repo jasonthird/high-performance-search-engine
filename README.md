@@ -1,37 +1,75 @@
-# High-Performance Search Engine
+# hips — a small search engine for agents
 
-A single-node **full-text search engine written in Rust from scratch** — no
-Tantivy, Lucene, or any other search-engine crate. It indexes
-JSONL documents into an inverted index and answers top-k queries with **BM25
-scoring executed by exact Block-Max WAND**, over **compressed
-(delta + bit-packed), memory-mapped posting lists** with optional
-**document reordering (recursive graph bisection)** for better compression.
+`hips` is a small, single-binary search engine that coding agents can use:
+point it at a repository (or any pile of documents and PDFs) and it gives
+Claude Code, Codex, OpenCode and friends a search tool that answers "where
+is this implemented?" with ranked `path:line` locations, keeps its index
+fresh in the background while they edit, and costs them a few lines of
+context per query. It ships as a CLI, an MCP server, and a Claude Code
+plugin, and needs no service, database, or Python at query time.
+
+Underneath is a **full-text search engine written in Rust from scratch** —
+no Tantivy, Lucene, or any other search-engine crate. It builds an inverted
+index and answers top-k queries with **BM25 scoring executed by exact
+Block-Max WAND**, over **compressed (delta + bit-packed), memory-mapped
+posting lists**, with optional **document reordering (recursive graph
+bisection)** for better compression; it scales from a repository to all of
+English Wikipedia on a laptop. The code-search layer walks a repository into
+declaration-sized chunks that keep their line numbers and adds
+**CodeRankEmbed vectors** (Candle, or CoreML on the Apple Neural Engine)
+for hybrid lexical + semantic retrieval.
 
 ```
 JSONL docs ──index──▶ inverted index + block metadata ──search──▶ exact BM25 top-k
                       (compressed, mmap'd, immutable)            (Block-Max WAND)
+
+source tree ──index-repo──▶ segments: postings + FP16 vectors ──search──▶ path:line hits
+             (gitignore-aware, chunked by declaration)   (BM25 + CodeRankEmbed)
 ```
 
-![Searching all of English Wikipedia (7.1M articles) in under a millisecond](demo.gif)
+![hips: hybrid code search over a repository, kept fresh by the background watcher — a file written moments earlier is already a hit, and a verbose query shows the 14 ms hybrid retrieval breakdown](demo.gif)
 
 The theory and original papers behind every algorithm used here are
 documented in [docs/THEORY.md](docs/THEORY.md).
 
 ## Status
 
-This is an educational and experimental search engine, not a production
-search service. It is useful for learning how modern lexical search works end
-to end: indexing, compression, memory-mapped storage, exact dynamic pruning,
-batch updates, benchmarking, and a small HTTP API.
+Small by design: one binary, an index directory under the user's cache, no
+daemon unless an agent session asks for the watcher. It is in daily use as
+the code-search tool this repository itself is developed with, and every
+measurement in this README was taken on the author's laptop. It is not a
+hosted search service — no clustering, no replication — and the engine
+half doubles as a readable, tested walk through how modern lexical search
+works end to end: indexing, compression, memory-mapped storage, exact
+dynamic pruning, batch updates, benchmarking, and a small HTTP API.
 
 ## Requirements
 
-- Rust stable, edition 2021.
-- Python 3 if you want to use the corpus helper scripts in `scripts/`.
-- macOS with Metal only if you build the optional `gpu` feature for
-  `--reorder bp-gpu`; the default build is CPU-only and portable.
+- Rust stable 1.89 or newer (the segmented writer and the watcher use
+  `std` file locks), edition 2021.
+- `--features semantic` for hybrid code search: pulls in Candle and the
+  tokenizers crate and downloads the ~550 MB CodeRankEmbed weights on first
+  use (into the Hugging Face cache). Off by default so the lexical engine
+  stays dependency-light.
+- macOS with Metal only for the optional `gpu` feature (`--reorder bp-gpu`)
+  and for the CoreML/Neural Engine encoder backend; the default build is
+  CPU-only and portable, and on Linux the encoder runs through Candle.
+- Python 3 for the corpus helper scripts in `scripts/`, and a Python
+  environment with coremltools to produce the CoreML models
+  (`scripts/ane-prototype/README.md`).
 
 ## Quick start
+
+Code search over a repository (the common case):
+
+```sh
+cargo install --path . --features semantic     # installs `hips`
+hips index-repo --root .                        # once; later runs are incremental
+hips search --root . --query "where do we validate auth tokens"
+hips status --root .                            # what is indexed, watcher, sessions
+```
+
+The lexical engine on a JSONL corpus:
 
 ```sh
 cargo test
@@ -55,22 +93,45 @@ cargo run --release -- repl --index ./index --top-k 10
 
 ## Project layout
 
-- `src/cli.rs` - command routing for `index`, `index-repo`, `search`, `mcp`,
-  `repl`, `serve`, `bench`, `add`, `delete`, `merge`, and `migrate`.
-- `src/indexer.rs`, `src/postings.rs`, `src/compress.rs` - JSONL ingestion,
-  inverted-index construction, block metadata, and bit-packed postings.
+- `src/cli.rs` - command routing: `index`, `search`, `repl`, `serve`,
+  `bench`, `add`, `delete`, `merge`, `migrate` for the engine; `index-repo`,
+  `mcp`, `watch`, `session`, `status`, `eval-gen`, `eval-code`, `embed` for
+  code search. `src/query.rs` is the ranking facade the CLI, REPL, MCP
+  server and evals share.
+- `src/tokenizer.rs`, `src/indexer.rs`, `src/postings.rs`,
+  `src/compress.rs` - tokenization (plain and code-aware), inverted-index
+  construction, block metadata, and bit-packed postings.
 - `src/searcher.rs`, `src/block_max_wand.rs`, `src/maxscore.rs`,
-  `src/bm25.rs` - exact BM25 top-k query execution.
-- `src/storage.rs`, `src/segments.rs`, `src/external.rs` - on-disk format,
-  memory mapping, segmented updates, and sharded external builds.
+  `src/bm25.rs`, `src/spell.rs` - exact BM25 top-k query execution and
+  query spelling correction.
+- `src/storage.rs`, `src/segments.rs`, `src/external.rs`, `src/migrate.rs` -
+  on-disk format, memory mapping, segmented updates, sharded external
+  builds, and format migration.
+- `src/reorder.rs`, `src/reorder/gpu.rs` - document reordering (BP on CPU,
+  zero-copy Metal behind `--features gpu`).
 - `src/api.rs` - Axum HTTP API.
+- `src/embedder.rs`, `src/coreml.rs`, `src/embeddings.rs`, `src/embcache.rs`,
+  `src/ivf.rs`, `src/pq.rs`, `src/hybrid.rs` - CodeRankEmbed inference
+  (Candle; CoreML/ANE on macOS), FP16 vector storage and scoring, the
+  content-keyed embedding cache, IVF/PQ, and score fusion.
 - `src/repo.rs`, `src/codeindex.rs` - source-tree ingestion: gitignore-aware
-  walking, declaration chunking with line numbers, and atomic rebuilds.
-- `src/mcp.rs`, `src/watch.rs`, `src/embcache.rs` - MCP server over stdio,
-  filesystem watching, and the content-keyed embedding cache.
+  walking, declaration chunking with line numbers, PDF pages, and
+  incremental segmented rebuilds.
+- `src/watch.rs`, `src/daemon.rs`, `src/mcp.rs`, `src/usagelog.rs` -
+  filesystem watching, the session-leased background watcher, the MCP
+  server over stdio, and the search usage log.
+- `src/eval.rs` - CodeSearchNet-style eval generation and recall metrics.
+- `skills/hips/`, `plugin/hips/`, `.claude-plugin/` - the agent skill, the
+  Claude Code plugin (skill + hooks + MCP registration), and the plugin
+  marketplace manifest.
+- `scripts/` - corpus converters (CirrusSearch dumps, directory crawls) and
+  the CoreML conversion of CodeRankEmbed (`scripts/ane-prototype/`).
+- `examples/` - micro-benchmarks and equivalence checks behind the numbers
+  in this README (`pq_scoring_bench`, `bucket_equiv`, `embed_bench`, ...).
 - `docs/THEORY.md` - algorithm notes and paper references.
-- `tests/` - correctness checks against naive BM25 oracles and persistence
-  tests.
+- `tests/` - Block-Max WAND vs naive-BM25 oracles, persistence and
+  reordering, external builds, segmented indexes, the repo lifecycle, the
+  MCP transport, and the background watcher.
 
 ## What this engine does
 
@@ -353,16 +414,36 @@ And on a 108k-document corpus (a crawled home directory, 679 MB of text,
 | Index size | 104 MB total (32 MB postings = 1.67 B/posting, 25 MB metadata, 46 MB doc store) |
 | Index load | ~20 ms; search process RSS ~43 MB (postings + docs mmap'd) |
 
-### Experimental: hybrid code search (BM25 + CodeRankEmbed)
+### Hybrid retrieval: BM25 + CodeRankEmbed
 
-The lexical engine is unchanged. Behind `--features semantic` you can
-precompute one [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed)
-vector per document (Candle on Metal/CPU, no Python) and rerank the BM25 candidate
-list. `--mode hybrid` is **embedding-first**: the encoder probes `ivf.bin`
-cluster posting lists (same inverted-file layout and `doc_id`s as BM25),
-then BM25 is a helper on the union. `--nprobe` controls how many
-clusters to open. `--mode rerank` is BM25-then-cosine. `--mode semantic`
-is encoder-only through IVF (full scan if `ivf.bin` is missing).
+The lexical engine is unchanged. Behind `--features semantic` the index
+also holds one [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed)
+vector per document, and `--mode hybrid` (the default on `search`) is
+**embedding-first**: the encoder's candidates are fused with BM25's.
+`--mode rerank` is BM25-then-cosine, `--mode semantic` is encoder-only,
+`--mode bm25` (or `--lexical`) is the plain engine. On a single-layout
+index built with `index --embed` the encoder probes `ivf.bin` cluster
+posting lists (same inverted-file layout and `doc_id`s as BM25; `--nprobe`
+controls how many clusters to open); on the segmented indexes that
+`index-repo` builds, vectors are scored exactly per segment (see below for
+why exact wins at repository scale).
+
+Inference runs in-process, no Python at query time. Two backends:
+
+- **Candle** (`src/embedder.rs`): NomicBert on Metal, CUDA-less CPU, or
+  Accelerate; portable, and the only backend off macOS. A Candle fork with
+  a fused Metal SDPA kernel in NomicBert attention is patched in
+  (`Cargo.toml`), 1.7x faster document encoding at sequence 512.
+- **CoreML on the Apple Neural Engine** (`src/coreml.rs`): the same weights
+  compiled to static-shape models (batch-8 document models at sequence
+  64/128/256/512, a batch-1 query model) under `<cache>/coreml/`, produced
+  by `scripts/ane-prototype/ane_convert.py`. Used automatically when the
+  compiled models exist; `HIPS_ENCODER=candle` forces the fallback.
+  Measured on an M3: 25.4k tok/s vs Candle/Metal's 6.3k for document
+  batches, an 810-chunk cold index in 13.0 s instead of 28.6 s, a hybrid
+  query in 0.10 s wall including model load, and embeddings within mean
+  cosine 0.99968 of the fp32 reference — mixed Candle/CoreML caches are
+  retrieval-safe.
 
 ```sh
 cargo build --release --features semantic
@@ -400,13 +481,15 @@ To index a real source tree, use `index-repo` (below) rather than
 `scripts/code_to_jsonl.py` — the script is kept only for reproducing the
 eval corpus, and its ids carry no line numbers.
 
-### Code search in a codebase: `index-repo` and the MCP server
+### Code search in a codebase: `index-repo`
 
 `index-repo` walks a repository the way git does — honouring nested
-`.gitignore` files, skipping `target/`, `node_modules/`, symlinks, and
-non-source files — and splits each file into declaration-sized chunks that
-**keep their line numbers**. A document id is therefore a location:
-`src/searcher.rs:120-165`.
+`.gitignore` files, the user's global excludes file and `.git/info/exclude`,
+skipping hidden directories, `target/`, `node_modules/`, symlinks, and
+non-source files (about 40 source extensions plus `.md`, `.toml`, `.yaml`
+and `.pdf` are indexed) — and splits each file into declaration-sized
+chunks that **keep their line numbers**. A document id is therefore a
+location: `src/searcher.rs:120-165`.
 
 ```sh
 cargo build --release --features semantic
@@ -426,38 +509,201 @@ Search it without knowing where the index went — `--root` resolves to the
 same per-repo location `index-repo` used:
 
 ```sh
-hips search --root . --query "where do we validate auth tokens" --mode hybrid
+hips search --root . --query "where do we validate auth tokens"
+hips search --root . --query "where do we validate auth tokens" --json   # JSONL, one hit per line
+hips search --root . --query "verify_bearer" --lexical                    # BM25 only, no encoder
 ```
 
-`hips mcp` serves that index to an MCP client over stdio, exposing three
-tools: `search_code` (ranked chunks with `path:line` locations, an optional
-`path_glob`, and fenced snippets), `index_status`, and `reindex`.
+The default output is one hit per line, location then declaration name, and
+nothing else, so an agent reading it pays for only what it needs:
+
+```
+src/auth/token.rs:88-140     verify_bearer
+src/auth/mod.rs:12-40        AuthLayer
+```
+
+Encoder loading is silent when the model is cached. It prints a line only
+when it is actually downloading (first run, ~550 MB) or when it cannot be
+loaded at all (offline with an empty cache), in which case the search
+degrades to BM25 with a `note:` explaining that. Pass `-v` for the old
+verbose output: scores, per-stage timing, WAND stats, device and cache
+lines.
+
+PDFs under the tree are indexed too: each page's extracted text becomes a
+chunk named `report.pdf::page 7`, so design docs and papers checked into a
+repo are searchable alongside the code. Encrypted or malformed PDFs are
+skipped with a warning, never fatal.
+
+Every `hips search` and MCP `search_code` call appends one JSON line
+(timestamp, calling agent, root, query, mode, hit ids, latency) to
+`~/.cache/csearch/usage.jsonl`, for offline analysis of how agents actually
+use the tool. `HIPS_NO_LOG=1` disables it.
+
+### Installing for agents
+
+Agents get hips two ways, and both are wired up by one install: the CLI,
+which a skill teaches them to run (`hips search --root . --query ...`), and
+the MCP server, for clients that prefer tools over shell. The repo doubles
+as a Claude Code plugin marketplace; the plugin gives Claude Code the `hips`
+skill, a keyword-gated routing hint on code-navigation prompts (also
+injected into subagents, which do not reliably see CLAUDE.md), a background
+watcher that indexes the repository when a session opens and keeps the index
+fresh until the last session on it closes, and the MCP server:
 
 ```sh
-# Register with Claude Code, scoped to the current project:
-claude mcp add hips -- hips mcp --root "$PWD"
+claude plugin marketplace add /path/to/this/repo   # or the GitHub URL
+claude plugin install hips@hips -s user
+```
+
+The plugin costs about 200 always-on tokens per session (the skill line plus
+one SessionStart note saying the index is handled); the hint fires only on
+prompts containing words like "where", "find", "how does", "which file".
+
+#### Always fresh: the session-leased watcher
+
+An agent should never have to think about indexing, and several agents may
+have the same repository open at once. The plugin's `SessionStart` hook runs
+`hips session start`, which
+
+- resolves the enclosing git work tree of the session's cwd (a session
+  opened in `$HOME` or another non-repository directory is left alone
+  unless `HIPS_WATCH_ANY_DIR=1`),
+- writes a **lease** for the session under `~/.cache/csearch/watch/<index>/leases/`
+  holding the session id and the pid of the Claude Code process,
+- starts `hips watch --leased` for that repository if none is running
+  (the watcher holds a `flock`, so a second session attaches instead of
+  starting a second process), and
+- answers the hook with one line of context telling the agent the index is
+  handled.
+
+The watcher builds the index if it is missing, then rebuilds after each burst
+of relevant filesystem events (300 ms quiet), incrementally: only changed
+files are re-chunked and re-encoded. `SessionEnd` runs `hips session end`,
+which drops the lease; the watcher exits 20 s after the last live lease goes
+(long enough to survive `/clear` and a quick restart). A lease whose pid is
+dead — a killed or crashed session — is reaped, so nothing is pinned forever,
+and after five idle minutes the watcher unloads the encoder, so an idle
+watcher costs a few megabytes rather than the model's memory.
+
+Searches stay consistent with edits without any coordination on the agent's
+side: `hips search` reads the watcher's status file and waits (bounded, 20 s)
+for a rebuild in flight before answering, and a search issued while the very
+first build is running waits up to 10 s for it. Measured on this repository
+(1.1k chunks, M3): `session start` returns in 30 ms; a save is noticed within
+120 ms and re-indexed in 20-170 ms with the encoder resident (3-5 s the first
+time a fresh process encodes, which is Neural Engine plan loading); the idle
+watcher is 11 MB without the encoder and 325 MB with it. A manual `hips index-repo`
+racing the watcher waits on the index's `writer.lock` instead of failing;
+whichever runs second finds the tree fingerprint current and does nothing.
+
+```sh
+hips status --root .        # index size, watcher state, sessions holding it
+hips session list --root .  # leases and whether their pids are alive
+hips watch --root .         # run a watcher by hand (foreground, Ctrl-C stops)
+hips watch --root . --stop  # stop the running one regardless of leases
+```
+
+The watcher's log is `~/.cache/csearch/watch/<index>/watch.log`.
+`HIPS_WATCH_LEXICAL=1` in the agent's environment makes session-started
+watchers build lexical-only indexes (no model). The same `session start` /
+`session end` pair works for any other agent or editor that can run a
+command on open and close; `--id` names the session and `--pid` the process
+whose exit should release it.
+
+Because the watcher indexes the git work tree, `hips search --root .` from a
+subdirectory of an indexed repository resolves to the repository's index and
+prints hit paths relative to that subdirectory.
+
+For OpenCode, Codex and any other agent that reads `~/.agents/skills`:
+
+```sh
+cp -r skills/hips ~/.agents/skills/hips
+ln -s ../../../.agents/skills/hips ~/.config/opencode/skills/hips   # OpenCode
+```
+
+`skills/hips/SKILL.md` is the source of truth; `plugin/hips/skills/hips/`
+is a copy that must be kept in sync. Agents without a skill mechanism get
+the same policy as a few lines in their instructions file (`AGENTS.md`,
+`CLAUDE.md`): search with hips before grep for any where-is-it or
+how-does-it-work question. Tested in non-interactive runs on this
+repository with no mention of hips in the prompt, Claude Code and Codex
+both open with a hips search (Claude alternates between the CLI and the MCP
+tool; Codex reads the skill and uses the CLI) and grep appears only to
+confirm hits.
+
+The plugin also registers the MCP server. `hips mcp` serves the same index
+over stdio, exposing three tools: `search_code` (ranked chunks with
+`path:line` locations, an optional `path_glob`, and fenced snippets),
+`index_status`, and `reindex`. With no `--root` it serves the git work tree
+enclosing the directory the client started it in, the same tree the watcher
+covers; it waits out a watcher rebuild in flight and reopens the index
+whenever another process (the watcher, another agent) has rebuilt it.
+
+```sh
+# Register by hand instead of through the plugin:
+claude mcp add hips -s user -- hips mcp
+```
+
+Codex (`~/.codex/config.toml`), OpenCode (`opencode.json`), Copilot CLI
+(`~/.copilot/mcp-config.json`), Antigravity and Grok take the same
+`hips mcp` command in their own MCP config formats:
+
+```toml
+# ~/.codex/config.toml (Grok: ~/.grok/config.toml, same shape)
+[mcp_servers.hips]
+command = "hips"
+args = ["mcp"]
 ```
 
 ```jsonc
-// ...or by hand, in an MCP client config:
-{
-  "mcpServers": {
-    "hips": {
-      "command": "hips",
-      "args": ["mcp", "--root", "/path/to/repo"]
-    }
-  }
-}
+// Copilot CLI ~/.copilot/mcp-config.json, Antigravity mcp_config.json
+{ "mcpServers": { "hips": { "command": "hips", "args": ["mcp"] } } }
+// OpenCode ~/.config/opencode/opencode.json
+{ "mcp": { "hips": { "type": "local", "command": ["hips", "mcp"], "enabled": true } } }
 ```
 
-**Staying fresh.** The server watches the tree (FSEvents / inotify) and marks
-it dirty on any change to an indexable file; the *next* tool call rebuilds
-before answering. Rebuilding rather than appending a segment is forced by the
-layout: `embeddings.bin` is keyed positionally by `doc_id`, and a rebuild
-reassigns every `doc_id`.
+Add `"--root", "/path/to/repo"` to pin a server to one repository. The
+server watches the tree itself (FSEvents / inotify) and rebuilds on the
+next tool call after a change, so it stays fresh with or without the
+session watcher. Note for Codex: its read-only shell sandbox lets `hips
+search` run but silently drops the usage-log write; searches through the
+MCP server, which runs outside the sandbox, are logged.
 
-Three caches make a rebuild proportional to the edit rather than to the
-repository:
+### How rebuilds stay proportional to the edit
+
+**Segmented layout (the default).** `index-repo`, the watcher and `mcp`
+use the same Lucene-style segment layout the lexical engine already used
+for `add`/`delete`/`merge`, extended to vectors: each segment carries its
+own `embeddings.bin` plus a `keys.bin` of content-cache keys. An edit
+tombstones the stale chunks (the manifest remembers which chunk ids each
+file produced), appends the changed chunks as one new segment, and encodes
+only those; a compaction merge runs past `codeindex::MAX_SEGMENTS` and
+rebuilds the merged segment's vectors from the cache by key — no
+re-encoding. A byte-identical tree is detected from a fingerprint of the
+walked file list (path, size, mtime), so an up-to-date rebuild costs only
+the walk. Semantic scoring is exact brute-force per segment (no IVF/PQ).
+Measured:
+
+```
+                                387k chunks (lexical)   this repo (embedded)
+first build                            3.8 s            13 s CoreML / ~42 s Candle
+one-file edit -> reindexed             0.15 s                 0.20 s
+  (non-segmented rebuild)             (2.4 s+)                  --
+```
+
+The 0.15 s is dominated by walking the tree (0.11 s); the index work itself
+is milliseconds. `tests/segmented_repo.rs` covers the lifecycle: edits,
+line-shift renames, file deletion, and merge-with-vector-rebuild. An index
+built with the old single layout migrates automatically on the next
+`index-repo` (its content cache is kept, so migration re-encodes nothing
+unchanged). Writers are serialized by `writer.lock`; a rebuild that finds
+the lock held waits for the other writer instead of failing.
+`CSEARCH_TIMING=1` prints the per-phase breakdown of any rebuild.
+
+**Single layout (`--single`, legacy).** One index directory with a
+positionally keyed `embeddings.bin` plus IVF/PQ, rebuilt as a whole and
+swapped in atomically from a staging directory. Three caches keep even that
+proportional to the edit:
 
 - **Vectors.** `embcache.bin` keys FP16 embeddings by a hash of the chunk
   text, so only chunks whose content changed are re-encoded. Encoding
@@ -477,8 +723,9 @@ repository:
   (`--retrain`, or `reindex` with `{"retrain": true}`).
 - **Chunking.** Files are read and split in parallel across cores.
 
-Measured on this repository (812 chunks, 46 files) and on the whole crates.io
-source cache (358k chunks, 15k files) — Apple M-series, 8 cores:
+Measured with the Candle encoder on this repository (812 chunks, 46 files)
+and on the whole crates.io source cache (358k chunks, 15k files) — Apple
+M-series, 8 cores:
 
 ```
                                         this repo     crates.io cache
@@ -488,20 +735,13 @@ edit -> next query, in-server            55-95 ms              --
 steady-state hybrid query                   11 ms              --
 ```
 
-A byte-identical tree is detected from a fingerprint of the walked file
-list (path, size, mtime) stored in the manifest, so an up-to-date rebuild
-costs only the walk — 0.30 s even at 387k chunks.
-
 The 55-95 ms is everything: watcher wakeup, re-chunking the tree, encoding
 the one changed chunk on the GPU, re-quantizing it, rewriting the index, and
 running the search. Before the quantizer was made reusable this was ~1.1 s,
-essentially all of it retraining quantizers over unchanged data.
-
-When a file *did* change, the crates.io-scale rebuild still re-tokenizes
-every chunk (~1.7 s of the build), which a single-index layout has to redo
-in full; that is the price of keeping `embeddings.bin` positionally keyed.
-Real single repos sit at the left-hand column. `CSEARCH_TIMING=1` prints
-the per-phase breakdown.
+essentially all of it retraining quantizers over unchanged data. What the
+single layout cannot avoid is re-tokenizing every chunk when a file did
+change (~1.7 s at crates.io scale), the price of a positionally keyed
+`embeddings.bin` — which is why the segmented layout became the default.
 
 **Retrieval quality is measured, not assumed.** `eval-gen` mines a
 CodeSearchNet-style benchmark from any repo's doc comments (query = the
@@ -526,31 +766,6 @@ vectorized FP16 scoring of every vector costs ~16 ms. `pq.bin` is still
 built: its codebooks drive the incremental-rebuild cache, and `PqMode::Force`
 keeps ADC available for benchmarks.
 
-**Segmented layout: O(edit) reindex (the default).** `index-repo` and
-`mcp` use the same Lucene-style segment layout the lexical engine already used for `add`/`delete`/`merge`,
-now extended to vectors: each segment carries its own `embeddings.bin` plus
-a `keys.bin` of content-cache keys. An edit tombstones the stale chunks
-(the manifest remembers which chunk ids each file produced), appends the
-changed chunks as one new segment, and encodes only those; a compaction
-merge runs past `codeindex::MAX_SEGMENTS` and rebuilds the merged segment's
-vectors from the cache by key — no re-encoding. Semantic scoring is exact
-brute-force per segment (no IVF/PQ; see the measurements below for why
-exact wins at repo scale). Measured:
-
-```
-                                387k chunks (lexical)   this repo (embedded)
-first build                            3.8 s                  ~42 s
-one-file edit -> reindexed             0.15 s                 0.20 s
-  (non-segmented rebuild)             (2.4 s+)                  --
-```
-
-The 0.15 s is dominated by walking the tree (0.11 s); the index work itself
-is milliseconds. `tests/segmented_repo.rs` covers the lifecycle: edits,
-line-shift renames, file deletion, and merge-with-vector-rebuild. An index
-built with the old single layout migrates automatically on the next
-`index-repo` (its content cache is kept, so migration re-encodes nothing
-unchanged); `--single` keeps the legacy rebuild-the-world path available.
-
 **Scoring path.** Product quantization is enabled per query rather than
 always-on, because it is a fixed cost (building `M x 256` lookup tables)
 plus almost nothing per document, while exact scoring is a per-document dot
@@ -572,11 +787,10 @@ nothing). A query's candidate count is estimated from the
 IVF geometry, `num_docs * nprobe / num_clusters`, which puts the switch-over
 around 20k chunks at the default `nprobe`. `--no-pq` forces exact scoring.
 
-Deferring the rebuild to query time also means a burst of edits (a branch
-switch, a formatter run) costs one rebuild rather than one per file, and
-keeps the encoder on the thread whose Metal pipelines are already warm.
-Rebuilds are atomic: the new index is staged in a sibling directory and
-swapped in, so a concurrent reader never sees it half-written.
+Both the MCP server (rebuild on the next call) and the watcher (rebuild
+after 300 ms of quiet) coalesce a burst of edits — a branch switch, a
+formatter run — into one rebuild rather than one per file, and keep the
+encoder on the thread whose pipelines are already warm.
 
 ### Run the tests
 
@@ -585,11 +799,18 @@ cargo test
 ```
 
 The test suite includes unit tests for the tokenizer, BM25 math, index
-construction, block construction (including the upper-bound invariant), and
-the top-k heap — plus integration tests asserting Block-Max WAND returns the
-same top-k as the naive BM25 oracle on handcrafted and pseudo-random corpora,
-that blocks are skipped once the threshold is high, and that selective
-queries do not scan all documents.
+construction, block construction (including the upper-bound invariant), the
+top-k heap, the watcher's lease and hook-payload handling — plus integration
+tests asserting Block-Max WAND returns the same top-k as the naive BM25
+oracle on handcrafted and pseudo-random corpora, that blocks are skipped
+once the threshold is high, that selective queries do not scan all
+documents, that segmented and external builds persist and migrate, that the
+repo lifecycle (edits, renames, deletions, merges) keeps line numbers right,
+that the MCP server speaks JSON-RPC over a pipe, and that a leased watcher
+follows edits, is shared by two sessions, and exits with the last one.
+Everything that touches the encoder runs lexically in tests, so no model
+download is needed; `cargo test --features semantic` exercises the
+semantic build as well.
 
 ## Debug counters
 
@@ -616,12 +837,14 @@ Low `num_docs_scored` relative to `num_docs_total`, and high
 - Ties are broken deterministically by (score desc, doc_id asc).
 - Persistence: metadata via serde + bincode (`meta.bin`), postings as
   compressed blocks (`postings.bin`, memory-mapped at load).
-- `unsafe` is confined to two audited areas: the `mmap` call in storage
-  (standard accepted risk, same as Lucene's MMapDirectory) and, behind the
-  `gpu` feature, the zero-copy Metal interop in
-  `src/reorder/gpu.rs` (page-aligned shared allocations, no-copy buffer
-  wrapping, and disjoint parallel writes — each with its invariant
-  documented at the call site).
+- `unsafe` is confined to audited areas, each with its invariant documented
+  at the call site: the `mmap` call in storage (standard accepted risk,
+  same as Lucene's MMapDirectory); the NEON f16 dot product in
+  `src/embeddings.rs`; the CoreML bindings in `src/coreml.rs` (objc2);
+  the watcher's `setsid`, `kill(pid, 0)` liveness probes and signal
+  handlers in `src/daemon.rs` (libc); and, behind the `gpu` feature, the
+  zero-copy Metal interop in `src/reorder/gpu.rs` (page-aligned shared
+  allocations, no-copy buffer wrapping, and disjoint parallel writes).
 
 ### Incremental updates (segmented indexes)
 
@@ -664,9 +887,10 @@ What this engine deliberately does not do:
 - no autocomplete
 - no aggregations
 - no advanced analyzers (no stemming, no synonyms, no language-specific analysis)
-- no distributed vector search / HNSW (an optional encoder-first hybrid
-  — CodeRankEmbed + IVF cluster postings + PQ, same `doc_id`s as BM25 —
-  lives behind `--features semantic`; it is not a vector database)
+- no distributed vector search / HNSW (the optional encoder-first hybrid
+  behind `--features semantic` — CodeRankEmbed vectors scored exactly per
+  segment, or through IVF cluster postings + PQ on single-layout indexes —
+  is sized for repositories, not a vector database)
 - no highlighting
 - no relevance tuning beyond BM25
 
