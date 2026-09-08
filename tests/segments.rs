@@ -392,3 +392,69 @@ fn orphan_segments_are_garbage_collected() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn failed_sidecar_preparation_preserves_published_documents() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, false, 1).unwrap();
+    let old = InputDoc { id: "file.rs:1-4".into(), title: "old".into(), body: "original permission".into() };
+    writer.add_documents(&[old.clone()]).unwrap();
+    let before = std::fs::read(dir.join("manifest.bin")).unwrap();
+    let replacement = InputDoc { body: "updated permission".into(), ..old.clone() };
+    let error = writer.upsert_documents_prepared(&[replacement.clone()], &[old.id.clone()], |pending, _| {
+        assert!(pending.join("meta.bin").exists());
+        let published = SegmentedIndex::open(dir)?;
+        assert_eq!(published.num_segments(), 1);
+        assert_eq!(published.num_docs_live(), 1);
+        Err(anyhow::Error::new(std::io::Error::from_raw_os_error(28))
+            .context("injected embedding cache write failure"))
+    }).err().expect("preparation must fail");
+    assert!(error.to_string().contains("embedding cache write failure"));
+    assert!(format!("{error:#}").contains("No space left on device"));
+    assert_eq!(std::fs::read(dir.join("manifest.bin")).unwrap(), before);
+    drop(writer);
+    let mut writer = SegmentedWriter::open_or_create(dir, false, 1).unwrap();
+    let published = SegmentedIndex::open(dir).unwrap();
+    assert_eq!(published.num_docs_live(), 1);
+    assert_eq!(published.doc_summary_in(0, 0).title, "old");
+    writer.upsert_documents_prepared(&[replacement], &[old.id], |pending, _| {
+        std::fs::write(pending.join("keys.bin"), 1u64.to_le_bytes())?;
+        Ok(())
+    }).unwrap();
+    let published = SegmentedIndex::open(dir).unwrap();
+    assert_eq!(published.num_docs_live(), 1);
+    assert!(dir.join(published.segment_names().last().unwrap()).join("keys.bin").exists());
+}
+
+#[test]
+fn failed_merge_sidecars_preserve_source_segments() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, false, 1).unwrap();
+    for i in 0..2 {
+        writer.add_documents(&[InputDoc { id: format!("file{i}.rs:1-4"), title: "permission".into(), body: "validation".into() }]).unwrap();
+    }
+    let before = std::fs::read(dir.join("manifest.bin")).unwrap();
+    let names = SegmentedIndex::open(dir).unwrap().segment_names();
+    let error = writer.merge_all_prepared(|pending| {
+        assert!(pending.join("meta.bin").exists());
+        assert_eq!(SegmentedIndex::open(dir)?.num_segments(), 2);
+        Err(anyhow::Error::new(std::io::Error::from_raw_os_error(28))
+            .context("injected merged vector write failure"))
+    }).unwrap_err();
+    assert!(error.to_string().contains("merged vector write failure"));
+    assert!(format!("{error:#}").contains("No space left on device"));
+    assert_eq!(std::fs::read(dir.join("manifest.bin")).unwrap(), before);
+    assert!(names.iter().all(|name| dir.join(name).is_dir()));
+    drop(writer);
+    let mut writer = SegmentedWriter::open_or_create(dir, false, 1).unwrap();
+    writer.merge_all_prepared(|pending| {
+        std::fs::write(pending.join("keys.bin"), [0u8; 16])?;
+        Ok(())
+    }).unwrap();
+    let merged = SegmentedIndex::open(dir).unwrap();
+    assert_eq!(merged.num_docs_live(), 2);
+    assert_eq!(merged.num_segments(), 1);
+    assert!(dir.join(&merged.segment_names()[0]).join("keys.bin").exists());
+}

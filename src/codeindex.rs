@@ -1,16 +1,13 @@
 //! Repository indexing: turn a source tree into a searchable index directory,
 //! rebuilding cheaply when files change.
 //!
-//! Hybrid retrieval requires a single (non-segmented) index, because
-//! `embeddings.bin` is keyed positionally by inverted-index `doc_id`. So a
-//! change to the tree is handled by rebuilding the whole index rather than by
-//! appending a segment. That is affordable because the expensive half —
-//! CodeRankEmbed inference — is served from [`crate::embcache`], keyed by
-//! chunk content: only chunks whose text actually changed are re-encoded.
+//! Segmented builds encode changed chunks into a new immutable segment.
+//! Each segment's vector and key sidecars are complete before publication;
+//! CodeRankEmbed inference is reused through the content-keyed embedding cache.
 //!
-//! Rebuilds are atomic: the new index is assembled in a sibling temp
-//! directory and swapped in, so a concurrently open index is never observed
-//! half-written.
+//! Single-layout builds use a sibling staging directory. Segmented builds
+//! retain a recovery marker until the repository inventory is committed,
+//! and reconcile interrupted publications against the live segment rows.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -96,7 +93,10 @@ impl Manifest {
 
     fn save(&self, index_dir: &Path) -> anyhow::Result<()> {
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(index_dir.join(MANIFEST_FILE), text)?;
+        let temporary = index_dir.join("repo.json.tmp");
+        std::fs::write(&temporary, text).context("write repository inventory")?;
+        std::fs::rename(&temporary, index_dir.join(MANIFEST_FILE))
+            .context("publish repository inventory")?;
         Ok(())
     }
 }
@@ -362,6 +362,11 @@ impl RepoIndexer {
         self.build_with(self.opts.retrain)
     }
 
+    /// A prior writer stopped before publishing the repository inventory.
+    pub fn recovery_pending(&self) -> bool {
+        self.index_dir.join("build.pending").exists()
+    }
+
     fn invalid_embedding_ids(&self) -> anyhow::Result<Vec<String>> {
         if !self.opts.embed || !self.index_dir.join("repo.json").exists() {
             return Ok(Vec::new());
@@ -470,12 +475,35 @@ impl RepoIndexer {
 
         let start = Instant::now();
         let mut timer = PhaseTimer::new();
+        // Read the inventory and live rows under the same writer lock used
+        // for publication; a queued rebuild must not diff an older snapshot.
+        let writer = if !self.index_dir.join("meta.bin").exists()
+            || crate::segments::is_segmented(&self.index_dir) {
+            Some(self.open_writer_waiting(WRITER_WAIT)?)
+        } else { None }; // legacy single-layout migration below
         let files = repo::walk(&self.root)?;
         timer.mark("walk");
         let tree_fingerprint = repo::fingerprint(&files);
         let previous = Manifest::load(&self.index_dir).ok();
-        let merge_pending = crate::segments::SegmentedIndex::open(&self.index_dir)
-            .is_ok_and(|s| s.num_segments() > MAX_SEGMENTS);
+        let segments = if crate::segments::is_segmented(&self.index_dir) {
+            Some(crate::segments::SegmentedIndex::open(&self.index_dir)?)
+        } else { None };
+        let merge_pending = segments.as_ref().is_some_and(|s| s.num_segments() > MAX_SEGMENTS);
+        let mut live_ids = HashSet::new();
+        if let Some(index) = &segments {
+            for si in 0..index.num_segments() {
+                for id in 0..index.num_docs_in(si) {
+                    if index.is_live(si, id) { live_ids.insert(index.doc_summary_in(si, id).id); }
+                }
+            }
+        }
+        let recorded_ids: HashSet<String> = previous.as_ref().into_iter()
+            .flat_map(|m| &m.files).flat_map(|f| f.chunk_ids.iter().cloned()).collect();
+        let reconcile_files: HashSet<String> = live_ids.symmetric_difference(&recorded_ids)
+            .filter_map(|id| repo::parse_id(id).map(|(path, _, _)| path.to_owned())).collect();
+        if !reconcile_files.is_empty() {
+            self.log(format!("reconciling {} files after an incomplete index publication", reconcile_files.len()));
+        }
         let repair_ids = self.invalid_embedding_ids()?;
         let repair_files: HashSet<&str> = repair_ids.iter()
             .filter_map(|id| repo::parse_id(id).map(|(path, _, _)| path)).collect();
@@ -493,6 +521,8 @@ impl RepoIndexer {
                 && !rechunk
                 && repair_ids.is_empty()
                 && !merge_pending
+                && reconcile_files.is_empty()
+                && !self.recovery_pending()
             {
                 self.log(format!(
                     "index up to date ({} chunks, fingerprint unchanged)",
@@ -513,21 +543,12 @@ impl RepoIndexer {
         let current: HashSet<&str> = files.iter().map(|f| f.rel.as_str()).collect();
         for file in &files {
             match prev_files.get(file.rel.as_str()) {
-                Some(prev) if !rechunk && !repair_files.contains(file.rel.as_str()) && prev.len == file.len && prev.mtime_ns == file.mtime_ns => {
+                Some(prev) if !rechunk && !repair_files.contains(file.rel.as_str()) && !reconcile_files.contains(&file.rel) && prev.len == file.len && prev.mtime_ns == file.mtime_ns => {
                     records.push((*prev).clone());
                 }
                 _ => changed.push(file),
             }
         }
-        let removed: Vec<&FileRecord> = previous
-            .as_ref()
-            .map(|m| {
-                m.files
-                    .iter()
-                    .filter(|f| !current.contains(f.path.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default();
         timer.mark("diff");
 
         // Chunk only the changed files.
@@ -562,7 +583,14 @@ impl RepoIndexer {
         // `index-repo`) may hold the index. Its rebuild is incremental and
         // short, so wait for it rather than fail; whoever runs second
         // usually finds the tree fingerprint already current.
-        let mut writer = self.open_writer_waiting(WRITER_WAIT)?;
+        let mut writer = match writer {
+            Some(writer) => writer,
+            None => self.open_writer_waiting(WRITER_WAIT)?,
+        };
+        // Retain this marker on every error. A restarted MCP must retry even
+        // when no new filesystem event arrives and all remaining vectors are valid.
+        std::fs::write(self.index_dir.join("build.pending"), b"segmented build in progress\n")
+            .context("record pending index publication")?;
         // 1. Tombstone chunks that no longer exist: every id a removed file
         //    had, and every id of a changed file that its new chunking no
         //    longer produces (line shifts rename ids).
@@ -570,17 +598,18 @@ impl RepoIndexer {
         // unchanged; ordinary upsert would otherwise retain the corrupt row.
         let mut stale: Vec<String> = repair_ids.clone();
         let mut upserts: Vec<crate::indexer::InputDoc> = Vec::new();
+        let changed_paths: HashSet<&str> = changed_files.iter().map(|f| f.rel.as_str()).collect();
+        let new_ids: HashSet<&str> = docs_by_file.values().flatten().map(|d| d.id.as_str()).collect();
+        for id in &live_ids {
+            if let Some((path, _, _)) = repo::parse_id(id) {
+                if !current.contains(path) || (changed_paths.contains(path) && !new_ids.contains(id.as_str())) {
+                    stale.push(id.clone());
+                }
+            }
+        }
+        drop(new_ids);
         for file in &changed_files {
             let new_docs = docs_by_file.remove(&file.rel).unwrap_or_default();
-            let new_ids: HashSet<&str> = new_docs.iter().map(|d| d.id.as_str()).collect();
-            if let Some(prev) = prev_files.get(file.rel.as_str()) {
-                stale.extend(
-                    prev.chunk_ids
-                        .iter()
-                        .filter(|id| !new_ids.contains(id.as_str()))
-                        .cloned(),
-                );
-            }
             records.push(FileRecord {
                 path: file.rel.clone(),
                 len: file.len,
@@ -589,33 +618,14 @@ impl RepoIndexer {
             });
             upserts.extend(new_docs);
         }
-        for prev in &removed {
-            stale.extend(prev.chunk_ids.iter().cloned());
-        }
-        let deleted = writer.delete_documents(&stale)?;
-        timer.mark("tombstone");
-
-        // 2. Append changed/new chunks as one segment.
-        let outcome = if upserts.is_empty() {
-            crate::segments::UpsertOutcome {
-                added: 0,
-                updated: 0,
-                unchanged: 0,
-                new_segment: None,
-            }
-        } else {
-            writer.upsert_documents_full(&upserts)?
-        };
-        timer.mark("upsert");
-
-        // 3. Embed only the new segment.
-        let (encoded, cached) = match (&outcome.new_segment, self.opts.embed) {
-            (Some((name, docs)), true) => {
-                self.embed_segment(&self.index_dir.join(name), docs)?
-            }
-            _ => (0, 0),
-        };
-        timer.mark("embed");
+        // Encode the replacement before publishing it or deleting old rows.
+        // An encoder/cache failure leaves the previous index readable.
+        let (mut encoded, mut cached) = (0, 0);
+        let (outcome, deleted) = writer.upsert_documents_prepared(&upserts, &stale, |dir, docs| {
+            if self.opts.embed { (encoded, cached) = self.embed_segment(dir, docs)?; }
+            Ok(())
+        })?;
+        timer.mark("prepare-and-publish");
 
         // 4. Merge when the segment count gets silly. Embeddings for the
         //    merged segment come from the content cache via keys — no
@@ -643,6 +653,8 @@ impl RepoIndexer {
             chunker: CHUNKER_VERSION,
         };
         manifest.save(&self.index_dir)?;
+        std::fs::remove_file(self.index_dir.join("build.pending"))
+            .context("finish index publication")?;
         self.log(format!(
             "segmented index ready in {:.2}s ({} live chunks, {} upserted, {} tombstoned, {} encoded, {} from cache)",
             manifest.build_secs,
@@ -784,25 +796,18 @@ impl RepoIndexer {
             #[cfg(feature = "semantic")]
             if cache_changed { cache.save(&self.index_dir)?; }
         }
-        writer.merge_all()?;
-        if !self.opts.embed {
-            return Ok(());
-        }
-        let post = crate::segments::SegmentedIndex::open(&self.index_dir)?;
-        let names = post.segment_names();
-        anyhow::ensure!(names.len() == 1, "merge left {} segments", names.len());
-        let seg_dir = self.index_dir.join(&names[0]);
-        let n = post.num_docs_in(0);
-        let mut keys = Vec::with_capacity(n as usize);
-        for doc_id in 0..n {
-            let id = post.doc_summary_in(0, doc_id).id;
-            keys.push(
-                *key_of
-                    .get(&id)
-                    .with_context(|| format!("no cached key for merged doc {id}"))?,
-            );
-        }
-        self.rebuild_segment_vectors(&seg_dir, &keys)
+        writer.merge_all_prepared(|seg_dir| {
+            if !self.opts.embed { return Ok(()); }
+            use crate::indexer::SearchableIndex;
+            let post = crate::storage::load_index(seg_dir)?;
+            let mut keys = Vec::with_capacity(post.num_docs());
+            for doc_id in 0..post.num_docs() {
+                let id = post.doc_summary(doc_id as u32).id;
+                keys.push(*key_of.get(&id)
+                    .with_context(|| format!("no cached key for merged doc {id}"))?);
+            }
+            self.rebuild_segment_vectors(seg_dir, &keys)
+        })
     }
 
     #[cfg(feature = "semantic")]
@@ -1142,6 +1147,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_inventory_write_preserves_previous_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::pending(temp.path(), false);
+        manifest.save(temp.path()).unwrap();
+        let original = std::fs::read(temp.path().join(MANIFEST_FILE)).unwrap();
+        std::fs::create_dir(temp.path().join("repo.json.tmp")).unwrap();
+        manifest.num_docs = 7;
+        assert!(manifest.save(temp.path()).is_err());
+        assert_eq!(std::fs::read(temp.path().join(MANIFEST_FILE)).unwrap(), original);
+        std::fs::remove_dir(temp.path().join("repo.json.tmp")).unwrap();
+        manifest.save(temp.path()).unwrap();
+        assert_eq!(Manifest::load(temp.path()).unwrap().num_docs, 7);
+    }
+
+    #[test]
     fn index_dir_is_stable_and_outside_the_repo() {
         let root = Path::new(".");
         let a = default_index_dir(root);
@@ -1258,6 +1278,47 @@ mod merge_recovery_tests {
             assert_eq!(repaired.cached, 1);
             assert!(indexer.invalid_embedding_ids().unwrap().is_empty());
             assert!(!indexer.encoder_loaded(), "repair should not need a model");
+        }
+    }
+
+    #[test]
+    fn reconciles_segments_ahead_of_the_file_manifest_after_interruption() {
+        for (add_orphans, delete_recorded) in [(true, false), (false, true), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let indexer = seeded_index(temp.path());
+            let manifest = Manifest::load(&indexer.index_dir).unwrap();
+            let expected = manifest.files[0].chunk_ids.clone();
+            {
+                let mut writer = indexer.open_writer_waiting(WRITER_WAIT).unwrap();
+                if delete_recorded { writer.delete_documents(&expected).unwrap(); }
+                if add_orphans {
+                    let docs = vec![
+                        InputDoc { id: "permission.toml:1-7".into(), title: "outdated chunk".into(), body: "old permission".into() },
+                        InputDoc { id: "removed.toml:1-1".into(), title: "removed file".into(), body: "old permission".into() },
+                    ];
+                    let name = writer.upsert_documents_full(&docs).unwrap().new_segment.unwrap().0;
+                    let mut cache = crate::embcache::EmbedCache::load(&indexer.index_dir, crate::embeddings::CODERANK_DIM);
+                    let mut vector = vec![0.0; crate::embeddings::CODERANK_DIM]; vector[0] = 1.0;
+                    for doc in &docs {
+                        cache.insert(crate::embcache::key_for(&format!("{}\n{}", doc.title, doc.body)), &vector);
+                    }
+                    cache.save(&indexer.index_dir).unwrap();
+                    indexer.embed_segment(&indexer.index_dir.join(name), &docs).unwrap();
+                }
+                // Simulate interruption before repo.json records these mutations.
+            }
+            assert!(indexer.invalid_embedding_ids().unwrap().is_empty());
+            let rebuilt = indexer.build().unwrap();
+            assert_eq!(rebuilt.num_docs, 1);
+            let index = crate::segments::SegmentedIndex::open(&indexer.index_dir).unwrap();
+            let mut live = Vec::new();
+            for si in 0..index.num_segments() {
+                for id in 0..index.num_docs_in(si) {
+                    if index.is_live(si, id) { live.push(index.doc_summary_in(si, id).id); }
+                }
+            }
+            assert_eq!(live, expected);
+            assert!(!indexer.encoder_loaded(), "reconciliation should reuse valid cached vectors");
         }
     }
 

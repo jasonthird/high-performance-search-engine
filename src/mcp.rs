@@ -453,7 +453,8 @@ impl Server {
         let invalid_before = if repair_vectors && self.hybrid_enabled() {
             self.index.as_ref().map(|i| i.invalid_embedding_ids().len()).unwrap_or(0)
         } else { 0 };
-        let dirty = self.refresh_pending || self.watcher.as_ref().is_some_and(|w| w.take_dirty());
+        let dirty = self.refresh_pending || self.indexer.recovery_pending()
+            || self.watcher.as_ref().is_some_and(|w| w.take_dirty());
         if dirty || self.index.is_none() {
             // Keep failed source refreshes pending: taking the watcher flag
             // must not let the following query silently use stale locations.
@@ -845,6 +846,34 @@ fn validate_index_root(manifest: &Manifest, root: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod freshness_regression_tests {
     use super::*;
+
+    #[test]
+    fn restarted_server_recovers_pending_publication_without_a_watch_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("settings.toml");
+        std::fs::write(&file, "permission = true\n").unwrap();
+        let config = ServerConfig {
+            root,
+            index_dir: temp.path().join("index"),
+            build: BuildOpts { embed: false, segmented: true, quiet: true, ..Default::default() },
+            force_rebuild: false, watch: false, default_top_k: 5, search: Default::default(),
+        };
+        RepoIndexer::new(&config.root, &config.index_dir, config.build.clone()).unwrap().build().unwrap();
+        // A previous writer tombstoned a row and stopped before repo.json.
+        {
+            let mut writer = crate::segments::SegmentedWriter::open_or_create_ex(&config.index_dir, false, 2, true).unwrap();
+            writer.delete_documents(&["settings.toml:1-1".into()]).unwrap();
+        }
+        std::fs::write(config.index_dir.join("build.pending"), b"interrupted").unwrap();
+        let mut server = Server::start(config).unwrap();
+        assert!(!server.refresh_pending);
+        let text = server.tool_search(&json!({"query":"permission"})).unwrap();
+        assert!(text.contains("settings.toml:1-1"), "{text}");
+        assert!(!server.indexer.recovery_pending());
+        assert_eq!(server.rebuilds, 1);
+    }
 
     #[test]
     fn failed_source_refresh_is_retried_before_results_are_served() {

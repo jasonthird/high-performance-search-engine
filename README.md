@@ -953,6 +953,28 @@ Normal watched source edits continue to trigger incremental reindexing. A
 failed source refresh remains pending and is retried; later calls cannot
 silently return the old locations.
 
+Segment publication also protects against disk-write failures. An observed
+failure began with `No space left on device (os error 28)` while writing
+`seg-000046/embeddings.bin`. Older writers had already published the lexical
+segment, so it remained visible without vectors or `keys.bin`. Later repairs
+retired its rows, but compaction still required its missing keys and failed
+repeatedly. Compaction could likewise replace source segments before writing
+the merged vectors. Neither failure required a CoreML initialization error.
+
+Writers now finish a new segment's embeddings and keys before publishing it
+or tombstoning the documents it replaces. Merge completes its sidecars before
+switching the segment manifest and removing source segments. A failed sidecar
+write leaves the previously published segments intact. A persistent
+`build.pending` marker makes MCP retry interrupted repository publication,
+including after a server restart without another file-watch event. Rebuilds
+reconcile live chunk IDs against `repo.json`, replacing missing chunks and
+removing stale ranges or deleted-file chunks left by older interrupted builds.
+Repository inventory is written to a temporary file and renamed into place,
+so a failed write cannot truncate the previous `repo.json`. The writer lock
+covers comparison and publication. Disk exhaustion still
+returns an error and requires free space; retries no longer depend on sidecars
+from retired segments or silently preserve an incomplete inventory.
+
 After installing an updated binary, reconnect/restart the MCP server and
 refresh its tool schema. Confirm `tools/list` advertises `verbose` before
 using it; an existing process continues running the old version.

@@ -588,6 +588,17 @@ impl SegmentedWriter {
 
     /// Add a batch of documents as one new segment.
     pub fn add_documents(&mut self, docs: &[InputDoc]) -> anyhow::Result<String> {
+        let entry = self.prepare_segment(docs, |_, _| Ok(()))?;
+        let name = entry.name.clone();
+        self.publish_segment(entry)?;
+        Ok(name)
+    }
+
+    fn prepare_segment(
+        &self,
+        docs: &[InputDoc],
+        prepare: impl FnOnce(&Path, &[InputDoc]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<SegmentEntry> {
         anyhow::ensure!(!docs.is_empty(), "no documents to add");
         let name = format!("seg-{:06}", self.manifest.next_segment);
         let index = crate::indexer::build_index_weighted_ex(
@@ -599,17 +610,25 @@ impl SegmentedWriter {
             self.manifest.code_mode,
         );
         storage::save_index(&index, &self.dir.join(&name))?;
+        // Sidecars must be complete before readers can discover this segment.
+        if let Err(error) = prepare(&self.dir.join(&name), docs) {
+            fs::remove_dir_all(self.dir.join(&name)).ok();
+            return Err(error);
+        }
         let total_len: u64 = index.docs().iter().map(|d| d.doc_len as u64).sum();
-        self.manifest.segments.push(SegmentEntry {
+        Ok(SegmentEntry {
             name: name.clone(),
             num_docs: index.docs().len() as u32,
             total_len,
             live_docs: index.docs().len() as u32,
             live_len: total_len,
-        });
+        })
+    }
+
+    fn publish_segment(&mut self, entry: SegmentEntry) -> anyhow::Result<()> {
+        self.manifest.segments.push(entry);
         self.manifest.next_segment += 1;
-        write_manifest(&self.dir, &self.manifest)?;
-        Ok(name)
+        write_manifest(&self.dir, &self.manifest)
     }
 
     /// Tombstone a batch of documents by external id in one pass: each
@@ -689,6 +708,17 @@ impl SegmentedWriter {
 
     /// As [`Self::upsert_documents`], reporting the created segment too.
     pub fn upsert_documents_full(&mut self, docs: &[InputDoc]) -> anyhow::Result<UpsertOutcome> {
+        self.upsert_documents_prepared(docs, &[], |_, _| Ok(())).map(|(outcome, _)| outcome)
+    }
+
+    /// Build sidecars before publishing a replacement or tombstoning old rows.
+    /// Explicit deletions also force replacement of unchanged corrupt rows.
+    pub fn upsert_documents_prepared(
+        &mut self,
+        docs: &[InputDoc],
+        delete_ids: &[String],
+        prepare: impl FnOnce(&Path, &[InputDoc]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<(UpsertOutcome, usize)> {
         // Resolve against current live segments once.
         let segments: Vec<(String, DiskIndex, Vec<u64>, u32)> = self
             .manifest
@@ -727,14 +757,15 @@ impl SegmentedWriter {
         };
 
         let mut to_add: Vec<InputDoc> = Vec::new();
-        let mut to_delete: Vec<String> = Vec::new();
+        let mut to_delete = delete_ids.to_vec();
+        let forced: std::collections::HashSet<&str> = delete_ids.iter().map(String::as_str).collect();
         let mut added = 0usize;
         let mut updated = 0usize;
         let mut unchanged = 0usize;
         for &doc in &docs {
             let new_hash = crate::indexer::content_hash(&doc.title, &doc.body);
             match live_lookup(&doc.id) {
-                Some((_, _, stored)) if stored == new_hash => unchanged += 1,
+                Some((_, _, stored)) if stored == new_hash && !forced.contains(doc.id.as_str()) => unchanged += 1,
                 Some(_) => {
                     to_delete.push(doc.id.clone());
                     to_add.push(doc.clone());
@@ -746,19 +777,23 @@ impl SegmentedWriter {
                 }
             }
         }
-        self.delete_documents(&to_delete)?;
-        let new_segment = if to_add.is_empty() {
+        let prepared = if to_add.is_empty() {
             None
         } else {
-            let name = self.add_documents(&to_add)?;
-            Some((name, to_add))
+            Some(self.prepare_segment(&to_add, prepare)?)
         };
-        Ok(UpsertOutcome {
+        let deleted = self.delete_documents(&to_delete)?;
+        let new_segment = if let Some(entry) = prepared {
+            let name = entry.name.clone();
+            self.publish_segment(entry)?;
+            Some((name, to_add))
+        } else { None };
+        Ok((UpsertOutcome {
             added,
             updated,
             unchanged,
             new_segment,
-        })
+        }, deleted))
     }
 
     /// Merge every segment into one, dropping tombstoned documents.
@@ -771,6 +806,11 @@ impl SegmentedWriter {
     /// merged segment scores identically to a from-scratch rebuild of the
     /// live documents.
     pub fn merge_all(&mut self) -> anyhow::Result<()> {
+        self.merge_all_prepared(|_| Ok(()))
+    }
+
+    /// Finish dependent sidecars before switching readers to the merged index.
+    pub fn merge_all_prepared(&mut self, prepare: impl FnOnce(&Path) -> anyhow::Result<()>) -> anyhow::Result<()> {
         let needs_merge = self.manifest.segments.len() > 1
             || self
                 .manifest
@@ -961,6 +1001,10 @@ impl SegmentedWriter {
             block_byte_offsets,
         };
         storage::write_meta(&meta, (&dict_groups, &dict_bytes), &out_dir)?;
+        if let Err(error) = prepare(&out_dir) {
+            fs::remove_dir_all(&out_dir).ok();
+            return Err(error);
+        }
 
         // Commit: new manifest first, then remove the old segments.
         self.manifest.segments = vec![SegmentEntry {
