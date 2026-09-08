@@ -144,6 +144,30 @@ impl AnyIndex {
         self.seg_stores.as_ref()
     }
 
+    /// IDs whose live vector is missing or invalid. The row scan is cached
+    /// by each immutable store; lexical callers need not pay for it.
+    pub fn invalid_embedding_ids(&self) -> Vec<String> {
+        use crate::indexer::SearchableIndex as _;
+        match &self.kind {
+            IndexKind::Single(disk) => {
+                let ids = self.embeddings.as_ref().map(|e| e.invalid_rows().to_vec())
+                    .unwrap_or_else(|| (0..disk.num_docs() as u32).collect());
+                ids.into_iter().map(|id| disk.doc_summary(id).id).collect()
+            }
+            IndexKind::Segmented(seg) => {
+                let mut ids = Vec::new();
+                for si in 0..seg.segment_names().len() {
+                    let rows = self.seg_stores.as_ref().and_then(|s| s.stores[si].as_ref())
+                        .map(|s| s.invalid_rows().to_vec())
+                        .unwrap_or_else(|| (0..seg.num_docs_in(si)).collect());
+                    ids.extend(rows.into_iter().filter(|&id| seg.is_live(si, id))
+                        .map(|id| seg.doc_summary_in(si, id).id));
+                }
+                ids
+            }
+        }
+    }
+
     /// True when some form of vector search is available (single-index
     /// sidecar or per-segment stores).
     pub fn has_vectors(&self) -> bool {

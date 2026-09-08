@@ -8,5 +8,5 @@ if [ "$event" = "UserPromptSubmit" ]; then
   printf '%s' "$input" | grep -qiE '\b(where|find|how does|how is|which (file|function)|implement|locate|explain)\b' || exit 0
 fi
 command -v hips >/dev/null 2>&1 || exit 0
-hint='[hips] For where-is-it / how-does-it-work questions, run `hips search --root . --query "<what the code does>"` BEFORE grep, find, or directory listing. Grep only for exact literals you already know.'
+hint='[hips] For code navigation, use hips before grep or file listing. If the shell is sandboxed, prefer MCP search_code; otherwise prefer `hips search --root . --query "<what the code does>"`. If MCP is unavailable or serves another repository, use the CLI with an explicit --root. Grep is for known exact literals.'
 printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$event" "$(printf '%s' "$hint" | sed 's/"/\\"/g')"

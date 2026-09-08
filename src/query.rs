@@ -195,6 +195,7 @@ pub fn run_ranked_with(
     let embeddings = index
         .embeddings()
         .context("no embeddings.bin — run `embed --index ... --input ...` first")?;
+    embeddings.validate_live(|_| true)?;
     let disk = index
         .as_single()
         .context("hybrid/semantic modes currently support a single (non-segmented) index")?;
@@ -310,6 +311,11 @@ fn run_ranked_segmented(
         .segment_stores()
         .context("segmented index has no embeddings; rebuild with --segmented (not --lexical)")?;
 
+    for (si, store) in stores.stores.iter().enumerate() {
+        if let Some(store) = store {
+            store.validate_live(|id| seg.is_live(si, id))?;
+        }
+    }
     let total = Instant::now();
     let pool = opts.semantic_candidates.max(top_k);
 

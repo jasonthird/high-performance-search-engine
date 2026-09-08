@@ -315,6 +315,22 @@ impl RepoIndexer {
         }
     }
 
+    /// Read-only runtime inspection; unlike `embedder`, this never initializes it.
+    pub fn encoder_diagnostics(&self) -> serde_json::Value {
+        #[cfg(feature = "semantic")]
+        if let Some(encoder) = self.embedder.get() {
+            return encoder.diagnostics();
+        }
+        serde_json::json!({"state": if cfg!(feature = "semantic") { "not_loaded" } else { "not_compiled" }})
+    }
+
+    pub fn query_cached(&self, query: &str) -> bool {
+        #[cfg(feature = "semantic")]
+        { self.embedder.get().is_some_and(|e| e.query_cached(query)) }
+        #[cfg(not(feature = "semantic"))]
+        { let _ = query; false }
+    }
+
     /// Drop the encoder; the next rebuild that needs it reloads it (about
     /// a second). Frees the model's memory in a long-idle watcher.
     pub fn unload_embedder(&mut self) {
@@ -345,6 +361,13 @@ impl RepoIndexer {
         self.build_with(self.opts.retrain)
     }
 
+    fn invalid_embedding_ids(&self) -> anyhow::Result<Vec<String>> {
+        if !self.opts.embed || !self.index_dir.join("repo.json").exists() {
+            return Ok(Vec::new());
+        }
+        Ok(crate::searcher::AnyIndex::open(&self.index_dir)?.invalid_embedding_ids())
+    }
+
     /// As [`Self::build`], but forcing the IVF/PQ quantizer to be retrained.
     /// Worth doing after the tree has changed substantially; a normal
     /// rebuild reuses it.
@@ -359,7 +382,8 @@ impl RepoIndexer {
         // Byte-identical tree: nothing downstream can change, so the only
         // cost of an up-to-date `index-repo` is the walk itself.
         let tree_fingerprint = repo::fingerprint(&files);
-        if !retrain {
+        let repair = !self.invalid_embedding_ids()?.is_empty();
+        if !retrain && !repair {
             if let Ok(existing) = Manifest::load(&self.index_dir) {
                 if existing.tree_fingerprint == tree_fingerprint
                     && existing.tree_fingerprint != 0
@@ -405,7 +429,7 @@ impl RepoIndexer {
         let _ = &mut index;
 
         let (encoded, cached) = match embed_texts {
-            Some(texts) => self.build_embeddings(&staging, &texts, &doc_lens, retrain)?,
+            Some(texts) => self.build_embeddings(&staging, &texts, &doc_lens, retrain || repair)?,
             None => (0, 0),
         };
         timer.mark("embed");
@@ -449,6 +473,12 @@ impl RepoIndexer {
         timer.mark("walk");
         let tree_fingerprint = repo::fingerprint(&files);
         let previous = Manifest::load(&self.index_dir).ok();
+        let repair_ids = self.invalid_embedding_ids()?;
+        let repair_files: HashSet<&str> = repair_ids.iter()
+            .filter_map(|id| repo::parse_id(id).map(|(path, _, _)| path)).collect();
+        if !repair_ids.is_empty() {
+            self.log(format!("repairing {} invalid or missing document embeddings in {} files", repair_ids.len(), repair_files.len()));
+        }
         let rechunk = previous.as_ref().is_some_and(|p| p.chunker != CHUNKER_VERSION);
         if rechunk {
             self.log("chunker changed: re-chunking every file".to_string());
@@ -458,6 +488,7 @@ impl RepoIndexer {
                 && prev.tree_fingerprint != 0
                 && prev.embedded == self.opts.embed
                 && !rechunk
+                && repair_ids.is_empty()
             {
                 self.log(format!(
                     "index up to date ({} chunks, fingerprint unchanged)",
@@ -478,7 +509,7 @@ impl RepoIndexer {
         let current: HashSet<&str> = files.iter().map(|f| f.rel.as_str()).collect();
         for file in &files {
             match prev_files.get(file.rel.as_str()) {
-                Some(prev) if !rechunk && prev.len == file.len && prev.mtime_ns == file.mtime_ns => {
+                Some(prev) if !rechunk && !repair_files.contains(file.rel.as_str()) && prev.len == file.len && prev.mtime_ns == file.mtime_ns => {
                     records.push((*prev).clone());
                 }
                 _ => changed.push(file),
@@ -531,7 +562,9 @@ impl RepoIndexer {
         // 1. Tombstone chunks that no longer exist: every id a removed file
         //    had, and every id of a changed file that its new chunking no
         //    longer produces (line shifts rename ids).
-        let mut stale: Vec<String> = Vec::new();
+        // Force a replacement even when the source text and chunk ID are
+        // unchanged; ordinary upsert would otherwise retain the corrupt row.
+        let mut stale: Vec<String> = repair_ids.clone();
         let mut upserts: Vec<crate::indexer::InputDoc> = Vec::new();
         for file in &changed_files {
             let new_docs = docs_by_file.remove(&file.rel).unwrap_or_default();

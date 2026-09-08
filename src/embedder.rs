@@ -60,6 +60,7 @@ pub struct Embedder {
     /// Document encoding is NOT cached here — that is `embcache`'s job,
     /// keyed by content and persisted.
     query_cache: std::sync::Mutex<QueryCache>,
+    fallbacks: Vec<String>,
 }
 
 /// Tiny string-keyed LRU. At 256 entries x 768 f32 this is ~0.8 MB.
@@ -148,6 +149,18 @@ impl Embedder {
         weights_path: &Path,
         kind: EmbedUse,
     ) -> anyhow::Result<Self> {
+        Self::load_from_files_with_backend(config_path, tokenizer_path, weights_path, kind, true)
+    }
+
+    fn load_from_files_with_backend(
+        config_path: &Path,
+        tokenizer_path: &Path,
+        weights_path: &Path,
+        kind: EmbedUse,
+        allow_coreml: bool,
+    ) -> anyhow::Result<Self> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = allow_coreml;
         let mut config: Config = serde_json::from_str(
             &std::fs::read_to_string(config_path).context("read config.json")?,
         )
@@ -177,7 +190,7 @@ impl Embedder {
         }));
 
         #[cfg(target_os = "macos")]
-        let coreml = if std::env::var("HIPS_ENCODER").as_deref() == Ok("candle") {
+        let coreml = if !allow_coreml || std::env::var("HIPS_ENCODER").as_deref() == Ok("candle") {
             None
         } else {
             crate::coreml::CoreMlEncoder::load().filter(|cm| match kind {
@@ -210,7 +223,7 @@ impl Embedder {
             (Some(model), Some(device))
         } else {
             if crate::verbosity::verbose() {
-                eprintln!("CodeRankEmbed device: ANE (CoreML)");
+                eprintln!("CodeRankEmbed backend: CoreML");
             }
             (None, None)
         };
@@ -222,10 +235,46 @@ impl Embedder {
             #[cfg(target_os = "macos")]
             coreml,
             query_cache: std::sync::Mutex::new(QueryCache::new()),
+            fallbacks: Vec::new(),
         };
-        // Compile Metal pipelines (first forward is hundreds of ms).
-        let _ = embedder.embed_query("warmup");
+        // A model is ready only after a successful, validated prediction.
+        // CoreML can report an E5RT exception yet return NaN output as success.
+        if let Err(err) = embedder.embed_query("warmup") {
+            #[cfg(target_os = "macos")]
+            if embedder.coreml.is_some() {
+                eprintln!("note: CoreML unavailable ({err:#}); retrying CodeRankEmbed with Candle (semantic search retained)");
+                drop(embedder);
+                let mut retry = Self::load_from_files_with_backend(
+                    config_path, tokenizer_path, weights_path, kind, false,
+                ).with_context(|| format!("Candle retry after CoreML initialization failure ({err:#})"))?;
+                retry.fallbacks.push(format!("CoreML initialization failed: {err:#}"));
+                return Ok(retry);
+            }
+            return Err(err.context("CodeRankEmbed warmup failed"));
+        }
         Ok(embedder)
+    }
+
+    /// Inspect the resident encoder without loading a model or running inference.
+    pub fn diagnostics(&self) -> serde_json::Value {
+        #[cfg(target_os = "macos")]
+        let coreml = self.coreml.as_ref().map(|cm| cm.diagnostics());
+        #[cfg(not(target_os = "macos"))]
+        let coreml: Option<serde_json::Value> = None;
+        serde_json::json!({
+            "state": "ready",
+            "model": MODEL_ID,
+            "backend": if coreml.is_some() { "coreml" } else { "candle" },
+            "candle_device": self.device.as_ref().map(|d| if d.is_metal() { "metal" } else { "cpu" }),
+            "coreml": coreml,
+            "warmup_validated": true,
+            "fallbacks": self.fallbacks,
+            "query_cache_entries": self.query_cache.lock().ok().map(|c| c.map.len()),
+        })
+    }
+
+    pub fn query_cached(&self, query: &str) -> bool {
+        self.query_cache.lock().is_ok_and(|c| c.map.contains_key(query))
     }
 
     /// Encode documents in inverted-index `doc_id` order and write
@@ -443,12 +492,21 @@ impl Embedder {
             let _ = (tok_ms, upload_ms, t2);
             normed.to_vec2::<f32>()?
         };
-        anyhow::ensure!(
-            vecs.iter().all(|v| v.len() == CODERANK_DIM),
-            "unexpected embedding dim"
-        );
+        for vector in &vecs {
+            validate_vector(vector).context("invalid Candle prediction")?;
+        }
         Ok(vecs)
     }
+}
+
+/// Both backends promise finite, L2-normalized CodeRankEmbed output. Reject
+/// broken predictions before they enter the query cache, index, or ranking.
+pub(crate) fn validate_vector(vector: &[f32]) -> anyhow::Result<()> {
+    anyhow::ensure!(vector.len() == CODERANK_DIM, "unexpected embedding dimension {}", vector.len());
+    anyhow::ensure!(vector.iter().all(|v| v.is_finite()), "embedding contains non-finite values (NaN or infinity)");
+    let norm: f64 = vector.iter().map(|&v| (v as f64).powi(2)).sum();
+    anyhow::ensure!((0.9..=1.1).contains(&norm), "embedding is not L2-normalized (squared norm {norm})");
+    Ok(())
 }
 
 fn prepare_window(
@@ -480,6 +538,19 @@ fn profile() -> bool {
 #[cfg(test)]
 mod scheduling_tests {
     use super::*;
+
+    #[test]
+    fn reject_invalid_predictions_before_ranking_or_caching() {
+        let mut vector = vec![0.0; CODERANK_DIM];
+        assert!(validate_vector(&vector).is_err());
+        vector[0] = 1.0;
+        validate_vector(&vector).unwrap();
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 2.0] {
+            vector[0] = invalid;
+            assert!(validate_vector(&vector).is_err());
+        }
+        assert!(validate_vector(&[1.0]).is_err());
+    }
 
     #[test]
     fn token_bucketing_preserves_rows_ids_masks_and_truncation() {
@@ -528,6 +599,7 @@ mod scheduling_tests {
             #[cfg(target_os = "macos")]
             coreml: None,
             query_cache: std::sync::Mutex::new(QueryCache::new()),
+            fallbacks: Vec::new(),
         };
         assert!(encoder.embed_docs_with(&[], 4, true).unwrap().is_empty());
         // More batches than queue capacity: consumer fails on the first one.
@@ -554,6 +626,12 @@ fn cpu_device() -> (Device, DType) {
 fn metal_or_cpu() -> (Device, DType) {
     #[cfg(target_os = "macos")]
     {
+        // Candle currently indexes Device::all()[0] without checking for an
+        // empty list. Sandboxes can hide every GPU even on Apple silicon.
+        if objc2_metal::MTLCopyAllDevices().count() == 0 {
+            eprintln!("Metal unavailable (macOS reports no accessible GPU devices); falling back to CPU");
+            return cpu_device();
+        }
         match Device::new_metal(0) {
             Ok(device) => {
                 if crate::verbosity::verbose() {

@@ -140,6 +140,15 @@ impl EmbedCache {
                 let off = at + 8 + j * 2;
                 lanes.push(u16::from_le_bytes(buf[off..off + 2].try_into().unwrap()));
             }
+            // Older runtimes could persist NaN output. Do not reuse it in a
+            // fresh rebuild, even though its content hash still matches.
+            if lanes.iter().any(|h| h & 0x7c00 == 0x7c00) {
+                continue;
+            }
+            if dim == crate::embeddings::CODERANK_DIM {
+                let norm: f32 = lanes.iter().map(|&h| { let x = f16_to_f32(h); x * x }).sum();
+                if !(0.9..=1.1).contains(&norm) { continue; }
+            }
             let coff = at + 8 + dim * 2;
             let cluster = u32::from_le_bytes(buf[coff..coff + 4].try_into().unwrap());
             let codes = buf[coff + 4..coff + 4 + m].to_vec();
@@ -352,5 +361,23 @@ mod tests {
     fn keys_separate_by_length() {
         assert_ne!(key_for("abc"), key_for("abcd"));
         assert_eq!(key_for("abc"), key_for("abc"));
+    }
+}
+
+#[cfg(test)]
+mod legacy_validation_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_cached_vectors_become_misses_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = EmbedCache::new(2);
+        cache.insert(1, &[1.0, 0.0]);
+        cache.insert(2, &[f32::NAN, 0.0]);
+        cache.insert(3, &[f32::INFINITY, 0.0]);
+        cache.save(dir.path()).unwrap();
+        let restored = EmbedCache::load(dir.path(), 2);
+        assert!(restored.contains(1));
+        assert_eq!(restored.unique_misses(&[1, 2, 3]), vec![1, 2]);
     }
 }

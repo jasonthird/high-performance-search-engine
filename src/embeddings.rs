@@ -42,6 +42,7 @@ pub struct EmbeddingStore {
     modified_ns: u128,
     graph_dir: std::path::PathBuf,
     graph: std::sync::OnceLock<Option<crate::hnsw::HnswIndex>>,
+    invalid_rows: std::sync::OnceLock<Vec<u32>>,
 }
 
 impl EmbeddingStore {
@@ -90,6 +91,7 @@ impl EmbeddingStore {
             modified_ns,
             graph_dir: dir.to_path_buf(),
             graph: std::sync::OnceLock::new(),
+            invalid_rows: std::sync::OnceLock::new(),
         })
     }
 
@@ -118,6 +120,11 @@ impl EmbeddingStore {
     /// Optional topology loads once, only for ANN queries. Exact and lexical
     /// callers never pay its allocation or validation cost.
     pub fn hnsw(&self) -> Option<&crate::hnsw::HnswIndex> {
+        // Graph traversal can visit tombstoned nodes. If a retired row is
+        // invalid, use exact live-row scoring until that segment is merged.
+        if !self.invalid_rows().is_empty() {
+            return None;
+        }
         self.graph
             .get_or_init(
                 || match crate::hnsw::HnswIndex::open(&self.graph_dir, self) {
@@ -134,6 +141,29 @@ impl EmbeddingStore {
                 },
             )
             .as_ref()
+    }
+
+    /// Validate before ranked retrieval: the SIMD decoder assumes finite
+    /// normalized input and can turn legacy NaNs into large finite scores.
+    /// Scan immutable storage once; retired rows do not invalidate live hits.
+    pub fn invalid_rows(&self) -> &[u32] {
+        self.invalid_rows.get_or_init(|| {
+            let mut row = vec![0.0; self.dim as usize];
+            (0..self.num_docs).filter(|&id| {
+                self.copy_f32(id, &mut row);
+                let norm: f32 = row.iter().map(|v| v * v).sum();
+                !row.iter().all(|v| v.is_finite()) || !(0.9..=1.1).contains(&norm)
+            }).collect()
+        })
+    }
+
+    pub fn validate_live(&self, live: impl Fn(u32) -> bool) -> anyhow::Result<()> {
+        let invalid = self.invalid_rows();
+        if let Some(id) = invalid.iter().find(|&&id| live(id)) {
+            anyhow::bail!("invalid stored embedding in {} at document {id}; results withheld. run hips index-repo for this root to repair it (MCP repairs automatically before semantic search)",
+                self.graph_dir.join(EMBEDDINGS_FILE).display());
+        }
+        Ok(())
     }
 
     /// Cosine similarity = dot product of L2-normalized vectors.
@@ -481,5 +511,23 @@ mod tests {
         assert!((s0 - 1.0).abs() < 0.002, "self cosine {s0}");
         assert!(s1 < s0, "orthogonal-ish {s1} vs {s0}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_nan_and_non_normalized_rows_are_rejected_before_fast_scoring() {
+        let dir = tempfile::tempdir().unwrap();
+        write_f16(dir.path(), 2, &[vec![1.0, 0.0], vec![f32::NAN, f32::NAN], vec![4.0, 0.0]]).unwrap();
+        let store = EmbeddingStore::open(dir.path()).unwrap();
+        assert!(store.validate_live(|_| true).unwrap_err().to_string().contains("document 1"));
+        // Deleted invalid vectors must not block an otherwise valid index.
+        store.validate_live(|id| id == 0).unwrap();
+        assert!(store.hnsw().is_none());
+        assert!(store.graph.get().is_none(), "do not route through invalid retired rows");
+        assert!(store.validate_live(|id| id == 2).is_err());
     }
 }

@@ -33,12 +33,7 @@ const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Snippet lines returned per snippeted hit. Enough to judge relevance,
 /// small enough that hits do not flood the caller's context: results are
 /// pointers the caller can open, not a substitute for reading the file.
-const SNIPPET_LINES: usize = 12;
-
-/// Only the top hits carry snippets; the rest are path:line pointers.
-/// Measured on codex one-shot sessions: full 40-line snippets on every
-/// hit made an MCP search cost more tokens than the grep it replaced.
-const SNIPPET_HITS: usize = 5;
+const SNIPPET_LINES: usize = 4;
 
 pub struct ServerConfig {
     pub root: PathBuf,
@@ -63,6 +58,8 @@ pub struct Server {
     manifest: Manifest,
     config: ServerConfig,
     rebuilds: u64,
+    last_search: Option<Value>,
+    refresh_pending: bool,
     /// Modification time of the on-disk manifest when `index` was opened.
     /// The background watcher (or another agent's `index-repo`) rebuilds
     /// the index behind this process; a changed mtime means reopen.
@@ -71,8 +68,17 @@ pub struct Server {
 
 impl Server {
     /// Prepare the index (building it if absent) and start watching.
-    pub fn start(config: ServerConfig) -> anyhow::Result<Self> {
+    pub fn start(mut config: ServerConfig) -> anyhow::Result<Self> {
+        // Automatic freshness/repair preserves an existing index's layout.
+        // In particular, a failed encoder load must not trigger the legacy
+        // destructive single-to-segmented migration during a tool call.
+        if config.index_dir.join("meta.bin").exists()
+            && !crate::segments::is_segmented(&config.index_dir)
+        {
+            config.build.segmented = false;
+        }
         let indexer = RepoIndexer::new(&config.root, &config.index_dir, config.build.clone())?;
+        config.root = indexer.root().to_path_buf();
         // The encoder loads lazily on the first search: eager loading here
         // delays the MCP initialize handshake by model-load time (~1-2s) in
         // every session, including sessions that never search — measured as
@@ -91,6 +97,7 @@ impl Server {
         };
         let (manifest, index) = match existing {
             Some(m) => {
+                validate_index_root(&m, &config.root)?;
                 let idx = AnyIndex::open(&config.index_dir)?;
                 (m, Some(idx))
             }
@@ -117,6 +124,8 @@ impl Server {
             manifest,
             config,
             rebuilds: 0,
+            last_search: None,
+            refresh_pending: false,
             manifest_mtime,
         })
     }
@@ -130,7 +139,7 @@ impl Server {
                 "hips MCP server ready: {} chunks from {} ({} search)",
                 self.manifest.num_docs,
                 self.config.root.display(),
-                if self.manifest.embedded {
+                if self.hybrid_enabled() {
                     "hybrid"
                 } else {
                     "lexical"
@@ -244,13 +253,17 @@ impl Server {
                 } else {
                     "indexed on first call".to_string()
                 },
-                if self.manifest.embedded { "hybrid BM25 + CodeRankEmbed" } else { "BM25" },
+                if self.hybrid_enabled() { "hybrid BM25 + CodeRankEmbed" } else { "BM25" },
             ),
         })
     }
 
+    fn hybrid_enabled(&self) -> bool {
+        self.manifest.embedded && self.config.build.embed
+    }
+
     fn on_tools_list(&self) -> Value {
-        let hybrid = self.manifest.embedded;
+        let hybrid = self.hybrid_enabled();
         let modes: Vec<&str> = if hybrid {
             vec!["hybrid", "lexical", "semantic"]
         } else {
@@ -280,7 +293,7 @@ impl Server {
                         },
                         "top_k": {
                             "type": "integer",
-                            "description": "Number of results (default 10, max 50).",
+                            "description": format!("Number of results (default {}, max 50).", self.config.default_top_k.clamp(1, 50)),
                             "minimum": 1,
                             "maximum": 50
                         },
@@ -295,7 +308,17 @@ impl Server {
                         },
                         "include_snippet": {
                             "type": "boolean",
-                            "description": "Include the source of each hit (default true)."
+                            "default": false,
+                            "description": "Include up to 4 source lines for every returned hit (default false)."
+                        },
+                        "verbose": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Include runtime backend, fallback, timing, cache reuse and score diagnostics (default false)."
+                        },
+                        "expected_root": {
+                            "type": "string",
+                            "description": "Optional absolute repository root; fail if this server serves a different root."
                         }
                     },
                     "required": ["query"]
@@ -305,7 +328,9 @@ impl Server {
                 "name": "index_status",
                 "description": "Report what is indexed: root, chunk count, retrieval mode, \
                                 freshness, and rebuild statistics.",
-                "inputSchema": {"type": "object", "properties": {}}
+                "inputSchema": {"type": "object", "properties": {
+                    "verbose": {"type": "boolean", "default": false, "description": "Inspect resident encoder and last search diagnostics without loading the model (default false)."}
+                }}
             },
             {
                 "name": "reindex",
@@ -333,13 +358,64 @@ impl Server {
             .context("tools/call missing `name`")?
             .to_string();
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
-        // Tool failures are reported in-band so the model can react to them,
-        // rather than as transport errors.
-        let text = match self.dispatch(&name, &args) {
-            Ok(text) => text,
-            Err(e) => return Ok(tool_error(&format!("{e:#}"))),
+        let verbose = match args.get("verbose") {
+            None => false,
+            Some(Value::Bool(v)) => *v,
+            Some(_) => return Ok(tool_error("`verbose` must be a boolean")),
         };
-        Ok(json!({"content": [{"type": "text", "text": text}], "isError": false}))
+        let started = std::time::Instant::now();
+        if name == "search_code" {
+            self.last_search = Some(json!({
+                "requested_mode": args.get("mode").cloned().unwrap_or(json!("auto")),
+                "effective_mode": null,
+                "success": false,
+            }));
+        }
+        // Failed semantic execution is a tool error, never a successful
+        // lexical response. CoreML -> Candle is still semantic execution.
+        let mut result = match self.dispatch(&name, &args) {
+            Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
+            Err(e) => {
+                if name == "search_code" {
+                    if let Some(search) = self.last_search.as_mut() {
+                        search["error"] = json!(format!("{e:#}"));
+                    }
+                }
+                tool_error(&format!("{e:#}"))
+            }
+        };
+        if name == "search_code" {
+            if let Some(search) = self.last_search.as_mut() {
+                search["total_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        if verbose {
+            let diagnostics = self.diagnostics();
+            result["structuredContent"] = json!({"diagnostics": diagnostics});
+            result["content"].as_array_mut().unwrap().push(json!({
+                "type": "text",
+                "text": format!("Debug diagnostics:\n{}", serde_json::to_string_pretty(&diagnostics)?),
+            }));
+        }
+        Ok(result)
+    }
+
+    fn diagnostics(&self) -> Value {
+        json!({
+            "server": {"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION")},
+            "root": self.config.root,
+            "index_dir": self.config.index_dir,
+            "indexed_root": self.manifest.root,
+            "index_loaded": self.index.is_some(),
+            "index_has_embeddings": self.manifest.embedded,
+            "semantic_enabled": self.hybrid_enabled(),
+            "refresh_pending": self.refresh_pending,
+            "invalid_live_embeddings": if self.manifest.embedded {
+                self.index.as_ref().map(|i| i.invalid_embedding_ids().len())
+            } else { None },
+            "encoder": self.indexer.encoder_diagnostics(),
+            "last_search": self.last_search,
+        })
     }
 
     fn dispatch(&mut self, name: &str, args: &Value) -> anyhow::Result<String> {
@@ -370,20 +446,35 @@ impl Server {
     }
 
     /// Rebuild if the watcher saw a change since the last call.
-    fn ensure_fresh(&mut self) -> anyhow::Result<()> {
+    fn ensure_fresh(&mut self, repair_vectors: bool) -> anyhow::Result<usize> {
         // A session-leased watcher may be rebuilding right now; let it
         // finish rather than race it for the writer lock.
         crate::daemon::wait_for_idle(&self.config.index_dir, std::time::Duration::from_secs(20));
-        let dirty = self.watcher.as_ref().is_some_and(|w| w.take_dirty());
+        let invalid_before = if repair_vectors && self.hybrid_enabled() {
+            self.index.as_ref().map(|i| i.invalid_embedding_ids().len()).unwrap_or(0)
+        } else { 0 };
+        let dirty = self.refresh_pending || self.watcher.as_ref().is_some_and(|w| w.take_dirty());
         if dirty || self.index.is_none() {
+            // Keep failed source refreshes pending: taking the watcher flag
+            // must not let the following query silently use stale locations.
+            self.refresh_pending = true;
             self.rebuild()?;
         } else if manifest_mtime(&self.config.index_dir) != self.manifest_mtime {
             // Rebuilt by someone else: pick up their index.
-            self.manifest = Manifest::load(&self.config.index_dir)?;
+            let manifest = Manifest::load(&self.config.index_dir)?;
+            validate_index_root(&manifest, &self.config.root)?;
             self.index = Some(AnyIndex::open(&self.config.index_dir)?);
+            self.manifest = manifest;
             self.manifest_mtime = manifest_mtime(&self.config.index_dir);
         }
-        Ok(())
+        if repair_vectors && self.hybrid_enabled() {
+            let invalid = self.index()?.invalid_embedding_ids().len();
+            if invalid > 0 {
+                self.rebuild().with_context(|| format!("repair of {invalid} invalid document embeddings failed"))?;
+            }
+            anyhow::ensure!(self.index()?.invalid_embedding_ids().is_empty(), "document embedding repair incomplete; results withheld");
+        }
+        Ok(invalid_before)
     }
 
     fn index(&self) -> anyhow::Result<&AnyIndex> {
@@ -400,6 +491,7 @@ impl Server {
         self.index = Some(AnyIndex::open(&self.config.index_dir)?);
         self.manifest_mtime = manifest_mtime(&self.config.index_dir);
         self.rebuilds += 1;
+        self.refresh_pending = false;
         Ok(())
     }
 
@@ -411,22 +503,33 @@ impl Server {
             .trim()
             .to_string();
         anyhow::ensure!(!query.is_empty(), "`query` is empty");
-        let top_k = args
-            .get("top_k")
-            .and_then(Value::as_u64)
-            .map(|k| k.clamp(1, 50) as usize)
-            .unwrap_or(self.config.default_top_k);
-        let include_snippet = args
-            .get("include_snippet")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let path_glob = args
-            .get("path_glob")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let mode = args.get("mode").and_then(Value::as_str);
+        if let Some(expected) = args.get("expected_root") {
+            let expected = expected.as_str().context("`expected_root` must be an absolute path string")?;
+            anyhow::ensure!(Path::new(expected).is_absolute(), "`expected_root` must be absolute");
+            let expected = Path::new(expected).canonicalize().context("resolve expected_root")?;
+            anyhow::ensure!(expected == self.config.root,
+                "MCP root mismatch: this server serves {}; requested {}. Connect a server for the requested repository or use hips search --root.",
+                self.config.root.display(), expected.display());
+        }
+        let top_k = match args.get("top_k") {
+            None => self.config.default_top_k.clamp(1, 50),
+            Some(v) => v.as_u64().filter(|k| (1..=50).contains(k))
+                .context("`top_k` must be an integer between 1 and 50")? as usize,
+        };
+        let include_snippet = match args.get("include_snippet") {
+            None => false,
+            Some(v) => v.as_bool().context("`include_snippet` must be a boolean")?,
+        };
+        let path_glob = args.get("path_glob").map(|v|
+            v.as_str().map(str::to_string).context("`path_glob` must be a string")
+        ).transpose()?;
+        let mode = args.get("mode").map(|v|
+            v.as_str().context("`mode` must be hybrid, semantic, or lexical")
+        ).transpose()?;
+        anyhow::ensure!(mode.is_none_or(|m| matches!(m, "hybrid" | "semantic" | "lexical")),
+            "`mode` must be hybrid, semantic, or lexical");
 
-        self.ensure_fresh()?;
+        let repaired_embeddings = self.ensure_fresh(mode != Some("lexical"))?;
 
         // A path filter is applied after retrieval, so over-fetch to keep
         // `top_k` results reachable through the filter.
@@ -436,7 +539,12 @@ impl Server {
             top_k
         };
         let started = std::time::Instant::now();
+        let effective_mode = mode.unwrap_or(if self.hybrid_enabled() { "hybrid" } else { "lexical" });
+        let query_cache_hit = effective_mode != "lexical" && self.indexer.query_cached(&query);
         let hits = self.retrieve(&query, fetch, mode)?;
+        anyhow::ensure!(hits.iter().all(|h| h.score.is_finite() &&
+            h.components.is_none_or(|(b, s)| b.is_finite() && s.is_finite())),
+            "search returned non-finite scores; results withheld");
         let hits: Vec<Hit> = hits
             .into_iter()
             .filter(|h| match &path_glob {
@@ -455,7 +563,7 @@ impl Server {
             query: &query,
             mode: mode
                 .map(str::to_string)
-                .unwrap_or_else(|| if self.manifest.embedded { "hybrid" } else { "lexical" }.to_string()),
+                .unwrap_or_else(|| if self.hybrid_enabled() { "hybrid" } else { "lexical" }.to_string()),
             top_k,
             path_glob: path_glob.as_deref(),
             n_hits: hits.len(),
@@ -463,16 +571,39 @@ impl Server {
             hits: hits.iter().map(|h| h.id.clone()).collect(),
         });
 
-        if hits.is_empty() {
-            return Ok(format!(
-                "No matches for {query:?}{}.",
-                match &path_glob {
-                    Some(g) => format!(" under `{g}`"),
-                    None => String::new(),
-                }
-            ));
+        self.last_search = Some(json!({
+            "requested_mode": mode.unwrap_or("auto"),
+            "effective_mode": effective_mode,
+            "success": true,
+            "query_cache_hit": query_cache_hit,
+            "repaired_embeddings": repaired_embeddings,
+            "retrieval_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "path_glob": path_glob,
+            "hits": hits.iter().map(|h| json!({
+                "path": h.path, "start_line": h.start_line, "end_line": h.end_line,
+                "score": h.score,
+                "bm25": h.components.map(|(b, _)| b),
+                "semantic": h.components.map(|(_, s)| s),
+            })).collect::<Vec<_>>(),
+        }));
+        let mut text = format!("Retrieval: {effective_mode}\n");
+        if repaired_embeddings > 0 {
+            text.push_str(&format!("Reindexed {repaired_embeddings} invalid document embeddings before searching.\n"));
         }
-        Ok(self.render(&query, &hits, include_snippet))
+        if effective_mode != "lexical" {
+            if let Some(fallbacks) = self.indexer.encoder_diagnostics()["fallbacks"].as_array() {
+                if !fallbacks.is_empty() {
+                    text.push_str("Note: CoreML unavailable; using Candle (semantic search retained). Use verbose=true for details.\n");
+                }
+            }
+        }
+        if hits.is_empty() {
+            text.push_str(&format!("No matches for {query:?} in {}{}.\n", self.config.root.display(),
+                path_glob.as_ref().map(|g| format!(" under `{g}`")).unwrap_or_default()));
+        } else {
+            text.push_str(&self.render(&query, &hits, include_snippet));
+        }
+        Ok(text)
     }
 
     /// Run the configured retrieval mode and normalize to [`Hit`].
@@ -480,7 +611,7 @@ impl Server {
         let lexical = match mode {
             Some("lexical") | Some("bm25") => true,
             Some(_) => false,
-            None => !self.manifest.embedded,
+            None => !self.hybrid_enabled(),
         };
         if lexical {
             let outcome = self.index()?.search(query, k);
@@ -491,8 +622,8 @@ impl Server {
                 .collect());
         }
         anyhow::ensure!(
-            self.manifest.embedded,
-            "this index has no embeddings; pass mode=\"lexical\" or rebuild with embeddings"
+            self.hybrid_enabled(),
+            "semantic retrieval is disabled or this index has no embeddings; pass mode=\"lexical\" or rebuild with embeddings"
         );
         self.retrieve_ranked(query, k, mode)
     }
@@ -552,7 +683,7 @@ impl Server {
             // Scores are logged (usagelog) rather than shown: they are for
             // tuning, not for deciding which hit to open.
             let _ = (hit.score, hit.components);
-            if include_snippet && rank < SNIPPET_HITS {
+            if include_snippet {
                 if let Some(snippet) =
                     repo::snippet_for(&self.config.root, &hit.id, SNIPPET_LINES)
                 {
@@ -575,16 +706,21 @@ impl Server {
             None => "not watching (call `reindex` after edits)".to_string(),
         };
         Ok(format!(
-            "root: {}\nindex: {}\nchunks: {} from {} files\nretrieval: {}\nfreshness: {}\n\
+            "root: {}\nindex: {}\nchunks: {} from {} files\nretrieval: {}\nencoder: {}\nfreshness: {}\n\
              rebuilds this session: {}\nlast build: {:.2}s ({} encoded, {} from cache)",
             self.config.root.display(),
             self.config.index_dir.display(),
             self.manifest.num_docs,
             self.manifest.num_files,
-            if self.manifest.embedded {
-                "hybrid (BM25 + CodeRankEmbed, IVF/PQ)"
+            if self.hybrid_enabled() {
+                "hybrid-capable index (BM25 + CodeRankEmbed vectors; encoder loads on demand)"
             } else {
                 "lexical (BM25, code tokenizer)"
+            },
+            {
+                let encoder = self.indexer.encoder_diagnostics();
+                format!("{}{}", encoder["state"].as_str().unwrap_or("unknown"),
+                    encoder["backend"].as_str().map(|b| format!(" ({b})")).unwrap_or_default())
             },
             watching,
             self.rebuilds,
@@ -694,5 +830,48 @@ mod tests {
         assert_eq!(language_for("a/b.rs"), "rust");
         assert_eq!(language_for("a/b.tsx"), "tsx");
         assert_eq!(language_for("Makefile"), "");
+    }
+}
+
+/// An explicit index must belong to the pinned repository; otherwise even
+/// valid hit IDs would resolve snippets against unrelated source files.
+fn validate_index_root(manifest: &Manifest, root: &Path) -> anyhow::Result<()> {
+    let indexed = Path::new(&manifest.root).canonicalize().context("resolve indexed root")?;
+    anyhow::ensure!(indexed == root, "MCP index root mismatch: index belongs to {}, server root is {}",
+        indexed.display(), root.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod freshness_regression_tests {
+    use super::*;
+
+    #[test]
+    fn failed_source_refresh_is_retried_before_results_are_served() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("settings.toml");
+        std::fs::write(&file, "permission = true\n").unwrap();
+        let mut server = Server::start(ServerConfig {
+            root,
+            index_dir: temp.path().join("index"),
+            build: BuildOpts { embed: false, segmented: false, quiet: true, ..Default::default() },
+            force_rebuild: false,
+            watch: false,
+            default_top_k: 5,
+            search: Default::default(),
+        }).unwrap();
+        server.tool_search(&json!({"query":"permission"})).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        server.refresh_pending = true; // the state set when consuming an edit event
+        for _ in 0..2 {
+            assert!(server.tool_search(&json!({"query":"permission"})).is_err());
+            assert!(server.refresh_pending);
+        }
+        std::fs::write(&file, "financial_validation = true\n").unwrap();
+        let text = server.tool_search(&json!({"query":"financial_validation", "include_snippet":true})).unwrap();
+        assert!(text.contains("financial_validation = true"));
+        assert!(!server.refresh_pending);
     }
 }

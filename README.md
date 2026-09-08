@@ -480,6 +480,100 @@ Inference runs in-process, no Python at query time. Two backends:
   equivalence check; failed shapes are skipped, and encoding reports an error
   if no fitting shape passes. `HIPS_ENCODER=candle` forces the fallback.
 
+#### macOS caches and restricted processes
+
+CoreML uses two distinct caches. Compiled CodeRankEmbed shapes live at
+`<CSEARCH_CACHE_DIR>/coreml` (default `~/.cache/csearch/coreml`). Loading a
+shape creates another, device-specialized E5RT cache, normally under
+`~/Library/Caches/hips/com.apple.e5rt.e5bundlecache/`. Changing
+`CSEARCH_CACHE_DIR`, `HF_HOME`, `XDG_CACHE_HOME`, or `TMPDIR` does not relocate
+that E5RT cache.
+
+The macOS CLI supports an explicit writable cache base:
+
+```sh
+HIPS_COREML_CACHE_DIR="$PWD/.hips-coreml-cache" \
+  hips search --root /path/to/repo --query "permission validation"
+```
+
+Use a directory permitted by the sandbox and ignore it in your repository.
+The directory is created and checked for writes. An empty, invalid, or
+unwritable override is a configuration error: exit 1, no result output.
+CoreML's files appear below
+`<override>/Library/Caches/hips/com.apple.e5rt.e5bundlecache/`.
+
+Implementation limitation: [MLModelConfiguration](https://developer.apple.com/documentation/coreml/mlmodelconfiguration)
+has no public E5RT cache-directory property. The CLI sets
+`CFFIXED_USER_HOME` before starting threads or calling Foundation, using the
+home-directory override present in [Apple's CoreFoundation implementation](https://github.com/apple-oss-distributions/CF/blob/main/CFPlatform.c).
+This affects **all Foundation home-relative paths in the hips process**,
+including its child processes, and takes precedence over an inherited
+`CFFIXED_USER_HOME`. It does not change the shell's `HOME`, hips' index
+selection, or `HF_HOME`. This is an opt-in compatibility mechanism, not a
+CoreML API guarantee; verify it on your target macOS version. Library users
+must arrange `CFFIXED_USER_HOME` at process startup themselves; loading an
+encoder never mutates the process environment.
+
+Cache relocation does not grant access to macOS accelerator services. In
+Codex's workspace-write sandbox on macOS build `25G83`, a fresh relocated
+cache removed the E5RT filesystem exception, but CoreML still failed ANE
+compilation. `HIPS_COREML_COMPUTE_UNITS=cpu` selected CoreML's public CPU-only
+mode, but IOSurface shared-event creation failed and predictions contained
+NaNs. The default is `cpu-and-ane`; CPU-only mode is available for diagnosing
+or running in environments where it works. Neither setting bypasses the
+sandbox. A previously populated cache is not a guarantee that the required
+runtime services are available.
+
+hips checks cache writability, requires successful encoder warmup, and
+rejects wrong-sized, non-finite, zero, or non-normalized predictions before
+ranking or caching them. If CoreML initialization fails, it prints the
+cause and retries CodeRankEmbed with Candle, preferring Metal when a GPU is
+accessible and using CPU otherwise. The device check also prevents Candle's
+empty-device-list panic when the sandbox hides every GPU. Hybrid retrieval
+uses the same stored document vectors. This may increase startup time
+and memory usage. `HIPS_ENCODER=candle HPS_EMBED_DEVICE=cpu` explicitly selects
+that backend for one invocation if needed.
+
+If encoder initialization is still unavailable, default/hybrid search
+prints `using lexical BM25 only` to **stderr** and returns lexical results
+with exit 0. Missing embeddings or a build without the semantic feature also
+produce a visible fallback note, even without `-v`. Explicit `--mode semantic`
+and `--mode rerank` fail with exit 1 if semantic execution is unavailable.
+A prediction failure after initialization exits 1 without printing results.
+JSONL stdout contains only results; fallback diagnostics go to stderr.
+Buffered C stdout from synchronous CoreML calls is redirected to stderr and
+flushed before returning (also protecting MCP output). This briefly redirects
+the process stdout descriptor while holding Rust's stdout lock; library hosts
+with unrelated native stdout writers should account for that shared descriptor.
+
+Codex also documents `[sandbox_workspace_write].writable_roots` in its
+[configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+Adding the existing `~/Library/Caches/hips` path there can permit cache writes
+without relocation. Filesystem access does not grant accelerator-service access;
+no Codex settings are changed by hips.
+
+Fallback preserves index resolution and path rebasing: an exact `--root`
+index is preferred, otherwise the nearest indexed ancestor is searched.
+As before, a subdirectory root searches the entire ancestor index, with paths
+relative to the requested directory (including `../` hits); it is not a
+subtree filter. `--index` takes precedence. Failure never selects a different
+repository or searches a global index.
+
+The model-free regression suite covers invalid vectors, denied cache writes,
+configuration errors, fallback diagnostics, exit status, JSONL output, and
+ancestor-index resolution. For real CoreML coverage with cached models:
+
+```sh
+HIPS_TEST_COREML_MODELS="$HOME/.cache/csearch/coreml" \
+HIPS_TEST_HF_HOME="$HOME/.cache/huggingface" \
+  cargo test --features semantic --test search_runtime \
+  native_coreml_cache_relocation -- --ignored
+```
+
+Run this inside the intended sandbox; it checks both CoreML compute modes,
+cache relocation, finite results, and preservation of semantic execution
+through the CPU retry when platform services are denied.
+
 Cold indexing encodes each missing content key once, groups inputs by actual
 token length, and overlaps CPU tokenization with inference using a bounded
 two-batch queue. The model, token caps and row order are preserved. Compare
@@ -667,9 +761,10 @@ use the tool. `HIPS_NO_LOG=1` disables it.
 
 ### Installing for agents
 
-Agents get hips two ways, and both are wired up by one install: the CLI,
-which a skill teaches them to run (`hips search --root . --query ...`), and
-the MCP server, for clients that prefer tools over shell. The repo doubles
+The search skill uses a simple rule: **sandboxed shell → prefer MCP; no
+shell sandbox → prefer CLI**. MCP reuses its encoder and query cache across
+calls. If MCP is unavailable or serves another repository, use the CLI with
+an explicit `--root`. The repo doubles
 as a Claude Code plugin marketplace; the plugin gives Claude Code the `hips`
 skill, a keyword-gated routing hint on code-navigation prompts (also
 injected into subagents, which do not reliably see CLAUDE.md), a background
@@ -746,20 +841,21 @@ For OpenCode, Codex and any other agent that reads `~/.agents/skills`:
 
 ```sh
 cp -r skills/hips ~/.agents/skills/hips
+cp -r skills/hips-install ~/.agents/skills/hips-install # installation and Codex cache setup
 ln -s ../../../.agents/skills/hips ~/.config/opencode/skills/hips   # OpenCode
 ```
 
-`skills/hips/SKILL.md` is the source of truth; `plugin/hips/skills/hips/`
-is a copy that must be kept in sync. Agents without a skill mechanism get
+`skills/hips/` and `skills/hips-install/` are the source of truth; their
+copies under `plugin/hips/skills/` must be kept in sync. The install skill
+includes opt-in Codex cache permissions and sandbox verification. Agents without a skill mechanism get
 the same policy as a few lines in their instructions file (`AGENTS.md`,
 `CLAUDE.md`): search with hips before grep for any where-is-it or
 how-does-it-work question. Tested in non-interactive runs on this
 repository with no mention of hips in the prompt, Claude Code and Codex
-both open with a hips search (Claude alternates between the CLI and the MCP
-tool; Codex reads the skill and uses the CLI) and grep appears only to
-confirm hits.
+both opened with a hips search in earlier evaluations. The current skill
+prefers MCP for sandboxed shell execution and the CLI otherwise.
 
-The plugin also registers the MCP server. `hips mcp` serves the same index
+The plugin registers the MCP server for use when shell execution is sandboxed. `hips mcp` serves the same index
 over stdio, exposing three tools: `search_code` (ranked chunks with
 `path:line` locations, an optional `path_glob`, and fenced snippets),
 `index_status`, and `reindex`. With no `--root` it serves the git work tree
@@ -793,9 +889,69 @@ args = ["mcp"]
 Add `"--root", "/path/to/repo"` to pin a server to one repository. The
 server watches the tree itself (FSEvents / inotify) and rebuilds on the
 next tool call after a change, so it stays fresh with or without the
-session watcher. Note for Codex: its read-only shell sandbox lets `hips
-search` run but silently drops the usage-log write; searches through the
-MCP server, which runs outside the sandbox, are logged.
+session watcher. A client's MCP server can have a different launch context
+from its sandboxed shell commands; verify runtime access through the actual
+connected server. Adding filesystem cache permissions does not grant ANE,
+GPU, or IOSurface access to a sandboxed CLI.
+
+#### MCP diagnostics and scope
+
+`verbose` and `include_snippet` both default to `false`. Set
+`include_snippet: true` to include up to 4 source lines for every returned hit.
+Normal results include their effective retrieval mode and report any
+CoreML-to-Candle recovery. Hybrid or semantic inference failures produce
+`isError: true`; the server remains available for another call. An explicit
+lexical retry is labeled lexical. Failed hybrid retrieval never returns
+arbitrary results as success.
+
+```json
+{"query":"permission validation","mode":"semantic","top_k":5,"verbose":true,
+ "expected_root":"/absolute/path/to/repo"}
+```
+
+`verbose` adds a diagnostic text block and the same JSON data under
+`structuredContent.diagnostics`. It includes server PID/version, pinned and
+indexed roots, index directory, actual encoder backend, validated warmup,
+CoreML loaded model paths and cache directory, fallback reasons, per-hit
+scores, retrieval/total elapsed milliseconds, and query-cache reuse. Total
+time includes freshness checks and rebuilds; retrieval time includes any
+lazy encoder load. Repeating a query in the same server should report
+`query_cache_hit: true` for successful semantic execution.
+
+`index_status` accepts `{"verbose":true}` and reports the resident encoder
+and last search without initializing a model or rebuilding. A hybrid-capable
+index means vectors exist; it does not prove runtime availability.
+`backend: "coreml"` after a successful semantic search proves CoreML inference.
+CoreML `compute_units` are permitted devices, while
+`execution_device: "not_observed"` explicitly avoids claiming that individual
+operations ran on ANE. Candle reports its actual CPU or Metal device.
+
+`expected_root` rejects a request aimed at a different repository before
+retrieval or rebuilding. MCP also rejects an explicitly supplied index that
+belongs to another root, so snippets cannot be read from an unrelated tree.
+Use `path_glob` to filter within the pinned repository; it does not switch
+repositories. Debug diagnostics can contain local paths and error details;
+they are returned only when requested.
+
+Older versions could persist invalid document embeddings after native runtime
+failure: warmup errors were ignored and CoreML outputs were checked for shape,
+not finite values or normalization. Content-only cache reuse and unchanged-file
+shortcuts could then preserve those rows across later rebuilds. Ranked retrieval now validates stored vectors before the fast FP16
+scorer can turn NaNs into large finite scores. MCP automatically rebuilds affected files before semantic/hybrid retrieval,
+even when their source has not changed. Invalid cache entries become misses,
+so the rebuild re-encodes them. Missing vector sidecars are repaired too;
+deleted rows do not trigger repair. `index_status` with `verbose: true`
+reports `invalid_live_embeddings`, and successful repair is disclosed in the
+search response and `last_search.repaired_embeddings`. A failed repair is a
+tool error; explicit lexical search remains available. For the CLI, run
+`hips index-repo --root <repository>` to repair before retrying search.
+Normal watched source edits continue to trigger incremental reindexing. A
+failed source refresh remains pending and is retried; later calls cannot
+silently return the old locations.
+
+After installing an updated binary, reconnect/restart the MCP server and
+refresh its tool schema. Confirm `tools/list` advertises `verbose` before
+using it; an existing process continues running the old version.
 
 ### How rebuilds stay proportional to the edit
 

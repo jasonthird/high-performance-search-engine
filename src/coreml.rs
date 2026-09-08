@@ -92,6 +92,60 @@ mod shape_tests {
     }
 
     #[test]
+    fn native_diagnostics_go_to_stderr_and_stdout_is_restored_on_error() {
+        const CHILD: &str = "HIPS_TEST_NATIVE_DIAGNOSTICS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let result = (|| -> anyhow::Result<()> {
+                let _outer = NativeDiagnostics::stderr()?;
+                let _inner = NativeDiagnostics::stderr()?;
+                unsafe { libc::printf(c"buffered-native-diagnostic\n".as_ptr()); }
+                anyhow::bail!("prediction failed")
+            })();
+            assert!(result.is_err());
+            println!("stdout-restored");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "coreml::shape_tests::native_diagnostics_go_to_stderr_and_stdout_is_restored_on_error", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("stdout-restored"), "{stdout}");
+        assert!(!stdout.contains("buffered-native-diagnostic"), "{stdout}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("buffered-native-diagnostic"));
+    }
+
+    #[test]
+    fn cache_probe_creates_and_cleans_up_in_writable_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("new/cache");
+        check_cache_writable(&cache).unwrap();
+        assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cache_probe_reports_path_and_permission_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("denied");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = check_cache_writable(&cache);
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            let err = result.unwrap_err();
+            let diagnostic = format!("{err:#}");
+            assert!(diagnostic.contains("CoreML/E5RT cache is not writable"));
+            assert!(diagnostic.contains(cache.to_str().unwrap()));
+            assert!(diagnostic.contains("Permission denied"));
+        }
+        // File-in-the-way is deterministic even when tests run as root.
+        let file = temp.path().join("file");
+        std::fs::write(&file, "occupied").unwrap();
+        assert!(check_cache_writable(&file.join("cache")).is_err());
+    }
+
+    #[test]
     fn partial_families_cannot_silently_shorten_documents() {
         let query_only = CoreMlEncoder { docs: vec![], query: Some(shape(1, 64)) };
         assert!(!query_only.supports_documents(512));
@@ -111,15 +165,107 @@ pub fn model_dir() -> PathBuf {
     crate::codeindex::cache_root().join("coreml")
 }
 
+/// CoreML's device-specialized cache is separate from our compiled models.
+/// The public MLModelConfiguration API does not expose a relocation option.
+fn runtime_cache_dir() -> anyhow::Result<PathBuf> {
+    use objc2_foundation::{
+        NSBundle, NSProcessInfo, NSSearchPathDirectory, NSSearchPathDomainMask,
+        NSSearchPathForDirectoriesInDomains,
+    };
+    let dirs = NSSearchPathForDirectoriesInDomains(
+        NSSearchPathDirectory::CachesDirectory,
+        NSSearchPathDomainMask::UserDomainMask,
+        true,
+    );
+    let base = dirs.firstObject().context("macOS has no user cache directory")?;
+    let name = NSBundle::mainBundle().bundleIdentifier()
+        .unwrap_or_else(|| NSProcessInfo::processInfo().processName());
+    Ok(PathBuf::from(base.to_string()).join(name.to_string())
+        .join("com.apple.e5rt.e5bundlecache"))
+}
+
+/// Probe real create/write operations: mode bits and access(2) do not account
+/// for sandbox rules. This is a best-effort preflight, not a guarantee that
+/// every OS-specific runtime subdirectory will be writable.
+fn check_cache_writable(dir: &Path) -> anyhow::Result<()> {
+    (|| -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let probe = tempfile::Builder::new().prefix("hips-probe-").tempdir_in(dir)?;
+        std::fs::write(probe.path().join("probe"), b"cache probe")?;
+        probe.close()?;
+        Ok(())
+    })().with_context(|| format!("CoreML/E5RT cache is not writable at {}; set HIPS_COREML_CACHE_DIR to a writable directory (CLI)", dir.display()))
+}
+
+/// Some E5RT/IOSurface errors use buffered C stdout instead of NSError or
+/// stderr. Keep them off CLI JSONL and MCP protocol output. Holding Rust's
+/// stdout lock serializes these calls with Rust output; flush C stdio before
+/// restoring the descriptor so delayed native messages cannot leak at exit.
+struct NativeDiagnostics {
+    saved: std::os::fd::OwnedFd,
+    _stdout: std::io::StdoutLock<'static>,
+}
+
+impl NativeDiagnostics {
+    fn stderr() -> anyhow::Result<Self> {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        let mut stdout = std::io::stdout().lock();
+        stdout.flush()?;
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            let saved = libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 0);
+            anyhow::ensure!(saved >= 0, "save stdout for CoreML diagnostics: {}", std::io::Error::last_os_error());
+            let saved = std::os::fd::OwnedFd::from_raw_fd(saved);
+            anyhow::ensure!(libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) >= 0,
+                "redirect CoreML diagnostics: {}", std::io::Error::last_os_error());
+            Ok(Self { saved, _stdout: stdout })
+        }
+    }
+}
+
+impl Drop for NativeDiagnostics {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            libc::dup2(self.saved.as_raw_fd(), libc::STDOUT_FILENO);
+        }
+    }
+}
+
 fn load_model(path: &Path) -> anyhow::Result<Retained<MLModel>> {
+    let _diagnostics = NativeDiagnostics::stderr()?;
+    check_cache_writable(&runtime_cache_dir()?)?;
     let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
     let config = unsafe { MLModelConfiguration::new() };
-    unsafe { config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine) };
+    let units = match std::env::var("HIPS_COREML_COMPUTE_UNITS").as_deref() {
+        Ok("cpu") => MLComputeUnits::CPUOnly,
+        Ok("cpu-and-ane") | Err(std::env::VarError::NotPresent) => MLComputeUnits::CPUAndNeuralEngine,
+        _ => anyhow::bail!("HIPS_COREML_COMPUTE_UNITS must be cpu or cpu-and-ane"),
+    };
+    if crate::verbosity::verbose() {
+        eprintln!("CoreML compute units: {}; runtime cache: {}",
+            if units == MLComputeUnits::CPUOnly { "CPU only" } else { "CPU and Neural Engine" },
+            runtime_cache_dir()?.display());
+    }
+    unsafe { config.setComputeUnits(units) };
     unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
         .map_err(|e| anyhow::anyhow!("CoreML load {}: {e:?}", path.display()))
 }
 
 impl CoreMlEncoder {
+    pub fn diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "compute_units": std::env::var("HIPS_COREML_COMPUTE_UNITS").unwrap_or_else(|_| "cpu-and-ane".into()),
+            // Allowed units do not prove which device executed each operation.
+            "execution_device": "not_observed",
+            "runtime_cache_dir": runtime_cache_dir().ok(),
+            "loaded_models": self.docs.iter().chain(self.query.iter())
+                .filter(|m| m.model.get().is_some()).map(|m| &m.path).collect::<Vec<_>>(),
+        })
+    }
+
     /// Load the compiled model family, or `None` when the directory holds
     /// no usable models (the candle backend takes over).
     pub fn load() -> Option<Self> {
@@ -215,6 +361,7 @@ impl CoreMlEncoder {
 /// Run one prediction: pad `rows` into the model's (batch, seq) int32
 /// arrays, predict, and read back the normalized embeddings.
 fn run(m: &ShapeModel, rows: &[&[u32]]) -> anyhow::Result<Vec<Vec<f32>>> {
+    let _diagnostics = NativeDiagnostics::stderr()?;
     let (batch, seq) = (m.batch, m.seq);
     anyhow::ensure!(rows.len() <= batch, "too many rows for compiled batch");
 
@@ -303,8 +450,11 @@ fn run(m: &ShapeModel, rows: &[&[u32]]) -> anyhow::Result<Vec<Vec<f32>>> {
             anyhow::bail!("unexpected embedding dtype {dtype:?}");
         }
     }
-    Ok(flat
-        .chunks_exact(CODERANK_DIM)
-        .map(|c| c.to_vec())
-        .collect())
+    // Padded rows may have an all-zero mask; only real rows are observable.
+    let vectors: Vec<_> = flat.chunks_exact(CODERANK_DIM)
+        .take(rows.len()).map(|c| c.to_vec()).collect();
+    for vector in &vectors {
+        crate::embedder::validate_vector(vector).context("invalid CoreML prediction")?;
+    }
+    Ok(vectors)
 }

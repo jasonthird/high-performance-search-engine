@@ -103,7 +103,7 @@ fn serves_the_mcp_handshake_and_searches_code() {
         "search_code",
         json!({"query": "block max wand pivot threshold", "top_k": 3}),
     );
-    // Every hit must be an openable location, and the snippet must be fenced.
+    // Default output contains openable locations without snippets.
     let location = text
         .lines()
         .find(|l| l.starts_with("1. "))
@@ -115,7 +115,14 @@ fn serves_the_mcp_handshake_and_searches_code() {
         start.parse::<usize>().unwrap() <= end.parse::<usize>().unwrap(),
         "bad line range: {location}"
     );
-    assert!(text.contains("```rust"), "snippet not fenced:\n{text}");
+    assert!(!text.contains("```"), "snippets must be opt-in:\n{text}");
+    let snippets = client.tool_text(6, "search_code", json!({
+        "query":"search", "top_k":10, "include_snippet":true
+    }));
+    let bodies: Vec<&str> = snippets.split("```rust\n").skip(1)
+        .map(|s| s.split("\n```").next().unwrap()).collect();
+    assert_eq!(bodies.len(), 10, "all k hits get snippets: {snippets}");
+    assert!(bodies.iter().all(|s| s.lines().count() <= 4), "{snippets}");
 
     let status = client.tool_text(4, "index_status", json!({}));
     assert!(status.contains("chunks:"), "{status}");
@@ -221,5 +228,57 @@ fn answers_json_rpc_batches() {
     let status = client.tool_text(4, "index_status", json!({}));
     assert!(status.contains("root:"), "{status}");
 
+    std::fs::remove_dir_all(&cache).ok();
+}
+
+#[test]
+fn verbose_diagnostics_are_opt_in_and_reject_wrong_roots_and_modes() {
+    let cache = temp_cache("diagnostics");
+    let mut client = Client::start(&cache);
+    let tools = client.call(1, "tools/list", json!({}));
+    for tool in tools["result"]["tools"].as_array().unwrap().iter().take(2) {
+        assert_eq!(tool["inputSchema"]["properties"]["verbose"]["type"], "boolean");
+        assert_eq!(tool["inputSchema"]["properties"]["verbose"]["default"], false);
+    }
+    let status = client.call(2, "tools/call", json!({"name":"index_status", "arguments":{"verbose":true}}));
+    let debug = &status["result"]["structuredContent"]["diagnostics"];
+    assert_eq!(debug["index_loaded"], false, "status must not build the index");
+    assert_ne!(debug["encoder"]["state"], "ready");
+    assert_eq!(debug["last_search"], Value::Null);
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).canonicalize().unwrap();
+    assert_eq!(debug["root"], root.to_str().unwrap());
+    for args in [
+        json!({"query":"tokenizer", "mode":"typo", "verbose":true}),
+        json!({"query":"tokenizer", "expected_root":env!("CARGO_MANIFEST_DIR"), "verbose":true}),
+        json!({"query":"tokenizer", "top_k":0}),
+        json!({"query":"tokenizer", "verbose":"yes"}),
+        json!({"query":"tokenizer", "mode":42}),
+    ] {
+        let response = client.call(3, "tools/call", json!({"name":"search_code", "arguments":args}));
+        assert_eq!(response["result"]["isError"], true, "{response}");
+    }
+    let response = client.call(4, "tools/call", json!({"name":"search_code", "arguments":{
+        "query":"tokenizer", "verbose":true, "expected_root":root, "top_k":2, "include_snippet":false
+    }}));
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let debug = &response["result"]["structuredContent"]["diagnostics"];
+    let search = &debug["last_search"];
+    assert_eq!(search["effective_mode"], "lexical");
+    assert_eq!(search["success"], true);
+    assert_eq!(search["query_cache_hit"], false);
+    assert!(search["total_ms"].as_f64().unwrap() >= search["retrieval_ms"].as_f64().unwrap());
+    assert!(!search["hits"].as_array().unwrap().is_empty());
+    for hit in search["hits"].as_array().unwrap() {
+        assert!(root.join(hit["path"].as_str().unwrap()).is_file());
+        assert!(hit["score"].as_f64().unwrap().is_finite());
+    }
+    let compact = client.call(5, "tools/call", json!({"name":"search_code", "arguments":{"query":"tokenizer"}}));
+    assert!(compact["result"].get("structuredContent").is_none());
+    assert_eq!(compact["result"]["content"].as_array().unwrap().len(), 1);
+    assert!(!compact["result"]["content"][0]["text"].as_str().unwrap().contains("```"));
+    let explicit = client.call(6, "tools/call", json!({"name":"search_code", "arguments":{
+        "query":"tokenizer", "verbose":false, "include_snippet":false
+    }}));
+    assert_eq!(compact["result"], explicit["result"]);
     std::fs::remove_dir_all(&cache).ok();
 }

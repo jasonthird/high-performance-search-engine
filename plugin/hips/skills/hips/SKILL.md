@@ -1,67 +1,81 @@
 ---
 name: hips
-description: Primary code-search tool. Use it FIRST, before grep/ripgrep/find, for any question about where something is implemented, how a mechanism works, or which file/function is responsible — in any repository. Hybrid BM25 + CodeRankEmbed over declaration-sized chunks (and PDF pages) that keep their line numbers; one query returns ranked `path:line` locations and replaces several grep rounds. Fall back to ripgrep only for an exact literal you already know.
-compatibility: Requires the `hips` binary (`cargo install --git https://github.com/jasonthird/high-performance-search-engine --features semantic`). First use in a repo builds an index under ~/.cache/csearch.
-allowed-tools: Bash(hips *)
+description: Primary code search. Prefer hips MCP when shell execution is sandboxed, otherwise prefer the hips CLI. Use FIRST for questions about where something is implemented, how a mechanism works, or which file or function is responsible. Returns ranked path and line locations using hybrid BM25 and CodeRankEmbed.
 metadata:
-  version: "0.5.2"
+  version: "0.6.0"
   argument-hint: <describe what the code does>
 ---
 
-# Code navigation policy
+# Search with hips
 
-For ANY question about where something is implemented, how a mechanism works,
-or which file/function is responsible, your FIRST action is:
+For code navigation, use hips FIRST, before grep or file listing:
 
-    hips search --root . --query "<describe what the code does>" --top-k 10
+- **Sandboxed shell:** prefer MCP `search_code`:
+  `{"query":"<what the code does>","top_k":10}`.
+- **No shell sandbox:** prefer the CLI:
+  `hips search --root . --query "<what the code does>" --top-k 10`.
 
-- It is a hybrid semantic+lexical search: natural-language descriptions and
-  exact identifiers both work. Output is one ranked hit per line,
-  `path:startLine-endLine` then the declaration name, nothing else:
+If MCP is unavailable or serves a different repository, use the CLI with an
+explicit `--root`. Check the MCP root in its tool description or `index_status`
+when uncertain; a server does not follow shell `cd`. Pass `expected_root`
+with the absolute indexed repository root to reject mismatches. Use
+`path_glob` to restrict MCP results to a subtree.
 
-      src/repo.rs:700-722    chunk_pdf
-      src/repo.rs:663-675    pdf_text
+Open the top 1–3 returned `path:startLine-endLine` locations. Refine a query
+if needed; use grep for a known exact literal or when hips returns no relevant
+hits. Describe behavior rather than supplying a bag of keywords.
 
-  A `note:` line means the encoder was unavailable and results are BM25 only.
-  `--lexical` forces BM25 (exact identifiers, no encoder load); `--json`
-  gives one `{"id","path","start","end","name","score"}` object per line;
-  `-v` adds scores, timing and stats.
-- Open only the top 1-3 hits to confirm; do not fall back to grep/find
-  unless hips returned nothing relevant.
-- One good hips query usually replaces several grep rounds. Keep queries
-  descriptive ("heal live counts after crash"), not keyword soup.
+MCP `verbose` and `include_snippet` default to `false`. Request
+`include_snippet: true` only when needed: up to 4 lines for every returned hit.
 
-## Before running
+## Debugging MCP
 
-If `hips` is not on PATH, install it; do not fall back to grep instead:
+Use `search_code` with `verbose: true` on a representative query. The normal
+results stay readable; an additional text block and `structuredContent.diagnostics`
+report the server PID, root, index, actual encoder backend, CoreML settings,
+fallback reasons, finite hit scores, timing, and query-cache reuse.
 
-    cargo install --git https://github.com/jasonthird/high-performance-search-engine --features semantic
+Use `index_status` with `verbose: true` to inspect the resident encoder and
+last search without loading a model. `index_has_embeddings` means vectors
+exist; `encoder.state: not_loaded` is not proof that CoreML works. Run a
+semantic or hybrid search first. Repeating a successful query should report
+`query_cache_hit: true` in the same process.
 
-In Claude Code with the hips plugin, the index is built when the session
-opens and kept fresh by a background watcher for as long as any session has
-the repository open — do not run `index-repo`; a search issued right after
-an edit waits for the watcher's rebuild (about a second). Outside that setup,
-if a search says "no index for . yet":
+`backend: coreml` plus a successful semantic search confirms CoreML inference.
+Its `compute_units` are allowed devices; `execution_device: not_observed`
+means hips has not measured whether individual operations ran on CPU or ANE.
+`backend: candle` and `candle_device` identify the alternative runtime. A
+CoreML-to-Candle retry retains semantic search and is disclosed in the normal
+response. A failed hybrid/semantic call has `isError: true`; do not present it
+as a successful search. Report an explicit lexical recovery if one is used.
 
-    hips index-repo --root .
+After upgrading hips, reconnect/restart the MCP server to load the new binary
+and refresh the tool schema. Older servers may not accept `verbose` or
+`expected_root`; check `tools/list` or reconnect before using these fields.
 
-Builds once into `~/.cache/csearch/` (never inside the repo); later runs are
-incremental and take under a second for unchanged code. Without a watcher,
-re-run it after you edit files, or hits will point at old line numbers. Add
-`--lexical` to skip the embedding model when you only need exact-word
-matching. `hips status --root .` shows what is indexed, whether a watcher is
-running, and which sessions hold it; `hips watch --root .` runs one by hand.
+## CLI diagnostics and scope
 
-## Notes
+```sh
+hips search --root /absolute/path/to/repository --query "<what the code does>" --top-k 10
+```
 
-- `--root .` from a subdirectory of an indexed repository finds the
-  repository's index; hits are then printed relative to that subdirectory.
-- Honours `.gitignore`; skips `target/`, `node_modules/`, `.venv/`, symlinks.
-- Chunks are real declarations: 40 tree-sitter grammars (C, C++, Java, Go,
-  Python, JS/TS, Rust, C#, Ruby, PHP, Swift, Kotlin, ... and Markdown by
-  heading) cut files at functions, classes and methods, so a hit is one
-  unit and its name is qualified (`path::Class::method`). Other files use
-  a keyword heuristic; `.toml`/`.yaml` are indexed whole; PDFs per page
-  (`report.pdf::page 7`). `hips chunks --file X` shows how a file is cut.
-- Every search appends one JSON line to `~/.cache/csearch/usage.jsonl` for
-  later analysis. `HIPS_NO_LOG=1` disables it.
+Use `-v` for runtime diagnostics and `--json` for JSONL results. A `using
+lexical BM25` note means semantic retrieval was unavailable. A Candle retry
+can still provide hybrid results. Cache access alone does not grant macOS
+GPU, ANE, or IOSurface access; see the sibling `hips-install` skill for setup.
+
+The CLI can reuse the nearest indexed ancestor and rebase paths; this searches
+the entire ancestor, so `../` hits can be valid. MCP reports paths relative
+to its pinned root. Both honor `.gitignore` and skip common build directories.
+
+Indexes are maintained automatically in the MCP and plugin workflows. Do not
+run `index-repo` unless search reports no index or requests vector repair. Use `index_status` (MCP) or
+`hips status --root <repository>` (CLI) to inspect freshness; use MCP `reindex`
+if watching is unavailable. For installation or updates, use `hips-install`.
+`HIPS_NO_LOG=1` disables the usage log under `~/.cache/csearch/usage.jsonl`.
+
+MCP checks for invalid or missing live document embeddings before semantic
+search and rebuilds affected files, even if their text is unchanged. Debug
+status reports `invalid_live_embeddings`; search reports
+`repaired_embeddings`. A failed repair is an error, not a successful hybrid
+result. For CLI repair, run `hips index-repo --root <repository>` and retry.

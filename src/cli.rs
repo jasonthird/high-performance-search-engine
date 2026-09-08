@@ -205,7 +205,8 @@ enum Command {
         /// Ranking mode: embedding-first hybrid (default: encoder over all
         /// vectors + BM25 helper), lexical BM25, BM25-then-rerank, or
         /// encoder-only. Hybrid falls back to BM25 (with a note) when the
-        /// index has no embeddings or the binary lacks the encoder.
+        /// index has no embeddings or encoder initialization fails. Explicit
+        /// semantic/rerank modes fail if semantic execution is unavailable.
         #[arg(long, value_enum, default_value_t = RankMode::Hybrid)]
         mode: RankMode,
         /// Also accepted as an alias for `--mode hybrid`.
@@ -1128,16 +1129,16 @@ fn cmd_search(
     // vectors; fall back to lexical BM25 (with a note) rather than fail.
     let verbose = crate::verbosity::verbose();
     if opts.mode != RankMode::Bm25 && (!cfg!(feature = "semantic") || !index.has_vectors()) {
-        if verbose {
-            eprintln!(
-                "note: {} — using lexical BM25 (pass --mode bm25 to silence)",
-                if cfg!(feature = "semantic") {
-                    "index has no embeddings"
-                } else {
-                    "built without --features semantic"
-                }
-            );
-        }
+        let reason = if cfg!(feature = "semantic") {
+            "index has no embeddings"
+        } else {
+            "built without --features semantic"
+        };
+        anyhow::ensure!(
+            opts.mode == RankMode::Hybrid,
+            "requested {:?} search cannot proceed: {reason}", opts.mode
+        );
+        eprintln!("note: {reason} — using lexical BM25 (pass --mode bm25 to silence)");
         opts.mode = RankMode::Bm25;
     }
     // The encoder needs its weights on disk (or a network to fetch them).
@@ -1148,9 +1149,11 @@ fn cmd_search(
         match crate::embedder::Embedder::load() {
             Ok(e) => Some(e),
             Err(err) => {
+                if opts.mode != RankMode::Hybrid {
+                    return Err(err.context(format!("requested {:?} search cannot proceed", opts.mode)));
+                }
                 eprintln!(
-                    "note: CodeRankEmbed unavailable ({}); using lexical BM25 only",
-                    root_cause_line(&err)
+                    "note: CodeRankEmbed unavailable ({err:#}); using lexical BM25 only"
                 );
                 opts.mode = RankMode::Bm25;
                 None
@@ -1185,7 +1188,7 @@ fn cmd_search(
         query,
         top_k,
         &opts,
-    )?;
+    ).context("semantic query failed; no results returned")?;
     #[cfg(not(feature = "semantic"))]
     let timed = run_ranked(&index, query, top_k, &opts)?;
     let mut timed = timed;
@@ -1679,12 +1682,6 @@ fn print_json<'a>(hits: impl Iterator<Item = (&'a str, &'a str, f32)>) {
             })
         );
     }
-}
-
-/// The innermost message of an error chain, single-line.
-#[cfg(feature = "semantic")]
-fn root_cause_line(err: &anyhow::Error) -> String {
-    err.root_cause().to_string().lines().next().unwrap_or("").to_string()
 }
 
 fn print_outcome(query: &str, outcome: &searcher::SearchOutcome, url_template: Option<&str>) {

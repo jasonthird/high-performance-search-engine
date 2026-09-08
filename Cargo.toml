@@ -23,7 +23,7 @@ bytemuck = "1.25.0"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
 objc2 = { version = "0.6.4", optional = true }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError", "NSPathUtilities", "NSProcessInfo", "NSBundle"], optional = true }
 objc2-metal = { version = "0.3.2", optional = true }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
@@ -77,6 +77,7 @@ semantic = [
     "dep:objc2",
     "dep:objc2-foundation",
     "dep:objc2-core-ml",
+    "dep:objc2-metal",
 ]
 
 # Candle fork with fused Metal SDPA in NomicBert attention: 1.7x faster
