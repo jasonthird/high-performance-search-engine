@@ -159,6 +159,7 @@ pub fn write_keys(seg_dir: &Path, keys: &[u64]) -> anyhow::Result<()> {
 pub fn read_keys(seg_dir: &Path) -> anyhow::Result<Vec<u64>> {
     let bytes = std::fs::read(seg_dir.join("keys.bin"))
         .with_context(|| format!("no keys.bin in {}", seg_dir.display()))?;
+    anyhow::ensure!(bytes.len().is_multiple_of(8), "truncated keys.bin in {}", seg_dir.display());
     Ok(bytes
         .chunks_exact(8)
         .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
@@ -473,6 +474,8 @@ impl RepoIndexer {
         timer.mark("walk");
         let tree_fingerprint = repo::fingerprint(&files);
         let previous = Manifest::load(&self.index_dir).ok();
+        let merge_pending = crate::segments::SegmentedIndex::open(&self.index_dir)
+            .is_ok_and(|s| s.num_segments() > MAX_SEGMENTS);
         let repair_ids = self.invalid_embedding_ids()?;
         let repair_files: HashSet<&str> = repair_ids.iter()
             .filter_map(|id| repo::parse_id(id).map(|(path, _, _)| path)).collect();
@@ -489,6 +492,7 @@ impl RepoIndexer {
                 && prev.embedded == self.opts.embed
                 && !rechunk
                 && repair_ids.is_empty()
+                && !merge_pending
             {
                 self.log(format!(
                     "index up to date ({} chunks, fingerprint unchanged)",
@@ -742,16 +746,43 @@ impl RepoIndexer {
         let mut key_of: HashMap<String, u64> = HashMap::new();
         if self.opts.embed {
             let pre = crate::segments::SegmentedIndex::open(&self.index_dir)?;
+            #[cfg(feature = "semantic")]
+            let mut cache = crate::embcache::EmbedCache::load(&self.index_dir, crate::embeddings::CODERANK_DIM);
+            #[cfg(feature = "semantic")]
+            let mut cache_changed = false;
             for (si, name) in pre.segment_names().iter().enumerate() {
-                let keys = read_keys(&self.index_dir.join(name))?;
-                for doc_id in 0..pre.num_docs_in(si) {
-                    if pre.is_live(si, doc_id) {
-                        if let Some(&key) = keys.get(doc_id as usize) {
-                            key_of.insert(pre.doc_summary_in(si, doc_id).id, key);
+                let live: Vec<u32> = (0..pre.num_docs_in(si)).filter(|&id| pre.is_live(si, id)).collect();
+                // Interrupted encoding can leave both sidecars absent. Repair
+                // replaces those rows; a fully retired segment needs no keys.
+                if live.is_empty() { continue; }
+                let dir = self.index_dir.join(name);
+                let keys = read_keys(&dir)?;
+                anyhow::ensure!(keys.len() == pre.num_docs_in(si) as usize,
+                    "keys.bin row count mismatch in {}; repair live rows before merge", dir.display());
+                #[cfg(feature = "semantic")]
+                if live.iter().any(|&id| !cache.contains(keys[id as usize])) {
+                    // Cache eviction must not fail *after* merge has replaced
+                    // the source segments. Recover from their validated vectors.
+                    let store = crate::embeddings::EmbeddingStore::open(&dir)?;
+                    anyhow::ensure!(store.dim() as usize == crate::embeddings::CODERANK_DIM,
+                        "wrong embedding dimension in {}", dir.display());
+                    store.validate_live(|id| pre.is_live(si, id))?;
+                    let mut row = vec![0.0; crate::embeddings::CODERANK_DIM];
+                    for &id in &live {
+                        let key = keys[id as usize];
+                        if !cache.contains(key) {
+                            store.copy_f32(id, &mut row);
+                            cache.insert(key, &row);
+                            cache_changed = true;
                         }
                     }
                 }
+                for doc_id in live {
+                    key_of.insert(pre.doc_summary_in(si, doc_id).id, keys[doc_id as usize]);
+                }
             }
+            #[cfg(feature = "semantic")]
+            if cache_changed { cache.save(&self.index_dir)?; }
         }
         writer.merge_all()?;
         if !self.opts.embed {
@@ -1144,4 +1175,110 @@ mod tests {
         assert!(start <= end);
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+#[cfg(all(test, feature = "semantic"))]
+mod merge_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn merge_ignores_missing_sidecars_on_retired_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let indexer = RepoIndexer::new(&root, &temp.path().join("index"), BuildOpts {
+            embed: true, segmented: true, quiet: true, ..Default::default()
+        }).unwrap();
+        let mut writer = indexer.open_writer_waiting(WRITER_WAIT).unwrap();
+        let old = InputDoc { id: "old.toml:1-1".into(), title: "old".into(), body: "old permission".into() };
+        writer.upsert_documents_full(&[old.clone()]).unwrap();
+        writer.delete_documents(&[old.id]).unwrap();
+        let doc = InputDoc { id: "live.toml:1-1".into(), title: "live".into(), body: "permission validation".into() };
+        let segment = writer.upsert_documents_full(&[doc.clone()]).unwrap().new_segment.unwrap().0;
+        let key = crate::embcache::key_for(&format!("{}\n{}", doc.title, doc.body));
+        let mut vector = vec![0.0; crate::embeddings::CODERANK_DIM];
+        vector[0] = 1.0;
+        let mut cache = crate::embcache::EmbedCache::new(vector.len());
+        cache.insert(key, &vector);
+        cache.save(&indexer.index_dir).unwrap();
+        indexer.embed_segment(&indexer.index_dir.join(segment), &[doc.clone()]).unwrap();
+        // A lost cache entry must be recovered before destructive compaction.
+        std::fs::remove_file(indexer.index_dir.join(crate::embcache::CACHE_FILE)).unwrap();
+        indexer.merge_segments(&mut writer).unwrap();
+        let merged = crate::segments::SegmentedIndex::open(&indexer.index_dir).unwrap();
+        assert_eq!(merged.num_segments(), 1);
+        assert_eq!(merged.num_docs_live(), 1);
+        assert_eq!(merged.doc_summary_in(0, 0).id, doc.id);
+        let dir = indexer.index_dir.join(&merged.segment_names()[0]);
+        assert_eq!(read_keys(&dir).unwrap(), vec![key]);
+        crate::embeddings::EmbeddingStore::open(&dir).unwrap().validate_live(|_| true).unwrap();
+    }
+
+    fn seeded_index(temp: &Path) -> RepoIndexer {
+        let root = temp.join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("permission.toml"), "permission_validation = true\n").unwrap();
+        let dir = temp.join("index");
+        RepoIndexer::new(&root, &dir, BuildOpts {
+            embed: false, segmented: true, quiet: true, ..Default::default()
+        }).unwrap().build().unwrap();
+        let indexer = RepoIndexer::new(&root, &dir, BuildOpts {
+            embed: true, segmented: true, quiet: true, ..Default::default()
+        }).unwrap();
+        let docs = repo::docs_from_chunks(repo::chunk_files(&repo::walk(&root).unwrap())).unwrap();
+        let mut cache = crate::embcache::EmbedCache::new(crate::embeddings::CODERANK_DIM);
+        let mut vector = vec![0.0; crate::embeddings::CODERANK_DIM]; vector[0] = 1.0;
+        for doc in &docs {
+            cache.insert(crate::embcache::key_for(&format!("{}\n{}", doc.title, doc.body)), &vector);
+        }
+        cache.save(&dir).unwrap();
+        let index = crate::segments::SegmentedIndex::open(&dir).unwrap();
+        indexer.embed_segment(&dir.join(&index.segment_names()[0]), &docs).unwrap();
+        let mut manifest = Manifest::load(&dir).unwrap();
+        manifest.embedded = true;
+        manifest.save(&dir).unwrap();
+        indexer
+    }
+
+    #[test]
+    fn repairs_missing_and_truncated_live_keys_without_source_edits() {
+        for damaged in [None, Some(vec![0; 7]), Some(Vec::new())] {
+            let temp = tempfile::tempdir().unwrap();
+            let indexer = seeded_index(temp.path());
+            let index = crate::segments::SegmentedIndex::open(&indexer.index_dir).unwrap();
+            let keys = indexer.index_dir.join(&index.segment_names()[0]).join("keys.bin");
+            match damaged {
+                None => std::fs::remove_file(&keys).unwrap(),
+                Some(bytes) => std::fs::write(&keys, bytes).unwrap(),
+            }
+            assert_eq!(indexer.invalid_embedding_ids().unwrap().len(), 1);
+            let repaired = indexer.build().unwrap();
+            assert_eq!(repaired.num_docs, 1);
+            assert_eq!(repaired.encoded, 0, "reuse the valid cached vector");
+            assert_eq!(repaired.cached, 1);
+            assert!(indexer.invalid_embedding_ids().unwrap().is_empty());
+            assert!(!indexer.encoder_loaded(), "repair should not need a model");
+        }
+    }
+
+    #[test]
+    fn unchanged_source_still_compacts_pending_retired_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let indexer = seeded_index(temp.path());
+        {
+            let mut writer = indexer.open_writer_waiting(WRITER_WAIT).unwrap();
+            for i in 0..MAX_SEGMENTS {
+                let doc = InputDoc { id: format!("retired-{i}.toml:1-1"), title: "retired".into(), body: "old".into() };
+                writer.upsert_documents_full(&[doc.clone()]).unwrap();
+                writer.delete_documents(&[doc.id]).unwrap();
+            }
+        }
+        assert!(indexer.invalid_embedding_ids().unwrap().is_empty());
+        indexer.build().unwrap();
+        let index = crate::segments::SegmentedIndex::open(&indexer.index_dir).unwrap();
+        assert_eq!(index.num_segments(), 1);
+        assert_eq!(index.num_docs_live(), 1);
+        assert!(!indexer.encoder_loaded());
+    }
+
 }

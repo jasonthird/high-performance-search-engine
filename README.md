@@ -939,8 +939,12 @@ not finite values or normalization. Content-only cache reuse and unchanged-file
 shortcuts could then preserve those rows across later rebuilds. Ranked retrieval now validates stored vectors before the fast FP16
 scorer can turn NaNs into large finite scores. MCP automatically rebuilds affected files before semantic/hybrid retrieval,
 even when their source has not changed. Invalid cache entries become misses,
-so the rebuild re-encodes them. Missing vector sidecars are repaired too;
-deleted rows do not trigger repair. `index_status` with `verbose: true`
+so the rebuild re-encodes them. Missing vector sidecars and missing or truncated
+`keys.bin` metadata on live segments are repaired too. Fully retired segments
+need no sidecars during compaction. If an embedding-cache entry is missing,
+merge recovers it from a valid stored vector before replacing the source
+segments. Pending compaction runs even when the source tree is unchanged;
+deleted rows do not trigger re-encoding. `index_status` with `verbose: true`
 reports `invalid_live_embeddings`, and successful repair is disclosed in the
 search response and `last_search.repaired_embeddings`. A failed repair is a
 tool error; explicit lexical search remains available. For the CLI, run

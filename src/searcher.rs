@@ -60,6 +60,7 @@ pub struct AnyIndex {
     /// Per-segment embedding stores for a segmented index (None entries
     /// for segments without an embeddings sidecar).
     seg_stores: Option<crate::hybrid::SegmentStores>,
+    invalid_key_segments: Vec<bool>,
     /// Built on the first query that contains an unmatched term; clean
     /// workloads never pay for it.
     spell: OnceLock<SpellCorrector>,
@@ -124,9 +125,19 @@ impl AnyIndex {
             }
             IndexKind::Single(_) => None,
         };
+        // Keys are needed for later compaction even when vectors themselves
+        // are valid. An interrupted sidecar write must trigger repair too.
+        let invalid_key_segments = match &kind {
+            IndexKind::Segmented(seg) => seg.segment_names().iter().enumerate().map(|(si, name)| {
+                !std::fs::metadata(dir.join(name).join("keys.bin"))
+                    .is_ok_and(|m| m.is_file() && m.len() == u64::from(seg.num_docs_in(si)) * 8)
+            }).collect(),
+            IndexKind::Single(_) => Vec::new(),
+        };
         Ok(Self {
             kind,
             seg_stores,
+            invalid_key_segments,
             spell: OnceLock::new(),
             embeddings,
             ivf,
@@ -144,7 +155,7 @@ impl AnyIndex {
         self.seg_stores.as_ref()
     }
 
-    /// IDs whose live vector is missing or invalid. The row scan is cached
+    /// IDs whose live vector or merge-key metadata is missing or invalid. The row scan is cached
     /// by each immutable store; lexical callers need not pay for it.
     pub fn invalid_embedding_ids(&self) -> Vec<String> {
         use crate::indexer::SearchableIndex as _;
@@ -157,9 +168,13 @@ impl AnyIndex {
             IndexKind::Segmented(seg) => {
                 let mut ids = Vec::new();
                 for si in 0..seg.segment_names().len() {
-                    let rows = self.seg_stores.as_ref().and_then(|s| s.stores[si].as_ref())
-                        .map(|s| s.invalid_rows().to_vec())
-                        .unwrap_or_else(|| (0..seg.num_docs_in(si)).collect());
+                    let rows = if self.invalid_key_segments[si] {
+                        (0..seg.num_docs_in(si)).collect()
+                    } else {
+                        self.seg_stores.as_ref().and_then(|s| s.stores[si].as_ref())
+                            .map(|s| s.invalid_rows().to_vec())
+                            .unwrap_or_else(|| (0..seg.num_docs_in(si)).collect())
+                    };
                     ids.extend(rows.into_iter().filter(|&id| seg.is_live(si, id))
                         .map(|id| seg.doc_summary_in(si, id).id));
                 }
