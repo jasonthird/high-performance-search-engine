@@ -191,7 +191,7 @@ impl IgnoreSet {
             };
             let dir_only = rest.ends_with('/');
             let rest = rest.trim_end_matches('/');
-            let anchored = rest.trim_start_matches('/').contains('/');
+            let anchored = rest.starts_with('/') || rest.contains('/');
             let pattern = rest.trim_start_matches('/').to_string();
             if pattern.is_empty() {
                 continue;
@@ -658,7 +658,11 @@ fn read_ident(s: &str) -> Option<String> {
 /// take the whole index build down).
 fn pdf_pages(path: &Path) -> Option<Vec<String>> {
     let bytes = fs::read(path).ok()?;
-    let result = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&bytes));
+    extract_pdf_pages(path, &bytes)
+}
+
+fn extract_pdf_pages(path: &Path, bytes: &[u8]) -> Option<Vec<String>> {
+    let result = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(bytes));
     match result {
         Ok(Ok(pages)) => Some(pages),
         Ok(Err(e)) => {
@@ -713,7 +717,11 @@ fn normalize_pdf_page(page: &str) -> String {
 /// (see `pdf_text`), and each chunk is named by its page so a hit reads as
 /// `report.pdf::page 7`.
 pub fn chunk_pdf(rel: &str, abs: &Path) -> Vec<Chunk> {
-    let Some(pages) = pdf_pages(abs) else {
+    chunk_pdf_pages(rel, pdf_pages(abs))
+}
+
+fn chunk_pdf_pages(rel: &str, pages: Option<Vec<String>>) -> Vec<Chunk> {
+    let Some(pages) = pages else {
         return Vec::new();
     };
     let normalized: Vec<String> = pages.iter().map(|p| normalize_pdf_page(p)).collect();
@@ -900,7 +908,7 @@ pub fn fingerprint(files: &[SourceFile]) -> u64 {
 
 /// Read and chunk every source file under `root`.
 pub fn collect_chunks(root: &Path) -> anyhow::Result<Vec<Chunk>> {
-    Ok(chunk_files(&walk(root)?))
+    chunk_files(&walk(root)?)
 }
 
 /// Chunk an already-walked file list, so a caller that needs both the file
@@ -910,24 +918,28 @@ pub fn collect_chunks(root: &Path) -> anyhow::Result<Vec<Chunk>> {
 /// large tree this is otherwise a serial I/O-plus-string-scanning phase.
 /// `files` is sorted, and the per-file results are concatenated in that same
 /// order, so doc_id assignment stays deterministic.
-pub fn chunk_files(files: &[SourceFile]) -> Vec<Chunk> {
+pub fn chunk_files(files: &[SourceFile]) -> anyhow::Result<Vec<Chunk>> {
     let per_file: Vec<Vec<Chunk>> = files
         .par_iter()
         .map(|file| {
             if is_pdf(&file.rel) {
-                return chunk_pdf(&file.rel, &file.abs);
+                // Check readability separately: malformed PDFs may be skipped,
+                // but an I/O failure must not publish a successful empty file.
+                let bytes = fs::read(&file.abs).with_context(|| format!("read {}", file.abs.display()))?;
+                return Ok(chunk_pdf_pages(&file.rel, extract_pdf_pages(&file.abs, &bytes)));
             }
             match fs::read_to_string(&file.abs) {
-                Ok(text) => chunk_source(&file.rel, &text),
+                Ok(text) => Ok(chunk_source(&file.rel, &text)),
                 // Binary or non-UTF-8: skip it, as the walker's extension
                 // filter cannot rule this out on its own.
-                Err(_) => Vec::new(),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Ok(Vec::new()),
+                Err(e) => Err(e).with_context(|| format!("read {}", file.abs.display())),
             }
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
     // `collect` on an indexed parallel iterator preserves input order, so
     // flattening here yields the same sequence a serial walk would.
-    per_file.into_iter().flatten().collect()
+    Ok(per_file.into_iter().flatten().collect())
 }
 
 /// Chunk one file: grammar-aware when a tree-sitter grammar covers it and
@@ -966,6 +978,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn leading_slash_anchors_rules_to_their_ignore_layer() {
+        let ignores = IgnoreSet { layers: vec![
+            ("".into(), IgnoreSet::parse_layer("", "/lib\n/root.rs\n")),
+            ("pkg".into(), IgnoreSet::parse_layer("pkg", "/local/\n")),
+        ] };
+        assert!(ignores.is_ignored("lib", true));
+        assert!(!ignores.is_ignored("pkg/lib", true));
+        assert!(ignores.is_ignored("root.rs", false));
+        assert!(!ignores.is_ignored("pkg/root.rs", false));
+        assert!(ignores.is_ignored("pkg/local", true));
+        assert!(!ignores.is_ignored("pkg/deeper/local", true));
+    }
+
+    #[test]
+    fn chunking_reports_io_errors_but_skips_non_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.rs");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        let files = walk(temp.path()).unwrap();
+        assert!(chunk_files(&files).unwrap().is_empty());
+        std::fs::remove_file(&path).unwrap();
+        let error = chunk_files(&files).unwrap_err();
+        assert!(format!("{error:#}").contains("file.rs"));
+    }
+
+    #[test]
     fn chunks_carry_line_ranges() {
         let text = "use std::fs;\n\nfn alpha() {\n    1\n}\n\nfn beta() {\n    2\n}\n";
         let chunks = chunk_text("src/x.rs", text);
@@ -1000,7 +1038,7 @@ mod tests {
         // keyed positionally by doc_id, so this ordering is load-bearing.
         let files = walk(Path::new("src")).unwrap();
         assert!(files.len() > 5);
-        let chunks = chunk_files(&files);
+        let chunks = chunk_files(&files).unwrap();
         let mut seen: Vec<&str> = Vec::new();
         for chunk in &chunks {
             if seen.last() != Some(&chunk.path.as_str()) {
@@ -1016,7 +1054,7 @@ mod tests {
         sorted.sort();
         assert_eq!(seen, sorted, "files must stay in walk order");
         // And it must be stable across runs.
-        let again = chunk_files(&files);
+        let again = chunk_files(&files).unwrap();
         let ids: Vec<String> = chunks.iter().map(|c| c.id()).collect();
         let ids_again: Vec<String> = again.iter().map(|c| c.id()).collect();
         assert_eq!(ids, ids_again);

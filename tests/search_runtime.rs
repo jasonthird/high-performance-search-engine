@@ -629,3 +629,22 @@ fn hybrid_index_and_semantic_search_rank_by_meaning() {
         }
     }
 }
+
+#[cfg(feature = "semantic")]
+#[test]
+fn failed_migration_keeps_the_original_single_index_readable() {
+    let f = Fixture::new();
+    let before = std::fs::read(f.index.join("repo.json")).unwrap();
+    let meta = std::fs::read(f.index.join("meta.bin")).unwrap();
+    std::fs::write(f.root.join("outside.toml"), "new_content = true\n").unwrap();
+    let out = f.command().args(["index-repo", "--root"]).arg(&f.root)
+        .arg("--index").arg(&f.index)
+        .env("HIPS_ENCODER", "ggml").env("HPS_EMBED_DEVICE", "cpu").output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read(f.index.join("repo.json")).unwrap(), before);
+    assert_eq!(std::fs::read(f.index.join("meta.bin")).unwrap(), meta);
+    assert!(!f.index.join("manifest.bin").exists());
+    let index = high_performance_search_engine::searcher::AnyIndex::open(&f.index).unwrap();
+    assert_eq!(index.num_docs(), 2);
+    assert!(!index.search("permission", 5).results.is_empty());
+}

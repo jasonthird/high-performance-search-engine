@@ -347,16 +347,14 @@ fn stale_manifest_counts_self_heal() {
         writer.add_documents(&docs).unwrap();
         writer.delete_document("h-3").unwrap();
     }
-    // Simulate a crash between the tombstone write and the manifest write:
-    // roll the manifest back to the pre-delete state while the tombstone
-    // stays on disk.
-    let manifest_path = dir.join("manifest.bin");
-    let good = std::fs::read(&manifest_path).unwrap();
-    {
-        let mut writer = SegmentedWriter::open_or_create(&dir, true, 2).unwrap();
-        writer.delete_document("h-4").unwrap();
-    }
-    std::fs::write(&manifest_path, &good).unwrap();
+    // An old-format writer may have committed a bitmap before its manifest.
+    // Keep testing recovery of these legacy indexes without overwriting a
+    // modern manifest snapshot (modern deletes publish a new segment name).
+    let current = SegmentedIndex::open(&dir).unwrap();
+    let bitmap = dir.join(format!("{}.del", current.segment_names()[0]));
+    let mut words = std::fs::read(&bitmap).unwrap();
+    words[0] |= 1 << 4;
+    std::fs::write(bitmap, words).unwrap();
 
     // The reader recounts from the bitmaps: both deletions visible.
     let index = SegmentedIndex::open(&dir).unwrap();
@@ -457,4 +455,124 @@ fn failed_merge_sidecars_preserve_source_segments() {
     assert_eq!(merged.num_docs_live(), 2);
     assert_eq!(merged.num_segments(), 1);
     assert!(dir.join(&merged.segment_names()[0]).join("keys.bin").exists());
+}
+
+#[test]
+fn failed_upsert_commit_preserves_documents_and_writer_can_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, true, 2).unwrap();
+    let old = InputDoc { id: "item".into(), title: "original".into(), body: "oldtoken".into() };
+    writer.add_documents(&[old]).unwrap();
+    let snapshot = SegmentedIndex::open(dir).unwrap();
+    let manifest = std::fs::read(dir.join("manifest.bin")).unwrap();
+    let updated = InputDoc { id: "item".into(), title: "replacement".into(), body: "newtoken".into() };
+    let failed = writer.upsert_documents_prepared(std::slice::from_ref(&updated), &[], |_, _| {
+        std::fs::create_dir(dir.join("manifest.tmp"))?;
+        Ok(())
+    });
+    assert!(failed.is_err());
+    assert_eq!(std::fs::read(dir.join("manifest.bin")).unwrap(), manifest);
+    assert_eq!(SegmentedIndex::open(dir).unwrap().search("oldtoken", 10).results.len(), 1);
+    std::fs::remove_dir(dir.join("manifest.tmp")).unwrap();
+    writer.upsert_documents(std::slice::from_ref(&updated)).unwrap();
+    assert_eq!(snapshot.search("oldtoken", 10).results.len(), 1, "open readers keep the old snapshot");
+    let current = SegmentedIndex::open(dir).unwrap();
+    assert!(current.search("oldtoken", 10).results.is_empty());
+    assert_eq!(current.search("newtoken", 10).results.len(), 1);
+    drop(writer);
+    drop(SegmentedWriter::open_or_create(dir, true, 2).unwrap());
+    assert_eq!(SegmentedIndex::open(dir).unwrap().num_docs_live(), 1);
+}
+
+#[test]
+fn recovery_discards_unpublished_upsert_without_losing_original() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, true, 2).unwrap();
+    writer.add_documents(&generate_docs(2, 10, 1, "old")).unwrap();
+    let docs = generate_docs(2, 10, 2, "old");
+    assert!(writer.upsert_documents_prepared(&docs, &[], |_, _| {
+        std::fs::create_dir(dir.join("manifest.tmp"))?; Ok(())
+    }).is_err());
+    drop(writer);
+    std::fs::remove_dir(dir.join("manifest.tmp")).unwrap();
+    let mut recovered = SegmentedWriter::open_or_create(dir, true, 2).unwrap();
+    assert_eq!(SegmentedIndex::open(dir).unwrap().num_docs_live(), 2);
+    recovered.upsert_documents(&docs).unwrap();
+    assert_eq!(SegmentedIndex::open(dir).unwrap().num_docs_live(), 2);
+}
+
+#[test]
+fn delete_and_upsert_cover_duplicate_ids_in_and_across_segments() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, true, 2).unwrap();
+    let copies: Vec<_> = (0..2).map(|_| InputDoc {
+        id: "same".into(), title: "duplicate".into(), body: "oldtoken".into()
+    }).collect();
+    writer.add_documents(&copies).unwrap();
+    writer.add_documents(&copies).unwrap();
+    let (added, updated, unchanged) = writer.upsert_documents(&copies[..1]).unwrap();
+    assert_eq!((added, updated, unchanged), (0, 1, 0));
+    assert_eq!(SegmentedIndex::open(dir).unwrap().num_docs_live(), 1);
+    writer.add_documents(&copies).unwrap();
+    assert!(writer.delete_document("same").unwrap());
+    assert!(!writer.delete_document("same").unwrap());
+    assert_eq!(SegmentedIndex::open(dir).unwrap().num_docs_live(), 0);
+}
+
+#[test]
+fn manual_merge_preserves_live_vectors_keys_and_graph() {
+    use high_performance_search_engine::{codeindex, embeddings, hnsw};
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, true, 2).unwrap();
+    let first = writer.add_documents(&generate_docs(2, 10, 1, "first")).unwrap();
+    let second = writer.add_documents(&generate_docs(1, 10, 2, "second")).unwrap();
+    embeddings::write_f16(&dir.join(&first), 2, &[vec![1., 0.], vec![0., 1.]]).unwrap();
+    embeddings::write_f16(&dir.join(&second), 2, &[vec![-1., 0.]]).unwrap();
+    codeindex::write_keys(&dir.join(&first), &[11, 12]).unwrap();
+    codeindex::write_keys(&dir.join(&second), &[13]).unwrap();
+    let store = embeddings::EmbeddingStore::open(&dir.join(&first)).unwrap();
+    hnsw::HnswIndex::build(&store).unwrap().save(&dir.join(&first)).unwrap();
+    writer.delete_document("first-0").unwrap();
+    writer.merge_all().unwrap();
+    let merged = SegmentedIndex::open(dir).unwrap();
+    let dest = dir.join(&merged.segment_names()[0]);
+    let vectors = embeddings::EmbeddingStore::open(&dest).unwrap();
+    assert_eq!(vectors.num_docs(), 2);
+    assert!(vectors.cosine(0, &[0., 1.]) > 0.99);
+    assert!(vectors.cosine(1, &[-1., 0.]) > 0.99);
+    assert_eq!(codeindex::read_keys(&dest).unwrap(), vec![12, 13]);
+    assert!(vectors.hnsw().is_some());
+}
+
+#[test]
+fn manual_merge_missing_live_vectors_preserves_segments() {
+    use high_performance_search_engine::embeddings;
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, true, 2).unwrap();
+    let first = writer.add_documents(&generate_docs(1, 10, 1, "first")).unwrap();
+    writer.add_documents(&generate_docs(1, 10, 2, "second")).unwrap();
+    embeddings::write_f16(&dir.join(&first), 2, &[vec![1., 0.]]).unwrap();
+    let manifest = std::fs::read(dir.join("manifest.bin")).unwrap();
+    assert!(writer.merge_all().is_err());
+    assert_eq!(std::fs::read(dir.join("manifest.bin")).unwrap(), manifest);
+    assert_eq!(SegmentedIndex::open(dir).unwrap().num_docs_live(), 2);
+}
+
+#[test]
+fn failed_delete_can_be_followed_by_merge_without_stale_tombstones() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let mut writer = SegmentedWriter::open_or_create(dir, true, 2).unwrap();
+    writer.add_documents(&generate_docs(2, 10, 1, "first")).unwrap();
+    writer.add_documents(&generate_docs(1, 10, 2, "second")).unwrap();
+    std::fs::create_dir(dir.join("manifest.tmp")).unwrap();
+    assert!(writer.delete_document("first-0").is_err());
+    std::fs::remove_dir(dir.join("manifest.tmp")).unwrap();
+    writer.merge_all().unwrap();
+    assert_eq!(SegmentedIndex::open(dir).unwrap().num_docs_live(), 3);
 }

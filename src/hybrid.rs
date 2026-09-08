@@ -287,7 +287,10 @@ pub fn brute_force_semantic(
 /// Keep the best `k` rows by `cmp` without sorting the full candidate set:
 /// O(n) selection, then an O(k log k) sort of only the survivors.
 fn top_k_by<T>(rows: &mut Vec<T>, k: usize, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) {
-    let k = k.max(1);
+    if k == 0 {
+        rows.clear();
+        return;
+    }
     if rows.len() > k {
         rows.select_nth_unstable_by(k - 1, &cmp);
         rows.truncate(k);
@@ -314,6 +317,14 @@ mod tests {
     use super::*;
     use crate::block_max_wand::SearchHit;
     use crate::embeddings::{l2_normalize, write_f16, EmbeddingStore};
+
+    #[test]
+    fn zero_k_returns_no_vector_hits() {
+        let (dir, embeddings) = store_named("zero-k");
+        assert!(brute_force_semantic(&embeddings, &[1., 0., 0., 0.], 0).is_empty());
+        assert!(semantic_pool(&embeddings, &[1., 0., 0., 0.], 0, None, 0, None).is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     fn store() -> (std::path::PathBuf, EmbeddingStore) {
         store_named("hyb")

@@ -378,6 +378,8 @@ impl RepoIndexer {
     /// Worth doing after the tree has changed substantially; a normal
     /// rebuild reuses it.
     pub fn build_with(&self, retrain: bool) -> anyhow::Result<Manifest> {
+        // Outside the index directory so layout changes cannot replace the lock.
+        let _build_lock = wait_for_file_lock(&sibling(&self.index_dir, ".rebuild.lock"))?;
         if self.opts.segmented {
             return self.build_segmented();
         }
@@ -404,7 +406,7 @@ impl RepoIndexer {
                 }
             }
         }
-        let docs = repo::docs_from_chunks(repo::chunk_files(&files))?;
+        let docs = repo::docs_from_chunks(repo::chunk_files(&files)?)?;
         timer.mark("chunk");
         anyhow::ensure!(
             !docs.is_empty(),
@@ -477,10 +479,11 @@ impl RepoIndexer {
         let mut timer = PhaseTimer::new();
         // Read the inventory and live rows under the same writer lock used
         // for publication; a queued rebuild must not diff an older snapshot.
-        let writer = if !self.index_dir.join("meta.bin").exists()
-            || crate::segments::is_segmented(&self.index_dir) {
-            Some(self.open_writer_waiting(WRITER_WAIT)?)
-        } else { None }; // legacy single-layout migration below
+        if self.index_dir.join("meta.bin").exists()
+            && !crate::segments::is_segmented(&self.index_dir) {
+            return self.migrate_to_segments();
+        }
+        let mut writer = self.open_writer_waiting(WRITER_WAIT)?;
         let files = repo::walk(&self.root)?;
         timer.mark("walk");
         let tree_fingerprint = repo::fingerprint(&files);
@@ -553,7 +556,7 @@ impl RepoIndexer {
 
         // Chunk only the changed files.
         let changed_files: Vec<repo::SourceFile> = changed.iter().map(|f| (*f).clone()).collect();
-        let chunks = repo::chunk_files(&changed_files);
+        let chunks = repo::chunk_files(&changed_files)?;
         let mut docs_by_file: HashMap<String, Vec<crate::indexer::InputDoc>> = HashMap::new();
         for chunk in chunks {
             let path = chunk.path.clone();
@@ -561,32 +564,6 @@ impl RepoIndexer {
         }
         timer.mark("chunk");
 
-        // Migration: an index built with the old single layout cannot mix
-        // with segments. Wipe it and rebuild — but keep `embcache.bin`, so
-        // the migration costs seconds, not a re-encode of the repo.
-        if self.index_dir.join("meta.bin").exists()
-            && !crate::segments::is_segmented(&self.index_dir)
-        {
-            self.log("migrating single-layout index to segmented (vectors kept)".to_string());
-            for entry in std::fs::read_dir(&self.index_dir)?.flatten() {
-                if entry.file_name() != crate::embcache::CACHE_FILE.as_ref() as &std::ffi::OsStr {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        std::fs::remove_dir_all(&path).ok();
-                    } else {
-                        std::fs::remove_file(&path).ok();
-                    }
-                }
-            }
-        }
-        // Another writer (the background watcher, or a second agent's
-        // `index-repo`) may hold the index. Its rebuild is incremental and
-        // short, so wait for it rather than fail; whoever runs second
-        // usually finds the tree fingerprint already current.
-        let mut writer = match writer {
-            Some(writer) => writer,
-            None => self.open_writer_waiting(WRITER_WAIT)?,
-        };
         // Retain this marker on every error. A restarted MCP must retry even
         // when no new filesystem event arrives and all remaining vectors are valid.
         std::fs::write(self.index_dir.join("build.pending"), b"segmented build in progress\n")
@@ -746,6 +723,43 @@ impl RepoIndexer {
         _docs: &[crate::indexer::InputDoc],
     ) -> anyhow::Result<(usize, usize)> {
         anyhow::bail!("this binary was built without CodeRankEmbed")
+    }
+
+    /// Prepare a complete migration next to the index, then publish its segment
+    /// manifest last. Until that rename, the original single layout is intact.
+    /// Keep the live directory (and daemon/lock files) at the same inode.
+    fn migrate_to_segments(&self) -> anyhow::Result<Manifest> {
+        let _writer_lock = wait_for_file_lock(&self.index_dir.join("writer.lock"))?;
+        let parent = self.index_dir.parent().filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let staging = tempfile::Builder::new().prefix(".hips-migration-").tempdir_in(parent)?;
+        let cache = self.index_dir.join(crate::embcache::CACHE_FILE);
+        if cache.is_file() {
+            std::fs::copy(&cache, staging.path().join(crate::embcache::CACHE_FILE))?;
+        }
+        let staged = RepoIndexer::new(&self.root, staging.path(), self.opts.clone())?;
+        let manifest = staged.build_segmented()?;
+        let index = crate::segments::SegmentedIndex::open(staging.path())?;
+        // All source reads, encoding, and sidecar preparation succeeded before
+        // any live artifact changes. Old files remain available on publication errors.
+        std::fs::write(self.index_dir.join("build.pending"), b"migration publication in progress\n")?;
+        for name in index.segment_names() {
+            let dest = self.index_dir.join(&name);
+            // Only unpublished remnants of an earlier failed migration can
+            // have these names: this directory still has the single layout.
+            if dest.exists() { std::fs::remove_dir_all(&dest)?; }
+            std::fs::rename(staging.path().join(&name), &dest)?;
+        }
+        let staged_cache = staging.path().join(crate::embcache::CACHE_FILE);
+        if staged_cache.exists() { std::fs::rename(staged_cache, &cache)?; }
+        std::fs::rename(staging.path().join("manifest.bin"), self.index_dir.join("manifest.bin"))?;
+        manifest.save(&self.index_dir)?;
+        for name in ["meta.bin", "docs.bin", "postings.bin", "ids.bin", "hashes.bin",
+            "embeddings.bin", "ivf.bin", "pq.bin", "keys.bin"] {
+            let _ = std::fs::remove_file(self.index_dir.join(name));
+        }
+        std::fs::remove_file(self.index_dir.join("build.pending"))?;
+        Ok(manifest)
     }
 
     /// Merge all segments, then rebuild the merged segment's embeddings
@@ -1133,6 +1147,22 @@ impl RepoIndexer {
     }
 }
 
+fn wait_for_file_lock(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+    let deadline = Instant::now() + WRITER_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline =>
+                std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => anyhow::bail!("cannot lock {}: {e}", path.display()),
+        }
+    }
+}
+
 fn sibling(dir: &Path, suffix: &str) -> PathBuf {
     let mut name = dir.file_name().unwrap_or_default().to_os_string();
     name.push(suffix);
@@ -1245,7 +1275,7 @@ mod merge_recovery_tests {
         let indexer = RepoIndexer::new(&root, &dir, BuildOpts {
             embed: true, segmented: true, quiet: true, ..Default::default()
         }).unwrap();
-        let docs = repo::docs_from_chunks(repo::chunk_files(&repo::walk(&root).unwrap())).unwrap();
+        let docs = repo::docs_from_chunks(repo::chunk_files(&repo::walk(&root).unwrap()).unwrap()).unwrap();
         let mut cache = crate::embcache::EmbedCache::new(crate::embeddings::CODERANK_DIM);
         let mut vector = vec![0.0; crate::embeddings::CODERANK_DIM]; vector[0] = 1.0;
         for doc in &docs {

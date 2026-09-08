@@ -2135,12 +2135,12 @@ fn cmd_bench(
     anyhow::ensure!(!queries.is_empty(), "no queries found in file");
 
     if opts.mode == RankMode::Bm25 {
-        let index = storage::load_index(index_dir)?;
+        let index = searcher::AnyIndex::open(index_dir)?;
         for query in &queries {
-            searcher::search(&index, query, top_k);
+            index.search_raw(query, top_k);
         }
-        let report = bench::run(&index, &queries, top_k);
-        bench::print_report(&report, &index);
+        let report = bench::run_any(&index, &queries, top_k);
+        bench::print_report_docs(&report, index.num_docs());
         return Ok(());
     }
 

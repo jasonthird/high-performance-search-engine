@@ -277,11 +277,17 @@ impl AnyIndex {
         }
     }
 
-    fn search_raw(&self, query: &str, k: usize) -> SearchOutcome {
+    pub(crate) fn search_raw(&self, query: &str, k: usize) -> SearchOutcome {
         match &self.kind {
             IndexKind::Single(index) => search(index.as_ref(), query, k),
             IndexKind::Segmented(index) => index.search(query, k),
         }
+    }
+
+    pub(crate) fn query_postings(&self, query: &str) -> u64 {
+        let tokenizer = Tokenizer::with_flags(self.remove_stopwords(), self.code_mode());
+        let terms: std::collections::HashSet<_> = tokenizer.tokenize(query).into_iter().collect();
+        terms.iter().map(|t| self.term_df(t) as u64).sum()
     }
 
     pub fn num_docs(&self) -> u64 {

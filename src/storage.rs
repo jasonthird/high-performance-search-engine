@@ -594,7 +594,16 @@ impl DiskIndex {
     /// Resolve an external id to its doc_id via the hash sidecar
     /// (verifying against the doc store to rule out collisions).
     pub fn find_by_external_id(&self, id: &str) -> Option<u32> {
-        let ids = self.ids.as_ref()?;
+        self.find_all_by_external_id(id).into_iter().next()
+    }
+
+    /// All matching rows, including duplicates introduced by append-only adds.
+    pub fn find_all_by_external_id(&self, id: &str) -> Vec<u32> {
+        let Some(ids) = self.ids.as_ref() else {
+            return (0..self.num_docs as u32)
+                .filter(|&doc| self.doc_summary(doc).id == id).collect();
+        };
+        let mut found = Vec::new();
         let entries: &[u64] = bytemuck::cast_slice(&ids[..]);
         let target = id_hash(id);
         // entries = [hash, doc_id, hash, doc_id, ...] sorted by hash.
@@ -612,11 +621,11 @@ impl DiskIndex {
         while lo < n && entries[lo * 2] == target {
             let doc_id = entries[lo * 2 + 1] as u32;
             if self.doc_summary(doc_id).id == id {
-                return Some(doc_id);
+                found.push(doc_id);
             }
             lo += 1;
         }
-        None
+        found
     }
 
     /// Stored content hash of a document (u64::MAX if the sidecar is

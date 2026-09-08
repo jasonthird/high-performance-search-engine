@@ -43,11 +43,15 @@ impl TreeWatcher {
         let (flag, counter, watch_root) = (dirty.clone(), events.clone(), root.clone());
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            let Ok(event) = res else { return };
+            let Ok(event) = res else {
+                // Lost events require an inventory check, not silent staleness.
+                flag.store(true, Ordering::Release);
+                return;
+            };
             if !is_content_change(&event.kind) {
                 return;
             }
-            if event.paths.iter().any(|p| is_relevant(&watch_root, p)) {
+            if event.paths.iter().any(|p| is_relevant_event(&watch_root, p, &event.kind)) {
                 counter.fetch_add(1, Ordering::Relaxed);
                 flag.store(true, Ordering::Release);
             }
@@ -95,12 +99,19 @@ fn is_content_change(kind: &EventKind) -> bool {
 /// Would this path have been indexed? Editor swap files, build output, and
 /// anything gitignored must not trigger rebuilds.
 fn is_relevant(root: &Path, path: &Path) -> bool {
+    is_relevant_event(root, path, &EventKind::Any)
+}
+
+fn is_relevant_event(root: &Path, path: &Path, kind: &EventKind) -> bool {
     let Ok(rel) = path.strip_prefix(root) else {
         return false;
     };
     let rel = rel.to_string_lossy().replace('\\', "/");
     if rel.is_empty() {
-        return false;
+        return true;
+    }
+    if rel == ".git/info/exclude" || rel.rsplit('/').next() == Some(".gitignore") {
+        return true;
     }
     if rel.split('/').any(is_skipped_component) {
         return false;
@@ -110,9 +121,17 @@ fn is_relevant(root: &Path, path: &Path) -> bool {
     if name.starts_with('.') || name.ends_with('~') || name.starts_with('#') {
         return false;
     }
+    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    if path.is_dir() || matches!(kind,
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
+            | EventKind::Modify(ModifyKind::Name(_))) {
+        return true;
+    }
     match name.rsplit_once('.') {
         Some((_, ext)) => repo::SOURCE_EXTS.contains(&ext),
-        None => false,
+        // Removed directories no longer pass is_dir(). An extensionless
+        // path can be a directory notification for an entire source subtree.
+        None => true,
     }
 }
 
@@ -160,6 +179,19 @@ mod tests {
         assert!(!would_trigger(root, Path::new("/repo/src/main.rs~")));
         assert!(!would_trigger(root, Path::new("/repo/README.png")));
         assert!(!would_trigger(root, Path::new("/elsewhere/src/main.rs")));
+    }
+
+    #[test]
+    fn watches_ignore_inputs_and_directory_events() {
+        let root = Path::new("/repo");
+        for path in ["/repo/.gitignore", "/repo/nested/.gitignore", "/repo/.git/info/exclude", "/repo/removed_dir"] {
+            assert!(would_trigger(root, Path::new(path)), "{path}");
+        }
+        use notify::event::{ModifyKind, RenameMode, RemoveKind};
+        assert!(is_relevant_event(root, Path::new("/repo/old.v2"),
+            &EventKind::Modify(ModifyKind::Name(RenameMode::From))));
+        assert!(is_relevant_event(root, Path::new("/repo/removed.v2"),
+            &EventKind::Remove(RemoveKind::Folder)));
     }
 
     #[test]

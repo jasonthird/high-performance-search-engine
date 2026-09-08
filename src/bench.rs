@@ -33,7 +33,26 @@ fn percentile(sorted_ms: &[f64], pct: f64) -> f64 {
 
 /// Run every query once and aggregate latency and skipping statistics.
 pub fn run<I: SearchableIndex + ?Sized>(index: &I, queries: &[String], k: usize) -> BenchReport {
-    let num_docs = index.num_docs().max(1);
+    run_queries(index.num_docs(), queries,
+        |query| searcher::search(index, query, k),
+        |query| searcher::query_terms(index, query).iter()
+            .filter_map(|t| index.term_postings(t)).map(|t| t.df as u64).sum())
+}
+
+/// Benchmark the same uncorrected BM25 path over either on-disk layout.
+pub fn run_any(index: &searcher::AnyIndex, queries: &[String], k: usize) -> BenchReport {
+    run_queries(index.num_docs() as usize, queries,
+        |query| index.search_raw(query, k),
+        |query| index.query_postings(query))
+}
+
+fn run_queries(
+    num_docs: usize,
+    queries: &[String],
+    search: impl Fn(&str) -> searcher::SearchOutcome,
+    query_postings: impl Fn(&str) -> u64,
+) -> BenchReport {
+    let num_docs = num_docs.max(1);
     let mut latencies = Vec::with_capacity(queries.len());
     let mut postings_visited = 0u64;
     let mut docs_scored = 0u64;
@@ -44,7 +63,7 @@ pub fn run<I: SearchableIndex + ?Sized>(index: &I, queries: &[String], k: usize)
     let mut postings_ratio_count = 0usize;
 
     for query in queries {
-        let outcome = searcher::search(index, query, k);
+        let outcome = search(query);
         latencies.push(outcome.took_ms);
         postings_visited += outcome.stats.num_postings_visited as u64;
         docs_scored += outcome.stats.num_docs_scored as u64;
@@ -54,11 +73,7 @@ pub fn run<I: SearchableIndex + ?Sized>(index: &I, queries: &[String], k: usize)
 
         // Total postings across this query's terms = the work a term-at-a-time
         // exhaustive evaluation would do.
-        let term_postings: u64 = searcher::query_terms(index, query)
-            .iter()
-            .filter_map(|t| index.term_postings(t))
-            .map(|t| t.df as u64)
-            .sum();
+        let term_postings = query_postings(query);
         if term_postings > 0 {
             postings_ratio_sum += outcome.stats.num_postings_visited as f64 / term_postings as f64;
             postings_ratio_count += 1;
@@ -89,6 +104,10 @@ pub fn run<I: SearchableIndex + ?Sized>(index: &I, queries: &[String], k: usize)
 }
 
 pub fn print_report<I: SearchableIndex + ?Sized>(report: &BenchReport, index: &I) {
+    print_report_docs(report, index.num_docs() as u64);
+}
+
+pub fn print_report_docs(report: &BenchReport, num_docs: u64) {
     println!("queries:                 {}", report.num_queries);
     println!("avg latency:             {:.3} ms", report.avg_ms);
     println!("p50 latency:             {:.3} ms", report.p50_ms);
@@ -103,7 +122,7 @@ pub fn print_report<I: SearchableIndex + ?Sized>(report: &BenchReport, index: &I
     println!("avg blocks skipped:      {:.1}", report.avg_blocks_skipped);
     println!(
         "avg docs scored / corpus ({} docs):            {:.4}%",
-        index.num_docs(),
+        num_docs,
         report.avg_docs_scored_ratio * 100.0
     );
     println!(

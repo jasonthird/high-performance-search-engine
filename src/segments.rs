@@ -57,7 +57,7 @@ struct SegmentEntry {
     live_len: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct Manifest {
     version: u32,
     next_segment: u64,
@@ -601,6 +601,7 @@ impl SegmentedWriter {
     ) -> anyhow::Result<SegmentEntry> {
         anyhow::ensure!(!docs.is_empty(), "no documents to add");
         let name = format!("seg-{:06}", self.manifest.next_segment);
+        self.clear_unpublished(&name)?;
         let index = crate::indexer::build_index_weighted_ex(
             docs,
             self.manifest.remove_stopwords,
@@ -626,62 +627,85 @@ impl SegmentedWriter {
     }
 
     fn publish_segment(&mut self, entry: SegmentEntry) -> anyhow::Result<()> {
-        self.manifest.segments.push(entry);
-        self.manifest.next_segment += 1;
-        write_manifest(&self.dir, &self.manifest)
+        let mut next = self.manifest.clone();
+        next.segments.push(entry);
+        next.next_segment += 1;
+        self.commit(next)
     }
 
-    /// Tombstone a batch of documents by external id in one pass: each
-    /// segment is opened once and its tombstone file written once, however
-    /// many ids it holds. A 200-file refactor tombstones hundreds of chunks;
-    /// per-id deletion would reload every segment for each of them.
-    /// Returns how many ids were found and tombstoned.
-    pub fn delete_documents(&mut self, external_ids: &[String]) -> anyhow::Result<usize> {
-        if external_ids.is_empty() {
-            return Ok(0);
-        }
-        let mut remaining: std::collections::HashSet<&str> =
-            external_ids.iter().map(String::as_str).collect();
-        let mut deleted = 0usize;
-        for entry in self.manifest.segments.iter_mut() {
-            if remaining.is_empty() {
-                break;
-            }
-            let index = storage::load_index(&self.dir.join(&entry.name))?;
-            let mut tombstones: Option<Vec<u64>> = None;
-            let mut found: Vec<&str> = Vec::new();
-            for &id in remaining.iter() {
-                let Some(doc_id) = index.find_by_external_id(id) else {
-                    continue;
-                };
-                let words = match &mut tombstones {
-                    Some(w) => w,
-                    None => {
-                        let mut w = read_tombstones(&self.dir, &entry.name, entry.num_docs)?;
-                        w.resize((entry.num_docs as usize).div_ceil(64), 0);
-                        tombstones.insert(w)
+    fn commit(&mut self, next: Manifest) -> anyhow::Result<()> {
+        write_manifest(&self.dir, &next)?;
+        self.manifest = next;
+        Ok(())
+    }
+
+    /// Discard artifacts of a failed attempt before reusing its sequence number.
+    fn clear_unpublished(&self, name: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.manifest.segments.iter().any(|e| e.name == name),
+            "cannot overwrite published segment {name}");
+        let path = self.dir.join(name);
+        if path.exists() { fs::remove_dir_all(path)?; }
+        let path = tombstone_path(&self.dir, name);
+        if path.exists() { fs::remove_file(path)?; }
+        Ok(())
+    }
+
+    /// Stage deletions under new segment names. Immutable files are hard-linked
+    /// (copied when links are unavailable); only the tombstone bitmap is new.
+    /// The existing manifest and its files stay readable until one commit
+    /// publishes all replacements and deletions together, without a format change.
+    fn publish_changes(&mut self, ids: &[String], prepared: Option<SegmentEntry>) -> anyhow::Result<usize> {
+        let mut next = self.manifest.clone();
+        if prepared.is_some() { next.next_segment += 1; }
+        let requested: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut found = std::collections::HashSet::new();
+        if !requested.is_empty() {
+            for entry in &mut next.segments {
+                let index = storage::load_index(&self.dir.join(&entry.name))?;
+                let mut words = read_tombstones(&self.dir, &entry.name, entry.num_docs)?;
+                words.resize((entry.num_docs as usize).div_ceil(64), 0);
+                let mut changed = false;
+                for &id in &requested {
+                    for doc in index.find_all_by_external_id(id) {
+                        if bit_is_set(&words, doc) { continue; }
+                        set_bit(&mut words, doc);
+                        entry.live_docs -= 1;
+                        entry.live_len -= index.doc_len(doc) as u64;
+                        found.insert(id);
+                        changed = true;
                     }
-                };
-                if bit_is_set(words, doc_id) {
-                    continue; // already tombstoned
                 }
-                set_bit(words, doc_id);
-                entry.live_docs -= 1;
-                entry.live_len -= index.doc_len(doc_id) as u64;
-                deleted += 1;
-                found.push(id);
-            }
-            if let Some(words) = tombstones {
-                write_tombstones(&self.dir, &entry.name, &words)?;
-            }
-            for id in found {
-                remaining.remove(id);
+                if !changed { continue; }
+                let name = format!("seg-{:06}", next.next_segment);
+                next.next_segment += 1;
+                self.clear_unpublished(&name)?;
+                let dest = self.dir.join(&name);
+                fs::create_dir(&dest)?;
+                for file in fs::read_dir(self.dir.join(&entry.name))? {
+                    let file = file?;
+                    if file.file_type()?.is_file() {
+                        let target = dest.join(file.file_name());
+                        if fs::hard_link(file.path(), &target).is_err() {
+                            fs::copy(file.path(), &target)?;
+                        }
+                    }
+                }
+                write_tombstones(&self.dir, &name, &words)?;
+                entry.name = name;
             }
         }
-        if deleted > 0 {
-            write_manifest(&self.dir, &self.manifest)?;
-        }
-        Ok(deleted)
+        let has_prepared = prepared.is_some();
+        if let Some(entry) = prepared { next.segments.push(entry); }
+        if has_prepared || !found.is_empty() { self.commit(next)?; }
+        // Retired files remain until the next writer's recovery. Existing read
+        // handles keep their snapshot, and no current bitmap was overwritten.
+        Ok(found.len())
+    }
+
+    /// Delete every live copy of each external id in a single manifest commit.
+    /// Returns the number of distinct IDs found, even if an ID had duplicates.
+    pub fn delete_documents(&mut self, external_ids: &[String]) -> anyhow::Result<usize> {
+        self.publish_changes(external_ids, None)
     }
 
     /// Tombstone a document by external id. Returns true if found.
@@ -692,8 +716,7 @@ impl SegmentedWriter {
 
     /// Update = delete (if present) + add as a new segment.
     pub fn update_document(&mut self, doc: InputDoc) -> anyhow::Result<()> {
-        self.delete_document(&doc.id)?;
-        self.add_documents(&[doc])?;
+        self.upsert_documents(&[doc])?;
         Ok(())
     }
 
@@ -730,15 +753,12 @@ impl SegmentedWriter {
                 Ok((entry.name.clone(), index, deleted, entry.num_docs))
             })
             .collect::<anyhow::Result<_>>()?;
-        let live_lookup = |id: &str| -> Option<(usize, u32, u64)> {
-            for (si, (_, index, deleted, _)) in segments.iter().enumerate() {
-                if let Some(doc_id) = index.find_by_external_id(id) {
-                    if !bit_is_set(deleted, doc_id) {
-                        return Some((si, doc_id, index.content_hash(doc_id)));
-                    }
-                }
-            }
-            None
+        let live_lookup = |id: &str| -> Vec<u64> {
+            segments.iter().flat_map(|(_, index, deleted, _)| {
+                index.find_all_by_external_id(id).into_iter()
+                    .filter(|&doc| !bit_is_set(deleted, doc))
+                    .map(|doc| index.content_hash(doc)).collect::<Vec<_>>()
+            }).collect()
         };
 
         // Within one batch the last occurrence of an id wins; without this
@@ -764,16 +784,16 @@ impl SegmentedWriter {
         let mut unchanged = 0usize;
         for &doc in &docs {
             let new_hash = crate::indexer::content_hash(&doc.title, &doc.body);
-            match live_lookup(&doc.id) {
-                Some((_, _, stored)) if stored == new_hash && !forced.contains(doc.id.as_str()) => unchanged += 1,
-                Some(_) => {
+            match live_lookup(&doc.id).as_slice() {
+                [stored] if *stored == new_hash && !forced.contains(doc.id.as_str()) => unchanged += 1,
+                [] => {
+                    to_add.push(doc.clone());
+                    added += 1;
+                }
+                _ => {
                     to_delete.push(doc.id.clone());
                     to_add.push(doc.clone());
                     updated += 1;
-                }
-                None => {
-                    to_add.push(doc.clone());
-                    added += 1;
                 }
             }
         }
@@ -782,12 +802,8 @@ impl SegmentedWriter {
         } else {
             Some(self.prepare_segment(&to_add, prepare)?)
         };
-        let deleted = self.delete_documents(&to_delete)?;
-        let new_segment = if let Some(entry) = prepared {
-            let name = entry.name.clone();
-            self.publish_segment(entry)?;
-            Some((name, to_add))
-        } else { None };
+        let new_segment = prepared.as_ref().map(|entry| (entry.name.clone(), to_add));
+        let deleted = self.publish_changes(&to_delete, prepared)?;
         Ok((UpsertOutcome {
             added,
             updated,
@@ -806,18 +822,59 @@ impl SegmentedWriter {
     /// merged segment scores identically to a from-scratch rebuild of the
     /// live documents.
     pub fn merge_all(&mut self) -> anyhow::Result<()> {
-        self.merge_all_prepared(|_| Ok(()))
+        if !self.needs_merge() { return Ok(()); }
+        let pre = SegmentedIndex::open(&self.dir)?;
+        let has_vectors = self.manifest.segments.iter().any(|e|
+            e.live_docs > 0 && self.dir.join(&e.name).join("embeddings.bin").exists());
+        let has_keys = self.manifest.segments.iter().any(|e|
+            e.live_docs > 0 && self.dir.join(&e.name).join("keys.bin").exists());
+        anyhow::ensure!(!has_keys || has_vectors, "merge keys have no embeddings; repair the index before merging");
+        let mut vectors = Vec::new();
+        let mut keys = Vec::new();
+        let mut dim = None;
+        let mut had_graph = false;
+        if has_vectors {
+            for (si, entry) in self.manifest.segments.iter().enumerate() {
+                if entry.live_docs == 0 { continue; }
+                let dir = self.dir.join(&entry.name);
+                let store = crate::embeddings::EmbeddingStore::open(&dir)?;
+                anyhow::ensure!(store.num_docs() == entry.num_docs, "embedding row count mismatch in {}", dir.display());
+                anyhow::ensure!(dim.is_none_or(|d| d == store.dim()), "embedding dimension mismatch");
+                dim = Some(store.dim());
+                store.validate_live(|id| pre.is_live(si, id))?;
+                let segment_keys = if has_keys { crate::codeindex::read_keys(&dir)? } else { Vec::new() };
+                anyhow::ensure!(!has_keys || segment_keys.len() == entry.num_docs as usize, "merge key count mismatch");
+                had_graph |= dir.join(crate::hnsw::FILE).exists();
+                for id in 0..entry.num_docs {
+                    if !pre.is_live(si, id) { continue; }
+                    let mut row = vec![0.0; store.dim() as usize];
+                    store.copy_f32(id, &mut row);
+                    vectors.push(row);
+                    if has_keys { keys.push(segment_keys[id as usize]); }
+                }
+            }
+        }
+        self.merge_all_prepared(|dir| {
+            if let Some(dim) = dim {
+                crate::embeddings::write_f16(dir, dim, &vectors)?;
+                if has_keys { crate::codeindex::write_keys(dir, &keys)?; }
+                if had_graph && !vectors.is_empty() {
+                    let store = crate::embeddings::EmbeddingStore::open(dir)?;
+                    crate::hnsw::HnswIndex::build(&store)?.save(dir)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn needs_merge(&self) -> bool {
+        self.manifest.segments.len() > 1 || self.manifest.segments.first()
+            .is_some_and(|e| e.live_docs != e.num_docs)
     }
 
     /// Finish dependent sidecars before switching readers to the merged index.
     pub fn merge_all_prepared(&mut self, prepare: impl FnOnce(&Path) -> anyhow::Result<()>) -> anyhow::Result<()> {
-        let needs_merge = self.manifest.segments.len() > 1
-            || self
-                .manifest
-                .segments
-                .first()
-                .is_some_and(|e| e.live_docs != e.num_docs);
-        if !needs_merge {
+        if !self.needs_merge() {
             return Ok(());
         }
 
@@ -851,6 +908,7 @@ impl SegmentedWriter {
 
         let name = format!("seg-{:06}", self.manifest.next_segment);
         let out_dir = self.dir.join(&name);
+        self.clear_unpublished(&name)?;
         fs::create_dir_all(&out_dir)?;
 
         // --- docs.bin + doc_lens + ids.bin: raw-copy live records --------
@@ -1007,15 +1065,16 @@ impl SegmentedWriter {
         }
 
         // Commit: new manifest first, then remove the old segments.
-        self.manifest.segments = vec![SegmentEntry {
+        let mut next = self.manifest.clone();
+        next.segments = vec![SegmentEntry {
             name: name.clone(),
             num_docs: num_docs as u32,
             total_len,
             live_docs: num_docs as u32,
             live_len: total_len,
         }];
-        self.manifest.next_segment += 1;
-        write_manifest(&self.dir, &self.manifest)?;
+        next.next_segment += 1;
+        self.commit(next)?;
         for entry in &old {
             fs::remove_dir_all(self.dir.join(&entry.name)).ok();
             fs::remove_file(tombstone_path(&self.dir, &entry.name)).ok();

@@ -117,6 +117,7 @@ impl Server {
             None
         };
         let manifest_mtime = manifest_mtime(&config.index_dir);
+        let refresh_pending = config.watch;
         Ok(Self {
             indexer,
             index,
@@ -125,7 +126,7 @@ impl Server {
             config,
             rebuilds: 0,
             last_search: None,
-            refresh_pending: false,
+            refresh_pending,
             manifest_mtime,
         })
     }
@@ -418,6 +419,7 @@ impl Server {
             "search_code" => self.tool_search(args),
             "index_status" => self.tool_status(),
             "reindex" => {
+                self.refresh_pending = true;
                 let before = self.manifest.num_docs;
                 let retrain = args.get("retrain").and_then(Value::as_bool).unwrap_or(false);
                 // This rebuild covers all watcher events seen so far; clear
@@ -529,15 +531,27 @@ impl Server {
 
         // A path filter is applied after retrieval, so over-fetch to keep
         // `top_k` results reachable through the filter.
-        let fetch = if path_glob.is_some() {
-            (top_k * 8).min(500)
+        let mut fetch = if path_glob.is_some() {
+            top_k.saturating_mul(8)
         } else {
             top_k
         };
         let started = std::time::Instant::now();
         let effective_mode = mode.unwrap_or(if self.hybrid_enabled() { "hybrid" } else { "lexical" });
         let query_cache_hit = effective_mode != "lexical" && self.indexer.query_cached(&query);
-        let hits = self.retrieve(&query, fetch, mode)?;
+        // A global cutoff cannot prove that a scoped query has no matches.
+        // Expand until the scope has enough hits or every document was eligible.
+        let total_docs = self.index()?.num_docs() as usize;
+        fetch = fetch.min(total_docs).max(1);
+        let hits = loop {
+            let hits = self.retrieve(&query, fetch, mode)?;
+            let scoped = hits.iter().filter(|h| path_glob.as_ref()
+                .is_none_or(|glob| repo::glob_match(glob, &h.path))).count();
+            if path_glob.is_none() || scoped >= top_k || fetch >= total_docs {
+                break hits;
+            }
+            fetch = fetch.saturating_mul(2).min(total_docs);
+        };
         anyhow::ensure!(hits.iter().all(|h| h.score.is_finite() &&
             h.components.is_none_or(|(b, s)| b.is_finite() && s.is_finite())),
             "search returned non-finite scores; results withheld");
@@ -900,6 +914,67 @@ fn validate_index_root(manifest: &Manifest, root: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod freshness_regression_tests {
     use super::*;
+
+    fn lexical_config(root: PathBuf, index_dir: PathBuf, watch: bool, segmented: bool) -> ServerConfig {
+        ServerConfig {
+            root, index_dir,
+            build: BuildOpts { embed: false, segmented, quiet: true, ..Default::default() },
+            force_rebuild: false, watch, default_top_k: 5, search: Default::default(),
+        }
+    }
+
+    #[test]
+    fn startup_refreshes_edits_made_before_the_watcher_started() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("settings.toml");
+        std::fs::write(&file, "obsolete = true\n").unwrap();
+        let config = lexical_config(root, temp.path().join("index"), true, true);
+        RepoIndexer::new(&config.root, &config.index_dir, config.build.clone()).unwrap().build().unwrap();
+        std::fs::write(file, "replacement_property = true\n").unwrap();
+        let mut server = Server::start(config).unwrap();
+        let text = server.tool_search(&json!({"query":"replacement_property", "include_snippet":true})).unwrap();
+        assert!(text.contains("replacement_property = true"), "{text}");
+        assert_eq!(server.rebuilds, 1);
+    }
+
+    #[test]
+    fn explicit_reindex_failure_stays_pending_until_a_successful_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("settings.toml");
+        std::fs::write(&file, "obsolete = true\n").unwrap();
+        let mut server = Server::start(lexical_config(root, temp.path().join("index"), false, false)).unwrap();
+        server.tool_search(&json!({"query":"obsolete"})).unwrap();
+        std::fs::write(file, "replacement_property = true\n").unwrap();
+        let blocker = temp.path().join("index.building");
+        std::fs::write(&blocker, "block staging").unwrap();
+        assert!(server.dispatch("reindex", &json!({})).is_err());
+        assert!(server.tool_search(&json!({"query":"obsolete"})).is_err());
+        assert!(server.refresh_pending);
+        std::fs::remove_file(blocker).unwrap();
+        let text = server.tool_search(&json!({"query":"replacement_property", "include_snippet":true})).unwrap();
+        assert!(text.contains("replacement_property = true"), "{text}");
+        assert!(!server.refresh_pending);
+    }
+
+    #[test]
+    fn scoped_query_finds_hits_below_the_global_candidate_cutoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..24 {
+            std::fs::write(root.join(format!("a{i:02}.rs")), "fn needle() {}\n").unwrap();
+        }
+        std::fs::write(root.join("z.rs"), format!("fn needle() {{ let x = \"{}\"; }}\n", "padding ".repeat(200))).unwrap();
+        let mut server = Server::start(lexical_config(root, temp.path().join("index"), false, true)).unwrap();
+        let text = server.tool_search(&json!({"query":"needle", "top_k":1, "path_glob":"z.rs", "mode":"lexical"})).unwrap();
+        assert!(text.contains("1. z.rs:"), "{text}");
+        let absent = server.tool_search(&json!({"query":"needle", "top_k":1, "path_glob":"missing.rs", "mode":"lexical"})).unwrap();
+        assert!(absent.contains("No matches"));
+    }
 
     #[test]
     fn restarted_server_recovers_pending_publication_without_a_watch_event() {
