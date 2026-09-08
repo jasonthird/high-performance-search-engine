@@ -381,7 +381,7 @@ impl Server {
                         search["error"] = json!(format!("{e:#}"));
                     }
                 }
-                tool_error(&format!("{e:#}"))
+                tool_failure(&e)
             }
         };
         if name == "search_code" {
@@ -390,12 +390,7 @@ impl Server {
             }
         }
         if verbose {
-            let diagnostics = self.diagnostics();
-            result["structuredContent"] = json!({"diagnostics": diagnostics});
-            result["content"].as_array_mut().unwrap().push(json!({
-                "type": "text",
-                "text": format!("Debug diagnostics:\n{}", serde_json::to_string_pretty(&diagnostics)?),
-            }));
+            append_diagnostics(&mut result, self.diagnostics())?;
         }
         Ok(result)
     }
@@ -805,9 +800,68 @@ fn tool_error(message: &str) -> Value {
     json!({"content": [{"type": "text", "text": message}], "isError": true})
 }
 
+fn tool_failure(error: &anyhow::Error) -> Value {
+    let cause = format!("{error:#}");
+    let storage_full = error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull));
+    if !storage_full { return tool_error(&cause); }
+    let message = "Not enough disk space.";
+    let action = "Free space on the affected filesystem, then retry.";
+    let mut result = tool_error(&format!("{message} {action}\nCause: {cause}"));
+    // Operational errors are actionable without enabling verbose diagnostics.
+    result["structuredContent"] = json!({"error": {
+        "code": "insufficient_disk_space", "message": message,
+        "action": action, "cause": cause,
+    }});
+    result
+}
+
+fn append_diagnostics(result: &mut Value, diagnostics: Value) -> anyhow::Result<()> {
+    let text = format!("Debug diagnostics:\n{}", serde_json::to_string_pretty(&diagnostics)?);
+    result["structuredContent"]["diagnostics"] = diagnostics;
+    result["content"].as_array_mut().unwrap().push(json!({"type": "text", "text": text}));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_full_is_actionable_without_verbose_and_survives_diagnostics() {
+        #[cfg(unix)]
+        assert_eq!(tool_failure(&std::io::Error::from_raw_os_error(libc::ENOSPC).into())
+            ["structuredContent"]["error"]["code"], "insufficient_disk_space");
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("failed to create /cache/seg-000046/embeddings.bin")
+            .context("document embedding repair failed");
+        let mut result = tool_failure(&error);
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["error"]["code"], "insufficient_disk_space");
+        assert!(result["structuredContent"].get("diagnostics").is_none());
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Not enough disk space."));
+        assert!(text.contains("Free space"));
+        assert!(text.contains("/cache/seg-000046/embeddings.bin"));
+        let operational_error = result["structuredContent"]["error"].clone();
+        append_diagnostics(&mut result, json!({"encoder": {"state": "ready"}})).unwrap();
+        assert_eq!(result["structuredContent"]["error"], operational_error);
+        assert_eq!(result["structuredContent"]["diagnostics"]["encoder"]["state"], "ready");
+        assert_eq!(result["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn other_failures_are_not_mislabeled_as_disk_full() {
+        for error in [
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            anyhow::anyhow!("missing keys.bin after a previous No space left on device error"),
+        ] {
+            let result = tool_failure(&error);
+            assert_eq!(result["isError"], true);
+            assert!(result.get("structuredContent").is_none());
+            assert_eq!(result["content"][0]["text"], format!("{error:#}"));
+        }
+    }
 
     #[test]
     fn hits_resolve_to_locations() {

@@ -49,6 +49,11 @@ CoreML-to-Candle retry retains semantic search and is disclosed in the normal
 response. A failed hybrid/semantic call has `isError: true`; do not present it
 as a successful search. Report an explicit lexical recovery if one is used.
 
+If MCP returns `structuredContent.error.code: insufficient_disk_space`, alert
+the user that disk space is exhausted and include the failed path from the
+cause. Retry indexing after space is available; repeated immediate retries
+will not resolve it. This error is returned even when `verbose` is false.
+
 After upgrading hips, reconnect/restart the MCP server to load the new binary
 and refresh the tool schema. Older servers may not accept `verbose` or
 `expected_root`; check `tools/list` or reconnect before using these fields.

@@ -974,6 +974,12 @@ so a failed write cannot truncate the previous `repo.json`. The writer lock
 covers comparison and publication. Disk exhaustion still
 returns an error and requires free space; retries no longer depend on sidecars
 from retired segments or silently preserve an incomplete inventory.
+MCP identifies disk exhaustion with `isError: true`, a "Not enough disk space"
+message, and `structuredContent.error.code: insufficient_disk_space`, even
+when `verbose` is false. The response includes the original error chain and
+instructs the caller to free space on the affected filesystem before retrying.
+Agents should alert the user rather than repeatedly retrying indexing. Verbose
+diagnostics retain this error code alongside the additional debug information.
 
 After installing an updated binary, reconnect/restart the MCP server and
 refresh its tool schema. Confirm `tools/list` advertises `verbose` before
