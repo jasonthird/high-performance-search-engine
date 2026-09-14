@@ -8,7 +8,7 @@
 //! - a burst of edits (a branch switch, a formatter run, a build) costs one
 //!   rebuild rather than one per file;
 //! - the encoder stays on the thread that loaded it, which matters because
-//!   its Metal pipelines are compiled and warmed there;
+//!   its GPU pipelines are compiled and warmed there;
 //! - a query never reads a half-written index, because rebuilds are
 //!   sequenced with the query that triggered them.
 //!

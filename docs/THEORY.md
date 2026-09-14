@@ -349,7 +349,7 @@ conclusion stands: lexical index construction is CPU-shaped, and GPU
 investment pays off mainly where dense math lives (embedding/vector
 retrieval, where kernel libraries like CubeK — matmul, reductions,
 quantization, attention on CubeCL — would slot in directly). That path is
-now §14: Candle on Metal runs the encoder; retrieval itself stays an
+now §14: the ggml engine runs the encoder; retrieval itself stays an
 inverted file plus (optional) product-quantized table lookups on the CPU.
 
 ## 10. Concurrency model
@@ -586,10 +586,14 @@ Documents are raw code. Queries receive the prefix
 Document tokenization defaults to 512 tokens; queries to 64.
 `HPS_EMBED_MAX_SEQ` overrides the document cap.
 
-Candle is the portable backend, using Metal F16 when available on macOS
-and CPU F32 otherwise. `HPS_EMBED_DEVICE=cpu|metal` overrides Candle's
-selection; unavailable Metal falls back to CPU. The current Cargo patch
-uses a Candle fork with fused Metal SDPA for NomicBert.
+The portable backend is hips' own NomicBert graph on the vendored ggml
+(`src/ggml.rs`): F16 weights, F32 activations, Vulkan on Linux, Metal on
+macOS, the CPU otherwise. `HPS_EMBED_DEVICE=cpu` forces the CPU. Batches
+are padded per sequence and attention is one batched `flash_attn_ext` with
+a per-sequence key mask, so its cost is quadratic in each sequence's own
+length rather than in the packed batch; the last layer computes only the
+`[CLS]` rows. Measured on an RX 9070 XT: 154k document tokens/s and 1.4 ms
+per query, vectors within cosine 0.99998 of the fp32 reference.
 
 CoreML/ANE is implemented in `src/coreml.rs`, not merely a prototype.
 On macOS, compiled models under `<csearch cache>/coreml/` are detected
@@ -597,23 +601,26 @@ automatically. The intended family is batch-8 document models at sequence
 64/128/256/512 and a batch-1 query model at sequence 64. Shapes load lazily,
 and documents use the smallest fitting shape. Install the complete document
 family and query model together; a query-only installation cannot encode
-documents. Incomplete families fall back to Candle when they cannot cover the
+documents. Incomplete families fall back to ggml when they cannot cover the
 configured token cap; CoreML does not silently shorten inputs to fit.
 Before using a document shape, a one-time mixed-length batch-permutation probe
 checks that outputs keep their row identities (cosine > 0.995). Failed shapes
 are skipped for a larger fitting shape; if none pass, encoding fails clearly
-and recommends Candle or regenerating the compiled family. This smoke test
+and recommends ggml or regenerating the compiled family. This smoke test
 does not prove equivalence to the original weights. It caught the locally
 installed batch-8/64-token artifact during scheduler validation. No installed
 model files are modified. Existing embedding caches are not rebuilt by this
 check; indexes produced using a rejected artifact need a separate fresh
-embedding rebuild. `HIPS_ENCODER=candle` bypasses CoreML.
+embedding rebuild. `HIPS_ENCODER=ggml` bypasses CoreML.
 
-The Hugging Face model files download on first use into its cache, honoring
-`HF_HOME` and `HF_ENDPOINT`. Compiled CoreML models are produced locally
-with the scripts in `scripts/ane-prototype/`; the runtime does not download
-or convert them. Loading CoreML still uses the Hugging Face configuration,
-tokenizer, and weights paths.
+The model is one GGUF (F16 weights plus the WordPiece vocabulary),
+downloaded on first use from the pinned `models-v1` release into
+`<csearch cache>/models/` after a SHA-256 check; `HIPS_MODEL_PATH` points
+at a local file and `HIPS_MODEL_OFFLINE=1` forbids downloads. Tokenization
+is hips' own WordPiece (`src/wordpiece.rs`), checked token-for-token
+against the reference tokenizer. Compiled CoreML models are produced
+locally with the scripts in `scripts/ane-prototype/`; the runtime does not
+download or convert them, and reads the vocabulary from the same GGUF.
 
 Document vectors are cached persistently by chunk content in `embcache.bin`.
 Cold indexing deduplicates missing content keys before inference: repeated
@@ -623,7 +630,7 @@ within 1,024-row windows, and pads only the accelerator batch. One CPU worker
 prepares ahead through a bounded two-batch channel while inference stays on
 the calling thread. Error paths release the queue before joining the worker.
 Queries and inputs fitting one batch avoid worker startup. Backend batch sizes
-remain unchanged (Candle default 4; installed CoreML family typically 8),
+remain unchanged (ggml default 32 sequences per graph; installed CoreML family typically 8),
 rather than assuming larger batches are faster. Indexing supplies up to 4,096
 rows per scheduling call. This bounds preparation memory, not the entire
 indexer's vector/cache memory. Repeated query strings
@@ -641,7 +648,7 @@ finiteness and row-wise cosine (>0.995). Local September 8 measurements:
 | Backend | Sample rows | Serial median | Prefetch median | Speedup | Minimum row cosine |
 |---|---:|---:|---:|---:|---:|
 | CoreML, validated shapes | 64 | 0.999 s | 0.794 s | 1.26× | 0.997605 |
-| Candle/Metal, batch 4 | 64 | 1.859 s | 1.736 s | 1.07× | 0.998804 |
+| Candle/Metal, batch 4 (former backend) | 64 | 1.859 s | 1.736 s | 1.07× | 0.998804 |
 | CoreML, partial final batch | 65 | 1.211 s | 1.014 s | 1.19× | 0.997605 |
 
 Both CoreML comparison paths exclude the rejected 64-token artifact. These
@@ -650,8 +657,8 @@ shape warmup/validation, lexical building, graph construction and disk writes.
 They do not isolate token bucketing from prefetch, measure retrieval relevance,
 or promise the same improvement for every corpus. Duplicate-input savings
 are additional but depend on the proportion of repeated content keys.
-Use `HIPS_ENCODER=candle CANDLE_METAL_COMPUTE_PER_BUFFER=200` for the Candle
-comparison; CoreML is automatic with a usable local model family. Accelerator
+Use `HIPS_ENCODER=ggml` for the ggml comparison; CoreML is automatic with a
+usable local model family. Accelerator
 benchmarks must have access to macOS accelerator services: a sandboxed run
 here executed CPU kernels and was stopped rather than reported as ANE timing.
 

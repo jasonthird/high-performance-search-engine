@@ -22,20 +22,17 @@ bincode = "1"
 bytemuck = "1.25.0"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
-objc2 = { version = "0.6.4", optional = true }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError", "NSPathUtilities", "NSProcessInfo", "NSBundle"], optional = true }
-objc2-metal = { version = "0.3.2", optional = true }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simd-json = "0.17.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-# Optional: CodeRankEmbed inference (see `semantic` feature).
-candle-core = { version = "0.11", optional = true }
-candle-nn = { version = "0.11", optional = true }
-candle-transformers = { version = "0.11", optional = true }
-tokenizers = { version = "0.21", optional = true }
-hf-hub = { version = "0.4", optional = true }
+# Optional: CodeRankEmbed inference (see `semantic` feature): hips' own
+# ggml engine (crates/ggml-sys builds the vendored ggml with Vulkan on
+# Linux, Metal on macOS) plus a WordPiece tokenizer fed from the GGUF.
+ggml-sys = { path = "crates/ggml-sys", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+unicode_categories = { version = "0.1", optional = true }
 # Watcher daemon: setsid on spawn, kill(pid, 0) liveness probes, signals.
 libc = "0.2"
 
@@ -50,13 +47,12 @@ sha2 = { version = "0.10", optional = true }
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 pdf-extract = "0.12.0"
 
-# Metal for batched document encoding; Accelerate for batch-1 query
-# encoding (Candle Metal is kernel-launch bound on short BERT sequences).
+# CoreML/ANE encoder backend and the optional Metal BP reorder.
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError", "NSPathUtilities", "NSProcessInfo", "NSBundle"], optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
 objc2-core-ml = { version = "0.3.2", optional = true, default-features = false, features = ["std", "MLModel", "MLModelConfiguration", "MLMultiArray", "MLFeatureValue", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLFeatureDescription", "MLModelDescription", "block2"] }
-candle-core = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
-candle-nn = { version = "0.11", optional = true, features = ["metal", "accelerate"] }
-candle-transformers = { version = "0.11", optional = true, features = ["metal"] }
 
 [features]
 default = ["treesitter"]
@@ -67,23 +63,25 @@ treesitter = ["dep:tree-sitter", "dep:tree-sitter-language", "dep:libloading", "
 # (macOS only). Off by default.
 gpu = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
 # Hybrid code search: CodeRankEmbed + IVF/PQ over the same doc_ids as BM25.
-# Off by default so the lexical engine stays dependency-light.
+# Off by default so the lexical engine stays dependency-light. The model is
+# fetched as one GGUF from a pinned release (like the grammars).
 semantic = [
-    "dep:candle-core",
-    "dep:candle-nn",
-    "dep:candle-transformers",
-    "dep:tokenizers",
-    "dep:hf-hub",
+    "dep:ggml-sys",
+    "dep:unicode-normalization",
+    "dep:unicode_categories",
+    "dep:ureq",
+    "dep:sha2",
     "dep:objc2",
     "dep:objc2-foundation",
     "dep:objc2-core-ml",
     "dep:objc2-metal",
 ]
 
-# Candle fork with fused Metal SDPA in NomicBert attention: 1.7x faster
-# document encoding at seq 512 (huggingface/candle#3918). Drop this block
-# once the PR is released on crates.io.
-[patch.crates-io]
-candle-core = { git = "https://github.com/jasonthird/candle", branch = "nomic-bert-fused-sdpa" }
-candle-nn = { git = "https://github.com/jasonthird/candle", branch = "nomic-bert-fused-sdpa" }
-candle-transformers = { git = "https://github.com/jasonthird/candle", branch = "nomic-bert-fused-sdpa" }
+[dev-dependencies]
+# Reference tokenizer for the WordPiece parity test (pure-Rust regex build).
+tokenizers = { version = "0.21", default-features = false, features = ["unstable_wasm"] }
+
+[workspace]
+members = ["crates/ggml-sys"]
+# The grammar libraries are their own workspace: never link them into hips.
+exclude = ["grammars"]

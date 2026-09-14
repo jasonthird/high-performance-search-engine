@@ -372,7 +372,7 @@ impl Server {
             }));
         }
         // Failed semantic execution is a tool error, never a successful
-        // lexical response. CoreML -> Candle is still semantic execution.
+        // lexical response. CoreML -> ggml is still semantic execution.
         let mut result = match self.dispatch(&name, &args) {
             Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
             Err(e) => {
@@ -589,7 +589,7 @@ impl Server {
         if effective_mode != "lexical" {
             if let Some(fallbacks) = self.indexer.encoder_diagnostics()["fallbacks"].as_array() {
                 if !fallbacks.is_empty() {
-                    text.push_str("Note: CoreML unavailable; using Candle (semantic search retained). Use verbose=true for details.\n");
+                    text.push_str("Note: CoreML unavailable; using ggml (semantic search retained). Use verbose=true for details.\n");
                 }
             }
         }

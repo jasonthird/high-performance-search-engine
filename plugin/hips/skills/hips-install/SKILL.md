@@ -49,10 +49,12 @@ schema. The running process retains its old code. Check that `tools/list`
 advertises `verbose` for `search_code` and `index_status`.
 
 MCP builds a missing index on first search and watches for changes. First
-semantic use may download approximately 550 MB of CodeRankEmbed weights.
-Use prepopulated model and grammar caches offline. CoreML also needs separately
-compiled CodeRankEmbed shapes; installing the semantic binary supplies Candle,
-not those CoreML models. Keep the CLI available for terminals and repositories
+semantic use downloads the 274 MB CodeRankEmbed GGUF into
+`~/.cache/csearch/models/` (`HIPS_MODEL_PATH` points at a local copy,
+`HIPS_MODEL_OFFLINE=1` forbids downloads). Use prepopulated model and grammar
+caches offline. CoreML also needs separately compiled CodeRankEmbed shapes;
+installing the semantic binary supplies the ggml engine, not those CoreML
+models. Keep the CLI available for terminals and repositories
 that the connected MCP server does not serve.
 
 ## Optional Codex setup on macOS
@@ -80,7 +82,7 @@ this to the selected config scope (normally `~/.codex/config.toml`) and
 verify in a new Codex session, since an existing process retains its sandbox.
 Grant only the directories the requested workflow needs, not the whole home
 or Library tree. Index-building and first-time downloads may separately need
-writable `CSEARCH_CACHE_DIR` and `HF_HOME` locations.
+writable `CSEARCH_CACHE_DIR` (indexes and the model) locations.
 
 Alternatively, with a hips version supporting the override, relocate the
 CoreML cache for one invocation into an already writable directory:
@@ -93,11 +95,11 @@ HIPS_COREML_CACHE_DIR="$PWD/.hips-coreml-cache" \
 Keep this directory out of the repository index. The override changes the
 hips process's Foundation home using `CFFIXED_USER_HOME`; runtime files are
 under `<override>/Library/Caches/hips/com.apple.e5rt.e5bundlecache/`. It does
-not move hips indexes or Hugging Face weights. This mechanism is not a public
+not move hips indexes or the model file. This mechanism is not a public
 CoreML configuration property and needs verification on the target macOS.
 
 Neither writable roots nor relocation grants GPU, ANE, or IOSurface service
-access. If those remain denied, hips retries with Candle, choosing Metal
+access. If those remain denied, hips retries with ggml, choosing Metal
 when a GPU is accessible and CPU otherwise. Do not claim that adding a cache
 permission enables CoreML, disable the sandbox, require routine escalation,
 or permanently change the user to lexical search.
@@ -121,7 +123,7 @@ shell permissions are needed just to use the registered MCP tool.
 
 For the CLI path, run a representative query with `-v` in the target sandbox.
 Capture stderr separately and validate JSONL stdout. A `using lexical BM25`
-note means lexical degradation; a Candle retry can still be successful hybrid
+note means lexical degradation; a ggml retry can still be successful hybrid
 execution. Report the backend that worked and any remaining restriction.
 
 `--root` prefers the index for that directory, then its nearest indexed

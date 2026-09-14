@@ -6,7 +6,6 @@ struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
     cache: PathBuf,
-    hf: PathBuf,
     index: PathBuf,
 }
 
@@ -15,7 +14,6 @@ impl Fixture {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         let cache = temp.path().join("cache");
-        let hf = temp.path().join("hf");
         let index = temp.path().join("index");
         std::fs::create_dir_all(root.join("server")).unwrap();
         std::fs::write(
@@ -47,21 +45,20 @@ impl Fixture {
             &vec![vector; manifest.num_docs],
         )
         .unwrap();
-        // Fully cached but invalid model: deterministic initialization failure,
-        // with no calls to the network and no dependency on the user's cache.
-        let repo = hf.join("hub/models--nomic-ai--CodeRankEmbed");
-        let snapshot = repo.join("snapshots/fixture");
-        std::fs::create_dir_all(&snapshot).unwrap();
-        std::fs::create_dir_all(repo.join("refs")).unwrap();
-        std::fs::write(repo.join("refs/main"), "fixture").unwrap();
-        for file in ["config.json", "tokenizer.json", "model.safetensors"] {
-            std::fs::write(snapshot.join(file), "invalid fixture").unwrap();
-        }
+        // A cached but invalid model: deterministic initialization failure,
+        // with no calls to the network (HIPS_MODEL_OFFLINE) and no
+        // dependency on the user's cache.
+        let models = cache.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join(high_performance_search_engine::embedder_model_file()),
+            "invalid fixture",
+        )
+        .unwrap();
         Self {
             _temp: temp,
             root,
             cache,
-            hf,
             index,
         }
     }
@@ -69,7 +66,10 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_hips"));
         cmd.env("CSEARCH_CACHE_DIR", &self.cache)
-            .env("HF_HOME", &self.hf)
+            .env("HIPS_MODEL_OFFLINE", "1")
+            // A developer's real model must not leak into the fixture.
+            .env_remove("HIPS_MODEL_PATH")
+            .env_remove("HIPS_MODEL_URL")
             .env("HIPS_NO_LOG", "1");
         cmd
     }
@@ -115,7 +115,7 @@ fn initialization_fallback_is_visible_and_keeps_the_same_index_and_paths() {
             assert!(stderr.contains("lexical BM25"), "{stderr}");
             #[cfg(feature = "semantic")]
             assert!(
-                stderr.contains("parse CodeRankEmbed config.json"),
+                stderr.contains("not a readable GGUF file"),
                 "{stderr}"
             );
             assert!(!String::from_utf8_lossy(&hybrid.stdout).contains("NaN"));
@@ -245,18 +245,18 @@ fn cache_override_preserves_repository_and_model_cache_selection() {
         output.stdout,
         f.search("bm25", &f.root, Some(&f.index), true).stdout
     );
-    // Reading this exact fixture proves HF_HOME was not accidentally relocated.
-    assert!(String::from_utf8_lossy(&output.stderr).contains("parse CodeRankEmbed config.json"));
+    // Reading this exact fixture proves the model cache was not accidentally relocated.
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CodeRankEmbed-f16.gguf"));
 }
 
 /// Real CoreML predictions under the invoking process's sandbox. Explicitly
 /// opt in with local model paths; never download 550 MB in the normal suite.
 #[cfg(all(target_os = "macos", feature = "semantic"))]
 #[test]
-#[ignore = "requires HIPS_TEST_COREML_MODELS and HIPS_TEST_HF_HOME with cached CodeRankEmbed"]
+#[ignore = "requires HIPS_TEST_COREML_MODELS and HIPS_TEST_MODEL_PATH (a CodeRankEmbed GGUF)"]
 fn native_coreml_cache_relocation_never_returns_invalid_hybrid_results() {
     let models = std::env::var_os("HIPS_TEST_COREML_MODELS").expect("set HIPS_TEST_COREML_MODELS");
-    let hf = std::env::var_os("HIPS_TEST_HF_HOME").expect("set HIPS_TEST_HF_HOME");
+    let model = std::env::var_os("HIPS_TEST_MODEL_PATH").expect("set HIPS_TEST_MODEL_PATH");
     let f = Fixture::new();
     std::fs::create_dir_all(&f.cache).unwrap();
     std::os::unix::fs::symlink(models, f.cache.join("coreml")).unwrap();
@@ -264,7 +264,7 @@ fn native_coreml_cache_relocation_never_returns_invalid_hybrid_results() {
     for units in ["cpu-and-ane", "cpu"] {
         let output = f
             .command()
-            .env("HF_HOME", &hf)
+            .env("HIPS_MODEL_PATH", &model)
             .env("HIPS_COREML_CACHE_DIR", &relocated)
             .env("HIPS_COREML_COMPUTE_UNITS", units)
             .args([
@@ -308,15 +308,15 @@ fn native_coreml_cache_relocation_never_returns_invalid_hybrid_results() {
 
 #[cfg(all(target_os = "macos", feature = "semantic"))]
 #[test]
-#[ignore = "requires HIPS_TEST_HF_HOME with cached CodeRankEmbed"]
-fn native_candle_metal_request_handles_an_inaccessible_gpu_without_panicking() {
-    let hf = std::env::var_os("HIPS_TEST_HF_HOME").expect("set HIPS_TEST_HF_HOME");
+#[ignore = "requires HIPS_TEST_MODEL_PATH (a CodeRankEmbed GGUF)"]
+fn native_ggml_gpu_request_handles_an_inaccessible_gpu_without_panicking() {
+    let model = std::env::var_os("HIPS_TEST_MODEL_PATH").expect("set HIPS_TEST_MODEL_PATH");
     let f = Fixture::new();
     let output = f
         .command()
-        .env("HF_HOME", hf)
-        .env("HIPS_ENCODER", "candle")
-        .env("HPS_EMBED_DEVICE", "metal")
+        .env("HIPS_MODEL_PATH", &model)
+        .env("HIPS_ENCODER", "ggml")
+        .env("HPS_EMBED_DEVICE", "gpu")
         .args([
             "search",
             "--query",
@@ -388,7 +388,7 @@ fn mcp_encoder_failure_is_an_error_and_explicit_lexical_recovery_preserves_scope
     assert_eq!(responses.len(), 3);
     let failed = &responses[0]["result"];
     assert_eq!(failed["isError"], true);
-    assert!(failed["content"][0]["text"].as_str().unwrap().contains("parse CodeRankEmbed config.json"));
+    assert!(failed["content"][0]["text"].as_str().unwrap().contains("not a readable GGUF file"));
     let debug = &failed["structuredContent"]["diagnostics"];
     assert_eq!(debug["last_search"]["success"], false);
     assert_eq!(debug["last_search"]["effective_mode"], serde_json::Value::Null);
@@ -424,8 +424,8 @@ fn mcp_rejects_an_index_from_a_different_repository() {
 
 #[cfg(all(target_os = "macos", feature = "semantic"))]
 #[test]
-#[ignore = "requires HIPS_TEST_COREML_MODELS and HIPS_TEST_HF_HOME with cached CodeRankEmbed"]
-fn native_mcp_reports_cache_failure_candle_recovery_and_query_reuse() {
+#[ignore = "requires HIPS_TEST_COREML_MODELS and HIPS_TEST_MODEL_PATH (a CodeRankEmbed GGUF)"]
+fn native_mcp_reports_cache_failure_ggml_recovery_and_query_reuse() {
     use serde_json::json;
     let f = Fixture::new();
     std::fs::create_dir_all(&f.cache).unwrap();
@@ -437,7 +437,7 @@ fn native_mcp_reports_cache_failure_candle_recovery_and_query_reuse() {
     std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
     std::fs::write(&blocked, "not a directory").unwrap();
     let mut cmd = f.mcp_command();
-    cmd.env("HF_HOME", std::env::var_os("HIPS_TEST_HF_HOME").expect("set HIPS_TEST_HF_HOME"))
+    cmd.env("HIPS_MODEL_PATH", std::env::var_os("HIPS_TEST_MODEL_PATH").expect("set HIPS_TEST_MODEL_PATH"))
         .env("HIPS_COREML_CACHE_DIR", &relocated).env("HPS_EMBED_DEVICE", "cpu").env_remove("HIPS_ENCODER");
     let query = json!({"name":"search_code", "arguments":{"query":"permission validation", "mode":"semantic", "verbose":true}});
     let (output, responses) = mcp_calls(cmd, &[
@@ -450,8 +450,8 @@ fn native_mcp_reports_cache_failure_candle_recovery_and_query_reuse() {
         let result = &response["result"];
         assert_eq!(result["isError"], false, "{result}");
         let debug = &result["structuredContent"]["diagnostics"];
-        assert_eq!(debug["encoder"]["backend"], "candle");
-        assert_eq!(debug["encoder"]["candle_device"], "cpu");
+        assert_eq!(debug["encoder"]["backend"], "ggml");
+        assert_eq!(debug["encoder"]["ggml_device"], "cpu");
         assert_eq!(debug["encoder"]["warmup_validated"], true);
         assert!(debug["encoder"]["fallbacks"][0].as_str().unwrap().contains(blocked.to_str().unwrap()));
         assert!(result["content"][0]["text"].as_str().unwrap().contains("CoreML unavailable"));
@@ -466,8 +466,8 @@ fn native_mcp_reports_cache_failure_candle_recovery_and_query_reuse() {
     // finite score through the optimized FP16 decoder.
     high_performance_search_engine::embeddings::write_f16(&f.index, 768, &vec![vec![f32::NAN; 768]; 2]).unwrap();
     let mut cmd = f.mcp_command();
-    cmd.env("HF_HOME", std::env::var_os("HIPS_TEST_HF_HOME").unwrap())
-        .env("HIPS_ENCODER", "candle").env("HPS_EMBED_DEVICE", "cpu");
+    cmd.env("HIPS_MODEL_PATH", std::env::var_os("HIPS_TEST_MODEL_PATH").unwrap())
+        .env("HIPS_ENCODER", "ggml").env("HPS_EMBED_DEVICE", "cpu");
     let (output, responses) = mcp_calls(cmd, &[
         json!({"name":"search_code", "arguments":{"query":"permission", "mode":"semantic", "verbose":true}}),
         json!({"name":"search_code", "arguments":{"query":"permission", "mode":"lexical", "verbose":true}}),
@@ -520,7 +520,7 @@ fn mcp_failed_document_repair_is_visible_and_lexical_still_works() {
 
 #[cfg(all(target_os = "macos", feature = "semantic"))]
 #[test]
-#[ignore = "requires HIPS_TEST_HF_HOME with cached CodeRankEmbed"]
+#[ignore = "requires HIPS_TEST_MODEL_PATH (a CodeRankEmbed GGUF)"]
 fn native_mcp_repairs_missing_segment_vectors_and_reindexes_source_edits() {
     use high_performance_search_engine::codeindex::{BuildOpts, RepoIndexer};
     use serde_json::json;
@@ -531,8 +531,8 @@ fn native_mcp_repairs_missing_segment_vectors_and_reindexes_source_edits() {
     }).unwrap().build().unwrap();
     let command = || {
         let mut cmd = f.mcp_command();
-        cmd.env("HF_HOME", std::env::var_os("HIPS_TEST_HF_HOME").expect("set HIPS_TEST_HF_HOME"))
-            .env("HIPS_ENCODER", "candle").env("HPS_EMBED_DEVICE", "cpu");
+        cmd.env("HIPS_MODEL_PATH", std::env::var_os("HIPS_TEST_MODEL_PATH").expect("set HIPS_TEST_MODEL_PATH"))
+            .env("HIPS_ENCODER", "ggml").env("HPS_EMBED_DEVICE", "cpu");
         cmd
     };
     let (output, responses) = mcp_calls(command(), &[
@@ -557,4 +557,75 @@ fn native_mcp_repairs_missing_segment_vectors_and_reindexes_source_edits() {
     let text = responses[1]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("financial_validation_new_code = true"), "{text}");
     assert_eq!(responses[1]["result"]["structuredContent"]["diagnostics"]["invalid_live_embeddings"], 0);
+}
+
+/// The whole hybrid path against the real model: index a small tree,
+/// then rank by meaning. The model is required (`HIPS_MODEL_PATH`, the
+/// csearch cache, or a download); `HIPS_TEST_SKIP_MODEL=1` opts out.
+#[cfg(feature = "semantic")]
+#[test]
+fn hybrid_index_and_semantic_search_rank_by_meaning() {
+    if std::env::var_os("HIPS_TEST_SKIP_MODEL").is_some_and(|v| v == "1") {
+        eprintln!("skipped: HIPS_TEST_SKIP_MODEL=1");
+        return;
+    }
+    // Resolved as the program resolves it; a missing model fails the test.
+    let model = high_performance_search_engine::embedder::model_path().expect(
+        "this test needs the CodeRankEmbed GGUF: set HIPS_MODEL_PATH, let it download, or set HIPS_TEST_SKIP_MODEL=1",
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/config.rs"),
+        "/// Read the application's configuration file from disk, parse the TOML settings and validate every required key.\npub fn load_settings(path: &str) -> Settings {\n    let text = std::fs::read_to_string(path).unwrap();\n    parse_toml(&text)\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/net.rs"),
+        "/// Open a TCP socket to the server and run the protocol handshake before streaming frames.\npub fn connect(addr: &str) -> Stream {\n    let socket = TcpStream::connect(addr).unwrap();\n    handshake(socket)\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/render.rs"),
+        "/// Draw the frame: clear the canvas, rasterize each sprite and swap the double buffer.\npub fn draw(frame: &Frame) {\n    clear();\n    for sprite in &frame.sprites { rasterize(sprite); }\n    swap_buffers();\n}\n",
+    )
+    .unwrap();
+    let cache = temp.path().join("cache");
+    let cmd = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_hips"));
+        c.env("CSEARCH_CACHE_DIR", &cache)
+            .env("HIPS_MODEL_PATH", &model)
+            .env("HIPS_MODEL_OFFLINE", "1")
+            .env("HIPS_NO_LOG", "1")
+            .env("HIPS_GRAMMAR_OFFLINE", "1");
+        c
+    };
+    let out = cmd().args(["index-repo", "--root"]).arg(&root).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let status = cmd().args(["status", "--root", root.to_str().unwrap(), "--json"]).output().unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["index"]["embedded"], true, "{status}");
+
+    // Nothing lexical links these queries to their files: the ranking must
+    // come from the encoder.
+    for (query, expected) in [
+        ("where do we load user preferences from a file on startup", "config.rs"),
+        ("establishing a network connection to a remote host", "net.rs"),
+        ("painting pixels to the screen", "render.rs"),
+    ] {
+        for mode in ["semantic", "hybrid"] {
+            let out = cmd()
+                .args(["search", "--root", root.to_str().unwrap(), "--query", query, "--mode", mode, "--json", "--top-k", "3"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stderr}");
+            assert!(!stderr.contains("lexical BM25"), "must not degrade: {stderr}");
+            let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap().to_string();
+            let hit: serde_json::Value = serde_json::from_str(&first).unwrap();
+            assert!(hit["id"].as_str().unwrap().contains(expected), "{mode} {query:?}: {hit}");
+            assert!(hit["score"].as_f64().unwrap().is_finite());
+        }
+    }
 }

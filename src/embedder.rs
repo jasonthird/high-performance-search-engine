@@ -1,42 +1,50 @@
-//! Native CodeRankEmbed inference via Candle's NomicBert.
+//! CodeRankEmbed inference on hips' own ggml engine (`crate::ggml`).
 //!
 //! Gated behind `--features semantic` so the default binary stays a lean
-//! lexical engine. Why Candle rather than ORT / fastembed-rs:
-//!
-//! - `nomic-ai/CodeRankEmbed` is a custom `nomic_bert` (RoPE + SwiGLU, no
-//!   official ONNX export). fastembed-rs ships `nomic-embed-text-v1.5`,
-//!   which is a *different* model (mean-pooled text, not CLS-pooled code).
-//! - Candle already implements NomicBert; we load the CodeRankEmbed
-//!   safetensors, CLS-pool, L2-normalize, and apply the query prefix.
+//! lexical engine. The model is one GGUF file (F16 weights plus the
+//! WordPiece vocabulary) fetched once from a pinned release, the way the
+//! grammar libraries are; `HIPS_MODEL_PATH` points at any local copy.
 //!
 //! Documents are encoded as raw code. Queries are prefixed with
-//! `Represent this query for searching relevant code: `.
+//! `Represent this query for searching relevant code: `. Output is the
+//! `[CLS]` row, L2-normalized, validated before it can reach an index or
+//! the query cache.
 
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::Context;
-use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::nomic_bert::{l2_normalize, Config, NomicBertModel};
-
-use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
 use crate::embeddings::CODERANK_DIM;
+use crate::ggml::{Engine, EngineOptions};
+use crate::wordpiece::WordPiece;
 
 pub const MODEL_ID: &str = "nomic-ai/CodeRankEmbed";
 pub const QUERY_PREFIX: &str = "Represent this query for searching relevant code: ";
-/// Tokenizer.json truncates at 512 by default; plenty for this prototype
-/// and much cheaper than the 8192 trained limit.
+/// The GGUF asset: the F16 conversion of the published safetensors
+/// (`convert_hf_to_gguf.py --outtype f16`), vocabulary included.
+pub const MODEL_FILE: &str = "CodeRankEmbed-f16.gguf";
+/// Immutable release holding [`MODEL_FILE`] and its `.sha256`; bump with
+/// the file, never replace an asset in place.
+const MODEL_RELEASE: &str = "models-v1";
+const MODEL_RELEASE_URL: &str = "https://github.com/jasonthird/high-performance-search-engine/releases/download";
+const MODEL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Plenty for code chunks and much cheaper than the 2048 trained limit;
+/// attention is quadratic in it.
 pub const MAX_SEQ: usize = 512;
-/// Queries plus the instruction prefix are a few dozen tokens. A shorter
-/// RoPE table means less work per layer when the query embedder is on CPU.
+/// Queries plus the instruction prefix are a few dozen tokens.
 pub const MAX_QUERY_SEQ: usize = 64;
-const DEFAULT_BATCH: usize = 4;
+/// Sequences per graph. Batches are length-bucketed, so padding stays
+/// small; the token budget caps the padded batch (longest x count). The
+/// GPU wants big graphs to amortize launches; the CPU wants activations
+/// that stay in cache (measured: 512-1024 tokens beats 8192 by 1.4x on a
+/// 96 MB L3), so the default follows the backend.
+const DEFAULT_BATCH: usize = 32;
+const DEFAULT_TOKEN_BUDGET_GPU: usize = 8192;
+const DEFAULT_TOKEN_BUDGET_CPU: usize = 1024;
 
-/// How the embedder will be used. Queries cap RoPE at [`MAX_QUERY_SEQ`];
-/// document indexing keeps [`MAX_SEQ`]. Device is Metal F16 on macOS for
-/// both (override `HPS_EMBED_DEVICE=cpu|metal`).
+/// How the embedder will be used. Queries truncate at [`MAX_QUERY_SEQ`];
+/// document indexing keeps [`MAX_SEQ`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedUse {
     Query,
@@ -44,22 +52,25 @@ pub enum EmbedUse {
 }
 
 pub struct Embedder {
-    /// Candle model + device; `None` when CoreML serves every request
-    /// this instance can receive.
-    model: Option<NomicBertModel>,
-    tokenizer: Tokenizer,
-    device: Option<Device>,
+    /// The ggml engine; `None` when CoreML serves every request this
+    /// instance can receive.
+    engine: Option<Mutex<Engine>>,
+    tokenizer: WordPiece,
+    pad_id: u32,
+    max_seq: usize,
+    device: Option<String>,
+    flash: bool,
+    token_budget: usize,
     /// CoreML/ANE backend, preferred on macOS when compiled models exist
-    /// (see `crate::coreml`). `HIPS_ENCODER=candle` disables it.
+    /// (see `crate::coreml`). `HIPS_ENCODER=ggml` disables it.
     #[cfg(target_os = "macos")]
     coreml: Option<crate::coreml::CoreMlEncoder>,
     /// Query-vector LRU: a repeated query costs a map lookup instead of a
-    /// ~7-15 ms forward pass. Agents re-issue queries (retries, refinement
-    /// loops, "the same search with a different top_k") often enough that
-    /// this is the cheapest latency win in the whole retrieval path.
-    /// Document encoding is NOT cached here — that is `embcache`'s job,
-    /// keyed by content and persisted.
-    query_cache: std::sync::Mutex<QueryCache>,
+    /// forward pass. Agents re-issue queries (retries, refinement loops,
+    /// "the same search with a different top_k") often enough that this is
+    /// the cheapest latency win in the whole retrieval path. Document
+    /// encoding is NOT cached here — that is `embcache`'s job.
+    query_cache: Mutex<QueryCache>,
     fallbacks: Vec<String>,
 }
 
@@ -81,8 +92,6 @@ impl QueryCache {
 
     fn get(&mut self, key: &str) -> Option<Vec<f32>> {
         let hit = self.map.get(key).cloned()?;
-        // Move to most-recent; O(n) over 256 keys is nothing next to the
-        // forward pass this avoids.
         if let Some(pos) = self.order.iter().position(|k| k == key) {
             let k = self.order.remove(pos).expect("position just found");
             self.order.push_back(k);
@@ -102,75 +111,63 @@ impl QueryCache {
     }
 }
 
+/// Where the model lives: `HIPS_MODEL_PATH`, else the csearch cache. A
+/// missing file is fetched from the pinned release (`HIPS_MODEL_URL`
+/// overrides the asset URL) unless `HIPS_MODEL_OFFLINE=1`.
+pub fn model_path() -> anyhow::Result<PathBuf> {
+    if let Some(p) = std::env::var_os("HIPS_MODEL_PATH").filter(|p| !p.is_empty()) {
+        let p = PathBuf::from(p);
+        anyhow::ensure!(p.is_file(), "HIPS_MODEL_PATH {} is not a file", p.display());
+        return Ok(p);
+    }
+    let path = crate::codeindex::cache_root().join("models").join(MODEL_FILE);
+    if path.is_file() {
+        return Ok(path);
+    }
+    if std::env::var_os("HIPS_MODEL_OFFLINE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        anyhow::bail!(
+            "CodeRankEmbed model {} is not cached and HIPS_MODEL_OFFLINE=1 (set HIPS_MODEL_PATH to a local GGUF)",
+            path.display()
+        );
+    }
+    let url = std::env::var("HIPS_MODEL_URL")
+        .unwrap_or_else(|_| format!("{MODEL_RELEASE_URL}/{MODEL_RELEASE}/{MODEL_FILE}"));
+    eprintln!("downloading CodeRankEmbed ({MODEL_FILE}, ~274 MB, once) into {}...", path.display());
+    crate::fetch::download_verified(&url, &path, MODEL_MAX_BYTES, crate::ggml::looks_like_gguf)
+        .with_context(|| format!("download CodeRankEmbed from {url}"))?;
+    Ok(path)
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name).as_deref() {
+        Ok("0") | Ok("false") | Ok("off") => false,
+        Ok("1") | Ok("true") | Ok("on") => true,
+        _ => default,
+    }
+}
+
 impl Embedder {
-    /// Download (first run) and load CodeRankEmbed for **query** encoding.
+    /// Load CodeRankEmbed for **query** encoding (fetching it on first run).
     pub fn load() -> anyhow::Result<Self> {
         Self::load_for(EmbedUse::Query)
     }
 
     pub fn load_for(kind: EmbedUse) -> anyhow::Result<Self> {
-        // Say something only when it matters: a first-run download is slow
-        // and network-bound, and its absence offline explains a failure.
-        // A cached load is routine and stays silent unless `-v`.
-        // `Cache::from_env` honours HF_HOME; `Api::new` does not (it always
-        // uses ~/.cache/huggingface). `ApiBuilder::from_env` uses the same
-        // cache (and HF_ENDPOINT), so the presence check and the download
-        // agree on one directory.
-        let cache = hf_hub::Cache::from_env();
-        let model_cache = cache.model(MODEL_ID.to_string());
-        let cached = ["config.json", "tokenizer.json", "model.safetensors"]
-            .iter()
-            .all(|f| model_cache.get(f).is_some());
-        if !cached {
-            eprintln!(
-                "downloading {MODEL_ID} (~550 MB, once) into {}...",
-                cache.path().display()
-            );
-        } else if crate::verbosity::verbose() {
-            eprintln!("loading {MODEL_ID} from cache");
-        }
-        let api = hf_hub::api::sync::ApiBuilder::from_env()
-            .build()
-            .context("huggingface hub client")?;
-        let repo = api.model(MODEL_ID.to_string());
-        let config_path = repo.get("config.json").context("download config.json")?;
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .context("download tokenizer.json")?;
-        let weights_path = repo
-            .get("model.safetensors")
-            .context("download model.safetensors")?;
-        Self::load_from_files(&config_path, &tokenizer_path, &weights_path, kind)
+        let path = model_path()?;
+        Self::load_from_file(&path, kind)
     }
 
-    pub fn load_from_files(
-        config_path: &Path,
-        tokenizer_path: &Path,
-        weights_path: &Path,
-        kind: EmbedUse,
-    ) -> anyhow::Result<Self> {
-        Self::load_from_files_with_backend(config_path, tokenizer_path, weights_path, kind, true)
+    pub fn load_from_file(path: &Path, kind: EmbedUse) -> anyhow::Result<Self> {
+        Self::load_with_backend(path, kind, true)
     }
 
-    fn load_from_files_with_backend(
-        config_path: &Path,
-        tokenizer_path: &Path,
-        weights_path: &Path,
-        kind: EmbedUse,
-        allow_coreml: bool,
-    ) -> anyhow::Result<Self> {
+    fn load_with_backend(path: &Path, kind: EmbedUse, allow_coreml: bool) -> anyhow::Result<Self> {
         #[cfg(not(target_os = "macos"))]
         let _ = allow_coreml;
-        let mut config: Config = serde_json::from_str(
-            &std::fs::read_to_string(config_path).context("read config.json")?,
-        )
-        .context("parse CodeRankEmbed config.json")?;
-        // RoPE tables are sized by n_positions. Don't precompute the 8192
-        // trained window; queries can go shorter still.
         // Attention is quadratic in sequence length, so this cap is the
         // single biggest lever on indexing throughput. `HPS_EMBED_MAX_SEQ`
-        // overrides it for documents (see `examples/embed_bench.rs`).
-        let cap = match kind {
+        // overrides it for documents.
+        let max_seq = match kind {
             EmbedUse::Query => MAX_QUERY_SEQ,
             EmbedUse::Index => std::env::var("HPS_EMBED_MAX_SEQ")
                 .ok()
@@ -178,63 +175,75 @@ impl Embedder {
                 .filter(|&c: &usize| c > 0)
                 .unwrap_or(MAX_SEQ),
         };
-        config.n_positions = config.n_positions.min(cap);
-
-        let mut tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
-        // Tokenize once without padding; the consumer pads only its actual batch.
-        tokenizer.with_padding(None);
-        let _ = tokenizer.with_truncation(Some(TruncationParams {
-            max_length: cap,
-            ..Default::default()
-        }));
 
         #[cfg(target_os = "macos")]
-        let coreml = if !allow_coreml || std::env::var("HIPS_ENCODER").as_deref() == Ok("candle") {
+        let coreml = if !allow_coreml || std::env::var("HIPS_ENCODER").as_deref() == Ok("ggml") {
             None
         } else {
             crate::coreml::CoreMlEncoder::load().filter(|cm| match kind {
-                EmbedUse::Index => cm.supports_documents(cap),
-                EmbedUse::Query => cm.supports_queries(cap),
+                EmbedUse::Index => cm.supports_documents(max_seq),
+                EmbedUse::Query => cm.supports_queries(max_seq),
             })
         };
-        // Candle stays the fallback: load it unless CoreML can serve every
+        // ggml stays the fallback: load it unless CoreML can serve every
         // request this instance will get (queries need the batch-1 model).
         #[cfg(target_os = "macos")]
-        let candle_needed = match (&coreml, kind) {
+        let engine_needed = match (&coreml, kind) {
             (None, _) => true,
             (Some(cm), EmbedUse::Query) => !cm.has_query_model(),
             (Some(_), EmbedUse::Index) => false,
         };
         #[cfg(not(target_os = "macos"))]
-        let candle_needed = true;
+        let engine_needed = true;
 
-        let (model, device) = if candle_needed {
-            // CANDLE_METAL_COMPUTE_PER_BUFFER is set in main() before any
-            // thread exists (calling setenv here would race concurrent
-            // getenv on the rayon/watcher threads — undefined behavior).
-            let (device, dtype) = pick_device(kind);
-            // SAFETY: weights file is not mutated while mapped.
-            let vb =
-                unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device) }
-                    .context("mmap CodeRankEmbed safetensors")?;
-            let model = load_nomic(vb, &config)
-                .context("load NomicBert weights (tried prefixes '', 'bert', 'nomic_bert')")?;
-            (Some(model), Some(device))
+        let (engine, vocab, device, flash, token_budget) = if engine_needed {
+            let opts = EngineOptions {
+                gpu: pick_gpu(),
+                threads: std::env::var("HPS_EMBED_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&t: &usize| t > 0)
+                    .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)),
+                flash_attention: env_flag("HIPS_GGML_FLASH", true),
+                cls_only_last_layer: env_flag("HIPS_GGML_CLS_ONLY", true),
+                cast_kv_f16: env_flag("HIPS_GGML_CAST_KV", cfg!(target_os = "macos")),
+            };
+            let (engine, vocab) = Engine::load(path, &opts)
+                .with_context(|| format!("load CodeRankEmbed GGUF {}", path.display()))?;
+            anyhow::ensure!(
+                engine.hparams().n_embd == CODERANK_DIM,
+                "model width {} != expected {CODERANK_DIM}",
+                engine.hparams().n_embd
+            );
+            anyhow::ensure!(max_seq <= engine.hparams().n_ctx, "sequence cap {max_seq} exceeds the model's {}", engine.hparams().n_ctx);
+            if crate::verbosity::verbose() {
+                eprintln!("CodeRankEmbed device: {} ({})", engine.device(), if engine.flash_attention() { "flash attention" } else { "naive attention" });
+            }
+            let device = engine.device().to_string();
+            let flash = engine.flash_attention();
+            let budget = if engine.on_gpu() { DEFAULT_TOKEN_BUDGET_GPU } else { DEFAULT_TOKEN_BUDGET_CPU };
+            (Some(Mutex::new(engine)), vocab, Some(device), flash, budget)
         } else {
             if crate::verbosity::verbose() {
                 eprintln!("CodeRankEmbed backend: CoreML");
             }
-            (None, None)
+            let vocab = crate::ggml::read_vocab(path)
+                .with_context(|| format!("read CodeRankEmbed vocabulary from {}", path.display()))?;
+            (None, vocab, None, false, DEFAULT_TOKEN_BUDGET_CPU)
         };
+        let tokenizer = WordPiece::from_gguf(&vocab.tokens, &vocab.token_types, vocab.unk, vocab.cls, vocab.sep);
 
         let embedder = Self {
-            model,
+            engine,
             tokenizer,
+            pad_id: vocab.pad,
+            max_seq,
             device,
+            flash,
+            token_budget,
             #[cfg(target_os = "macos")]
             coreml,
-            query_cache: std::sync::Mutex::new(QueryCache::new()),
+            query_cache: Mutex::new(QueryCache::new()),
             fallbacks: Vec::new(),
         };
         // A model is ready only after a successful, validated prediction.
@@ -242,11 +251,10 @@ impl Embedder {
         if let Err(err) = embedder.embed_query("warmup") {
             #[cfg(target_os = "macos")]
             if embedder.coreml.is_some() {
-                eprintln!("note: CoreML unavailable ({err:#}); retrying CodeRankEmbed with Candle (semantic search retained)");
+                eprintln!("note: CoreML unavailable ({err:#}); retrying CodeRankEmbed with ggml (semantic search retained)");
                 drop(embedder);
-                let mut retry = Self::load_from_files_with_backend(
-                    config_path, tokenizer_path, weights_path, kind, false,
-                ).with_context(|| format!("Candle retry after CoreML initialization failure ({err:#})"))?;
+                let mut retry = Self::load_with_backend(path, kind, false)
+                    .with_context(|| format!("ggml retry after CoreML initialization failure ({err:#})"))?;
                 retry.fallbacks.push(format!("CoreML initialization failed: {err:#}"));
                 return Ok(retry);
             }
@@ -264,8 +272,9 @@ impl Embedder {
         serde_json::json!({
             "state": "ready",
             "model": MODEL_ID,
-            "backend": if coreml.is_some() { "coreml" } else { "candle" },
-            "candle_device": self.device.as_ref().map(|d| if d.is_metal() { "metal" } else { "cpu" }),
+            "backend": if coreml.is_some() { "coreml" } else { "ggml" },
+            "ggml_device": self.device,
+            "flash_attention": self.flash,
             "coreml": coreml,
             "warmup_validated": true,
             "fallbacks": self.fallbacks,
@@ -275,6 +284,12 @@ impl Embedder {
 
     pub fn query_cached(&self, query: &str) -> bool {
         self.query_cache.lock().is_ok_and(|c| c.map.contains_key(query))
+    }
+
+    /// Token ids for one text under this instance's sequence cap
+    /// (`[CLS] ... [SEP]` included).
+    pub fn tokenize(&self, text: &str) -> Vec<u32> {
+        self.tokenizer.encode(text, self.max_seq)
     }
 
     /// Encode documents in inverted-index `doc_id` order and write
@@ -313,8 +328,7 @@ impl Embedder {
         self.embed_batch(texts)
     }
 
-    /// GPU batch size. Larger batches amortize kernel launches, which
-    /// dominate short BERT sequences on Metal. `HPS_EMBED_BATCH` overrides.
+    /// Sequences per graph. `HPS_EMBED_BATCH` overrides.
     pub fn batch_size() -> usize {
         std::env::var("HPS_EMBED_BATCH")
             .ok()
@@ -323,9 +337,19 @@ impl Embedder {
             .unwrap_or(DEFAULT_BATCH)
     }
 
+    /// Cap on padded tokens (`longest sequence x sequences`) per graph.
+    /// `HPS_EMBED_TOKENS` overrides the backend default.
+    fn token_budget(&self) -> usize {
+        std::env::var("HPS_EMBED_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&b: &usize| b > 0)
+            .unwrap_or(self.token_budget)
+    }
+
     /// The batch size for this instance's active backend: the CoreML
     /// document models' compiled batch when CoreML is serving, else the
-    /// measured candle batch.
+    /// ggml batch.
     pub fn effective_batch(&self) -> usize {
         #[cfg(target_os = "macos")]
         if let Some(cm) = &self.coreml {
@@ -335,18 +359,15 @@ impl Embedder {
     }
 
     fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        // Token-length bucketing with bounded CPU lookahead. Preserve the
-        // measured backend batch size; larger is not always faster on Metal.
         self.embed_docs_with(texts, self.effective_batch(), true)
     }
 
     /// Encode with an explicit batch size and optional length bucketing.
     ///
-    /// Padding is `BatchLongest`, so a batch costs the length of its longest
-    /// member times its size. Sorting by length before batching groups
-    /// similar-length texts together and stops one 512-token chunk from
-    /// inflating everything batched with it. Results are scattered back into
-    /// the caller's order, so bucketing is invisible from outside.
+    /// A graph costs the length of its longest sequence times its size, so
+    /// sorting by token count before batching groups similar lengths and
+    /// stops one 512-token chunk from padding everything batched with it.
+    /// Results are scattered back into the caller's order.
     pub fn embed_docs_with(
         &self,
         texts: &[&str],
@@ -357,146 +378,105 @@ impl Embedder {
             return Ok(Vec::new());
         }
         let batch = batch.max(1);
-        if texts.len() <= batch {
-            // Queries and tiny edits should not pay for a worker thread.
-            let rows = self
-                .tokenizer
-                .encode_batch(texts.to_vec(), true)
-                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-            return self.embed_encodings(&rows);
+        let t0 = std::time::Instant::now();
+        // WordPiece is cheap per text but a batch of thousands adds up next
+        // to a GPU that encodes 100k tokens a second: spread it over cores.
+        let tokens: Vec<Vec<u32>> = {
+            use rayon::prelude::*;
+            texts.par_iter().map(|t| self.tokenizer.encode(t, self.max_seq)).collect()
+        };
+        if matches!(std::env::var("HPS_EMBED_PROFILE").as_deref(), Ok("1") | Ok("true")) {
+            let n: usize = tokens.iter().map(Vec::len).sum();
+            eprintln!("  tokenize {} texts, {n} tokens: {:.3} ms", texts.len(), t0.elapsed().as_secs_f64() * 1000.0);
         }
-        // Keep the accelerator/model on the calling thread (CoreML is not Sync).
-        // Only the tokenizer and borrowed input text cross the thread boundary.
-        let tokenizer = self.tokenizer.clone();
-        std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::sync_channel(2);
-            let producer = scope.spawn(move || {
-                for (window, texts) in texts.chunks(1024).enumerate() {
-                    let rows =
-                        match prepare_window(&tokenizer, texts, window * 1024, bucket_by_length) {
-                            Ok(rows) => rows,
-                            Err(e) => {
-                                let _ = tx.send(Err(e));
-                                return;
-                            }
-                        };
-                    let mut rows = rows.into_iter();
-                    loop {
-                        let group: Vec<_> = rows.by_ref().take(batch).collect();
-                        if group.is_empty() {
-                            break;
-                        }
-                        if tx.send(Ok(group)).is_err() {
-                            return;
-                        }
-                    }
-                }
-            });
-            let result = (|| {
-                let mut out = vec![Vec::new(); texts.len()];
-                // IntoIter owns the receiver: on inference error it is dropped
-                // before join, releasing a producer blocked on the bounded queue.
-                for group in rx {
-                    let (ids, encodings): (Vec<_>, Vec<_>) = group?.into_iter().unzip();
-                    let vectors = self.embed_encodings(&encodings)?;
-                    anyhow::ensure!(vectors.len() == ids.len(), "embedding batch size mismatch");
-                    for (id, vector) in ids.into_iter().zip(vectors) {
-                        out[id] = vector;
-                    }
-                }
-                Ok(out)
-            })();
-            producer
-                .join()
-                .map_err(|_| anyhow::anyhow!("tokenizer worker panicked"))?;
-            result
-        })
+        let mut order: Vec<usize> = (0..texts.len()).collect();
+        if bucket_by_length {
+            order.sort_by_key(|&i| tokens[i].len());
+        }
+        let mut out = vec![Vec::new(); texts.len()];
+        // Largest batch first: the scheduler's buffers grow to their final
+        // size once instead of on every batch.
+        for group in plan_groups(&order, |i| tokens[i].len(), batch, self.token_budget()).into_iter().rev() {
+            let rows: Vec<&[u32]> = group.iter().map(|&i| tokens[i].as_slice()).collect();
+            let vectors = self.embed_encodings(&rows)?;
+            anyhow::ensure!(vectors.len() == group.len(), "embedding batch size mismatch");
+            for (&i, vector) in group.iter().zip(vectors) {
+                out[i] = vector;
+            }
+        }
+        Ok(out)
     }
 
-    fn embed_encodings(&self, encodings: &[Encoding]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let t0 = Instant::now();
-
+    fn embed_encodings(&self, rows: &[&[u32]]) -> anyhow::Result<Vec<Vec<f32>>> {
         #[cfg(target_os = "macos")]
         if let Some(cm) = &self.coreml {
-            // Unpadded rows (mask == 1); CoreML pads to its compiled shape.
-            let rows: Vec<Vec<u32>> = encodings
-                .iter()
-                .map(|e| {
-                    e.get_ids()
-                        .iter()
-                        .zip(e.get_attention_mask())
-                        .take_while(|(_, &m)| m == 1)
-                        .map(|(&t, _)| t)
-                        .collect()
-                })
-                .collect();
             if rows.len() == 1 {
-                if let Some(result) = cm.encode_query(&rows[0]) {
+                if let Some(result) = cm.encode_query(rows[0]) {
                     return Ok(vec![result?]);
                 }
             }
+            let owned: Vec<Vec<u32>> = rows.iter().map(|r| r.to_vec()).collect();
             let mut out = Vec::with_capacity(rows.len());
-            for group in rows.chunks(cm.doc_batch()) {
+            for group in owned.chunks(cm.doc_batch()) {
                 out.extend(cm.encode_docs(group)?);
             }
             return Ok(out);
         }
-        let seq = encodings.iter().map(|e| e.len()).max().unwrap_or(0);
-        let batch = encodings.len();
-        let mut ids = vec![0u32; batch * seq];
-        let mut mask = vec![0u8; batch * seq];
-        for (i, enc) in encodings.iter().enumerate() {
-            let t = enc.get_ids();
-            let m = enc.get_attention_mask();
-            ids[i * seq..i * seq + t.len()].copy_from_slice(t);
-            for (j, &bit) in m.iter().enumerate() {
-                mask[i * seq + j] = bit as u8;
-            }
-        }
-        let tok_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t1 = Instant::now();
-        let device = self
-            .device
+        let engine = self
+            .engine
             .as_ref()
-            .context("candle backend not loaded (CoreML-only instance)")?;
-        let model = self
-            .model
-            .as_ref()
-            .context("candle backend not loaded (CoreML-only instance)")?;
-        let ids = Tensor::from_vec(ids, (batch, seq), device)?;
-        // Candle's Metal backend implements where_cond for (U8, F16) but not
-        // (U32, F16). NomicBert builds the attention mask with where_cond, so
-        // keep the mask as U8 when running F16 on the GPU.
-        let mask = Tensor::from_vec(mask, (batch, seq), device)?;
-        let token_types = Tensor::zeros((batch, seq), DType::U32, device)?;
-        let upload_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        let t2 = Instant::now();
-        let hidden = model
-            .forward(&ids, Some(&token_types), Some(&mask))
-            .context("nomic-bert forward")?;
-        // CLS pooling: first token of each sequence. Sentence-transformers
-        // 1_Pooling/config.json sets pooling_mode_cls_token = true.
-        let cls = hidden.i((.., 0, ..))?;
-        let normed = l2_normalize(&cls)?.to_dtype(DType::F32)?;
-        let vecs = if profile() {
-            device.synchronize().ok();
-            let fwd_ms = t2.elapsed().as_secs_f64() * 1000.0;
-            let t3 = Instant::now();
-            let vecs = normed.to_vec2::<f32>()?;
-            let down_ms = t3.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "  embed seq={seq} batch={batch}  pad {tok_ms:.2} ms  upload {upload_ms:.2} ms  forward {fwd_ms:.2} ms  download {down_ms:.2} ms"
-            );
-            vecs
-        } else {
-            let _ = (tok_ms, upload_ms, t2);
-            normed.to_vec2::<f32>()?
-        };
-        for vector in &vecs {
-            validate_vector(vector).context("invalid Candle prediction")?;
-        }
-        Ok(vecs)
+            .context("ggml backend not loaded (CoreML-only instance)")?;
+        let raw = engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("encoder lock poisoned"))?
+            .forward(rows, self.pad_id)
+            .context("CodeRankEmbed forward")?;
+        raw.into_iter()
+            .map(|v| {
+                let v = l2_normalize(v);
+                validate_vector(&v).context("invalid ggml prediction")?;
+                Ok(v)
+            })
+            .collect()
     }
+}
+
+/// Consecutive slices of `order` with at most `batch` sequences and at most
+/// `budget` padded tokens (longest x count) each.
+fn plan_groups(order: &[usize], len_of: impl Fn(usize) -> usize, batch: usize, budget: usize) -> Vec<Vec<usize>> {
+    let mut groups = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut longest = 0usize;
+    for &i in order {
+        let len = len_of(i);
+        let next_longest = longest.max(len);
+        if !current.is_empty() && (current.len() >= batch || next_longest * (current.len() + 1) > budget) {
+            groups.push(std::mem::take(&mut current));
+            longest = 0;
+        }
+        longest = longest.max(len);
+        current.push(i);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in &mut v {
+            *x /= norm;
+        }
+    }
+    v
+}
+
+/// `HPS_EMBED_DEVICE=cpu` forces the CPU; `gpu`, `vulkan` and `metal` ask
+/// for the GPU (the default when one is available).
+fn pick_gpu() -> bool {
+    !matches!(std::env::var("HPS_EMBED_DEVICE").as_deref(), Ok("cpu"))
 }
 
 /// Both backends promise finite, L2-normalized CodeRankEmbed output. Reject
@@ -509,34 +489,8 @@ pub(crate) fn validate_vector(vector: &[f32]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prepare_window(
-    tokenizer: &Tokenizer,
-    texts: &[&str],
-    offset: usize,
-    bucket: bool,
-) -> anyhow::Result<Vec<(usize, Encoding)>> {
-    let mut rows: Vec<_> = tokenizer
-        .encode_batch(texts.to_vec(), true)
-        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?
-        .into_iter()
-        .enumerate()
-        .map(|(i, row)| (offset + i, row))
-        .collect();
-    if bucket {
-        rows.sort_by_key(|(_, row)| row.len());
-    }
-    Ok(rows)
-}
-
-fn profile() -> bool {
-    matches!(
-        std::env::var("HPS_EMBED_PROFILE").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
 #[cfg(test)]
-mod scheduling_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -553,123 +507,167 @@ mod scheduling_tests {
     }
 
     #[test]
-    fn token_bucketing_preserves_rows_ids_masks_and_truncation() {
-        let model = tokenizers::models::wordlevel::WordLevel::builder()
-            .vocab([("[UNK]".to_owned(), 0)].into_iter().collect())
-            .unk_token("[UNK]".into())
-            .build()
-            .unwrap();
-        let mut tokenizer = Tokenizer::new(model);
-        tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
-        tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: 3,
-                ..Default::default()
-            }))
-            .unwrap();
-        // Byte length gives the opposite order to actual token length.
-        let texts = ["a b c d e", "long_identifier_without_spaces", "a b"];
-        let plain = prepare_window(&tokenizer, &texts, 1024, false).unwrap();
-        let sorted = prepare_window(&tokenizer, &texts, 1024, true).unwrap();
-        assert_eq!(
-            sorted.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
-            vec![1025, 1026, 1024]
-        );
-        for (i, encoding) in sorted {
-            assert_eq!(encoding.get_ids(), plain[i - 1024].1.get_ids());
-            assert_eq!(
-                encoding.get_attention_mask(),
-                plain[i - 1024].1.get_attention_mask()
-            );
-            assert!(encoding.len() <= 3);
+    fn groups_respect_batch_and_padded_token_budget() {
+        let lens = [3usize, 3, 500, 510, 512, 512, 512];
+        let order: Vec<usize> = (0..lens.len()).collect();
+        let groups = plan_groups(&order, |i| lens[i], 4, 1100);
+        // Two short ones fit together; each ~512-token one is over half the
+        // budget, so at most two share a graph.
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6]]);
+        let groups = plan_groups(&order, |i| lens[i], 2, usize::MAX);
+        assert_eq!(groups.len(), 4);
+        // A single sequence always gets a group, even over budget.
+        assert_eq!(plan_groups(&[0], |_| 512, 8, 10), vec![vec![0]]);
+    }
+
+    use crate::test_util::ENV;
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+            for (k, v) in vars {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            Self(saved)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
         }
     }
 
     #[test]
-    fn inference_error_releases_prefetch_worker() {
-        let model = tokenizers::models::wordlevel::WordLevel::builder()
-            .vocab([("[UNK]".to_owned(), 0)].into_iter().collect())
-            .unk_token("[UNK]".into())
-            .build()
-            .unwrap();
-        let mut encoder = Embedder {
-            model: None,
-            device: None,
-            tokenizer: Tokenizer::new(model),
-            #[cfg(target_os = "macos")]
-            coreml: None,
-            query_cache: std::sync::Mutex::new(QueryCache::new()),
-            fallbacks: Vec::new(),
+    fn model_path_resolution_order() {
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let explicit = dir.path().join("explicit.gguf");
+        std::fs::write(&explicit, b"GGUF").unwrap();
+        // An explicit path wins and must exist.
+        let _g = EnvGuard::set(&[
+            ("HIPS_MODEL_PATH", Some(explicit.to_str().unwrap())),
+            ("HIPS_MODEL_OFFLINE", Some("1")),
+            ("HIPS_MODEL_URL", None),
+            ("CSEARCH_CACHE_DIR", Some(cache.to_str().unwrap())),
+        ]);
+        assert_eq!(model_path().unwrap(), explicit);
+        let _g = EnvGuard::set(&[("HIPS_MODEL_PATH", Some(dir.path().join("missing.gguf").to_str().unwrap()))]);
+        assert!(model_path().unwrap_err().to_string().contains("is not a file"));
+        // Empty counts as unset; offline with an empty cache is a clear error.
+        let _g = EnvGuard::set(&[("HIPS_MODEL_PATH", Some(""))]);
+        let err = model_path().unwrap_err().to_string();
+        assert!(err.contains("HIPS_MODEL_OFFLINE=1") && err.contains(MODEL_FILE), "{err}");
+        // A cached file under the csearch cache is used without any network.
+        std::fs::create_dir_all(cache.join("models")).unwrap();
+        std::fs::write(cache.join("models").join(MODEL_FILE), b"GGUF").unwrap();
+        assert_eq!(model_path().unwrap(), cache.join("models").join(MODEL_FILE));
+    }
+
+    #[test]
+    fn device_and_flag_parsing() {
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::set(&[("HPS_EMBED_DEVICE", None), ("HIPS_GGML_FLASH", None)]);
+        assert!(pick_gpu());
+        assert!(env_flag("HIPS_GGML_FLASH", true));
+        assert!(!env_flag("HIPS_GGML_FLASH", false));
+        let _g = EnvGuard::set(&[("HPS_EMBED_DEVICE", Some("cpu")), ("HIPS_GGML_FLASH", Some("off"))]);
+        assert!(!pick_gpu());
+        assert!(!env_flag("HIPS_GGML_FLASH", true));
+        let _g = EnvGuard::set(&[("HPS_EMBED_DEVICE", Some("vulkan")), ("HIPS_GGML_FLASH", Some("1"))]);
+        assert!(pick_gpu());
+        assert!(env_flag("HIPS_GGML_FLASH", false));
+        let _g = EnvGuard::set(&[("HIPS_GGML_FLASH", Some("garbage"))]);
+        assert!(env_flag("HIPS_GGML_FLASH", true), "unknown values keep the default");
+    }
+
+    #[test]
+    fn group_planning_edge_cases() {
+        assert!(plan_groups(&[], |_| 1, 4, 100).is_empty());
+        // batch = 1 is one sequence per graph regardless of budget.
+        assert_eq!(plan_groups(&[0, 1, 2], |_| 5, 1, 1000), vec![vec![0], vec![1], vec![2]]);
+        // The longest sequence so far sets the padded cost of the whole group.
+        let lens = [10usize, 10, 100];
+        assert_eq!(plan_groups(&[0, 1, 2], |i| lens[i], 8, 150), vec![vec![0, 1], vec![2]]);
+        // Every index appears exactly once, in order.
+        let order: Vec<usize> = (0..57).collect();
+        let groups = plan_groups(&order, |i| 1 + i % 13, 5, 40);
+        let flat: Vec<usize> = groups.iter().flatten().copied().collect();
+        assert_eq!(flat, order);
+        for g in &groups {
+            assert!(g.len() <= 5);
+            let longest = g.iter().map(|&i| 1 + i % 13).max().unwrap();
+            assert!(g.len() == 1 || longest * g.len() <= 40, "{g:?}");
+        }
+    }
+
+    /// Against vectors from the original fp32 implementation, and the
+    /// batching paths against each other. Skips without a model.
+    #[test]
+    fn matches_reference_vectors_and_batching_is_transparent() {
+        let Some(path) = crate::test_util::model() else { return };
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/coderank_reference.json")).unwrap();
+        let rows = |key: &str| -> Vec<(String, Vec<f32>)> {
+            fixture[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| (r["text"].as_str().unwrap().to_string(), r["vec"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect()))
+                .collect()
         };
-        assert!(encoder.embed_docs_with(&[], 4, true).unwrap().is_empty());
-        // More batches than queue capacity: consumer fails on the first one.
-        // Returning proves join does not wait forever on a blocked sender.
-        let inputs = vec!["fixture"; 2049];
-        let error = encoder.embed_docs_with(&inputs, 4, true).unwrap_err();
-        assert!(error.to_string().contains("backend not loaded"));
-        encoder.tokenizer = Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
-        let error = encoder.embed_docs_with(&inputs, 4, true).unwrap_err();
-        assert!(error.to_string().contains("tokenize"));
-    }
-}
+        let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
 
-fn cpu_device() -> (Device, DType) {
-    if crate::verbosity::verbose() {
-        #[cfg(target_os = "macos")]
-        eprintln!("CodeRankEmbed device: CPU (F32, Accelerate)");
-        #[cfg(not(target_os = "macos"))]
-        eprintln!("CodeRankEmbed device: CPU (F32)");
-    }
-    (Device::Cpu, DType::F32)
-}
-
-fn metal_or_cpu() -> (Device, DType) {
-    #[cfg(target_os = "macos")]
-    {
-        // Candle currently indexes Device::all()[0] without checking for an
-        // empty list. Sandboxes can hide every GPU even on Apple silicon.
-        if objc2_metal::MTLCopyAllDevices().count() == 0 {
-            eprintln!("Metal unavailable (macOS reports no accessible GPU devices); falling back to CPU");
-            return cpu_device();
+        let index = Embedder::load_from_file(&path, EmbedUse::Index).unwrap();
+        assert_eq!(index.diagnostics()["backend"], "ggml");
+        assert_eq!(index.diagnostics()["warmup_validated"], true);
+        let docs = rows("docs");
+        let texts: Vec<&str> = docs.iter().map(|(t, _)| t.as_str()).collect();
+        let bucketed = index.embed_docs_with(&texts, 32, true).unwrap();
+        let single = index.embed_docs_with(&texts, 1, false).unwrap();
+        for (i, (text, expected)) in docs.iter().enumerate() {
+            validate_vector(&bucketed[i]).unwrap();
+            let c = cosine(&bucketed[i], expected);
+            assert!(c > 0.9995, "doc {i} ({}...): cosine {c}", &text[..30]);
+            assert!(cosine(&bucketed[i], &single[i]) > 0.99999, "batching changed doc {i}");
         }
-        match Device::new_metal(0) {
-            Ok(device) => {
-                if crate::verbosity::verbose() {
-                    eprintln!("CodeRankEmbed device: Metal (F16)");
-                }
-                return (device, DType::F16);
-            }
-            Err(err) => eprintln!("Metal unavailable ({err}); falling back to CPU"),
-        }
-    }
-    cpu_device()
-}
+        assert_eq!(index.tokenize(&docs[0].0)[0], 101);
 
-fn pick_device(kind: EmbedUse) -> (Device, DType) {
-    match std::env::var("HPS_EMBED_DEVICE").as_deref() {
-        Ok("cpu") => return cpu_device(),
-        Ok("metal") => return metal_or_cpu(),
-        _ => {}
-    }
-    // Both paths prefer Metal when it exists. CPU+Accelerate was measured
-    // slower for batch-1 queries (~22 ms vs ~10 ms): Candle's NomicBert
-    // graph is hundreds of unfused ops, and Accelerate only speeds GEMMs.
-    let _ = kind;
-    metal_or_cpu()
-}
-
-fn load_nomic(vb: VarBuilder, config: &Config) -> anyhow::Result<NomicBertModel> {
-    let mut last = None;
-    for prefix in ["", "bert", "nomic_bert"] {
-        let sub = if prefix.is_empty() {
-            vb.clone()
-        } else {
-            vb.pp(prefix)
-        };
-        match NomicBertModel::load(sub, config) {
-            Ok(m) => return Ok(m),
-            Err(e) => last = Some(e),
+        let query = Embedder::load_from_file(&path, EmbedUse::Query).unwrap();
+        for (i, (text, expected)) in rows("queries").iter().enumerate() {
+            assert!(!query.query_cached(text));
+            let v = query.embed_query(text).unwrap();
+            validate_vector(&v).unwrap();
+            let c = cosine(&v, expected);
+            assert!(c > 0.9995, "query {i}: cosine {c}");
+            assert!(query.query_cached(text));
+            assert_eq!(query.embed_query(text).unwrap(), v, "cache returns the same vector");
         }
+        // A query longer than the query cap is truncated, not rejected.
+        let long = "token ".repeat(500);
+        assert!(query.tokenize(&long).len() <= MAX_QUERY_SEQ);
+        validate_vector(&query.embed_query(&long).unwrap()).unwrap();
+        // Empty input is a no-op, not an error.
+        assert!(index.embed_docs(&[]).unwrap().is_empty());
     }
-    Err(anyhow::anyhow!(last.unwrap()))
+
+    #[test]
+    fn normalization_and_cache_order() {
+        let v = l2_normalize(vec![3.0, 4.0]);
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        let mut cache = QueryCache::new();
+        for i in 0..QUERY_CACHE_CAP + 1 {
+            cache.put(format!("q{i}"), vec![i as f32]);
+        }
+        assert!(cache.get("q0").is_none(), "oldest entry evicted");
+        assert_eq!(cache.get("q1"), Some(vec![1.0]));
+    }
 }

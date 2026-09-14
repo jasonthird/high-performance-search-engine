@@ -2,7 +2,7 @@
 //! Apple Neural Engine.
 //!
 //! Measured on an M3 (see `scripts/ane-prototype/README.md`): 25.4k tok/s
-//! for document batches vs candle/Metal's 6.3k, and 3.8 ms vs ~6 ms for a
+//! for document batches vs Candle/Metal's 6.3k at the time, and 3.8 ms vs ~6 ms for a
 //! batch-1 query forward — with mean cosine 0.99968 against the fp32
 //! reference, tighter than the f16 sidecar's own rounding. The ANE is also
 //! the low-power engine, so sustained indexing barely throttles.
@@ -13,7 +13,7 @@
 //! batch-8 document models at several sequence lengths, and a batch-1
 //! short-sequence query model. Inputs are padded to the smallest model
 //! that fits. When no compiled models exist the caller falls back to the
-//! candle backend, which remains the portable implementation.
+//! ggml backend (`crate::ggml`), which remains the portable implementation.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -267,7 +267,7 @@ impl CoreMlEncoder {
     }
 
     /// Load the compiled model family, or `None` when the directory holds
-    /// no usable models (the candle backend takes over).
+    /// no usable models (the ggml backend takes over).
     pub fn load() -> Option<Self> {
         let dir = model_dir();
         let entries = std::fs::read_dir(&dir).ok()?;
@@ -344,7 +344,7 @@ impl CoreMlEncoder {
         for m in self.docs.iter().filter(|m| m.seq >= longest) {
             if m.batch_stable()? { selected = Some(m); break; }
         }
-        let m = selected.context("no CoreML shape passed batch-equivalence validation; use HIPS_ENCODER=candle and regenerate the compiled family")?;
+        let m = selected.context("no CoreML shape passed batch-equivalence validation; use HIPS_ENCODER=ggml and regenerate the compiled family")?;
         anyhow::ensure!(
             ids.len() <= m.batch,
             "batch {} exceeds compiled batch {}",

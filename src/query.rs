@@ -152,7 +152,7 @@ pub fn run_ranked(
 }
 
 /// Query embed and BM25 do not depend on each other. Encode on this
-/// thread (Metal stays where the model was warmed up) and run WAND on a
+/// thread (the GPU context stays where the model was warmed up) and run WAND on a
 /// helper thread; IVF/fusion still wait for the vector.
 #[cfg(feature = "semantic")]
 fn embed_and_bm25(

@@ -16,8 +16,11 @@ posting lists**, with optional **document reordering (recursive graph
 bisection)** for better compression; it scales from a repository to all of
 English Wikipedia on a laptop. The code-search layer walks a repository into
 declaration-sized chunks that keep their line numbers and adds
-**CodeRankEmbed vectors** (Candle, or CoreML on the Apple Neural Engine)
-for hybrid lexical + semantic retrieval.
+**CodeRankEmbed vectors** for hybrid lexical + semantic retrieval. The
+encoder is hips' own NomicBert graph on the ggml tensor library, running on
+Vulkan (Linux), Metal (macOS) or the CPU, with CoreML on the Apple Neural
+Engine as the fastest option on Apple silicon. Linux and macOS are both
+built and tested in CI; an Arch Linux package recipe is included.
 
 ```
 JSONL docs ──index──▶ inverted index + block metadata ──search──▶ exact BM25 top-k
@@ -34,14 +37,18 @@ documented in [docs/THEORY.md](docs/THEORY.md).
 
 ## Status
 
-Small by design: one executable, separately loadable grammar libraries, and
-index/model caches. Maintainers can package no grammars, a chosen subset, or
-all of them; omitted languages download when first indexed. The watcher runs
-only when requested directly or by an agent session. It is in daily use as
-the code-search tool this repository itself is developed with, and every
-benchmark in this README was taken on the author's laptop. Architecture and
-usage were reviewed against the working tree on 2026-09-07; historical
-benchmark numbers are retained with their original corpus and configuration.
+Small by design: one executable, separately loadable grammar libraries, one
+model file, and index caches. Maintainers can package no grammars, a chosen
+subset, or all of them; omitted languages download when first indexed, and
+the 274 MB encoder GGUF downloads once on the first hybrid index. The
+watcher runs only when requested directly or by an agent session. It is in
+daily use as the code-search tool this repository itself is developed with.
+Benchmarks in this README name their machine: the author's Apple M3 laptop
+for the lexical engine and the CoreML numbers, and a Linux workstation
+(Ryzen 5800X3D, Radeon RX 9070 XT) for the ggml encoder. Architecture and
+usage were reviewed against the working tree on 2026-09-14, when the Candle
+encoder was replaced by the ggml engine; historical benchmark numbers are
+retained with their original corpus and configuration.
 It is not a hosted search service — no clustering, no replication — and the engine
 half doubles as a readable, tested walk through how modern lexical search
 works end to end: indexing, compression, memory-mapped storage, exact
@@ -52,16 +59,30 @@ dynamic pruning, batch updates, benchmarking, and a small HTTP API.
 - A stable Rust toolchain and a C/C++ build toolchain for source builds,
   edition 2021. The file-lock APIs require at least Rust 1.89; this is not
   a tested minimum version for every locked dependency.
-- `--features semantic` for hybrid code search: pulls in Candle and the
-  tokenizers crate and downloads the ~550 MB CodeRankEmbed weights on first
-  use (into the Hugging Face cache). Off by default so the lexical engine
-  stays dependency-light.
+- `--features semantic` for hybrid code search: builds the vendored ggml
+  (`vendor/ggml`, a git submodule: clone with `--recurse-submodules` or run
+  `git submodule update --init`) with CMake and a C/C++ compiler, and
+  downloads the 274 MB CodeRankEmbed GGUF on first use into
+  `~/.cache/csearch/models/`. On Linux the Vulkan backend also needs
+  `glslc`, the Vulkan headers and loader, and SPIRV-Headers at build time
+  (Arch: `cmake shaderc vulkan-headers vulkan-icd-loader spirv-headers`;
+  Debian/Ubuntu: `cmake glslc libvulkan-dev spirv-headers`). Off by
+  default so the lexical engine stays dependency-light.
 - macOS with Metal only for the optional `gpu` feature (`--reorder bp-gpu`)
   and for the CoreML/Neural Engine encoder backend; the default build is
-  CPU-only and portable, and on Linux the encoder runs through Candle.
+  CPU-only and portable. The encoder itself runs on Vulkan (Linux), Metal
+  (macOS) or the CPU.
 - Grammar downloads target macOS and glibc Linux on arm64/x86_64. A user's
   machine needs no compiler when using prebuilt libraries. See
   [grammar packaging](grammars/README.md) for native builds and offline installs.
+- Linux (glibc, x86_64 or arm64) builds the default and `semantic` features
+  and is exercised in CI; the encoder runs on the GPU through Vulkan with a
+  CPU fallback. Build
+  from the repository root (or below it): `.cargo/config.toml` there adds
+  `-fno-strict-aliasing` for the GCC-built Linux targets, which the Haskell
+  grammar's scanner needs (see [grammar packaging](grammars/README.md)).
+  An Arch Linux package recipe lives in `packaging/arch/`
+  ([details](#arch-linux-package)).
 - Python 3 for the corpus helper scripts in `scripts/`, and a Python
   environment with coremltools to produce the CoreML models
   (`scripts/ane-prototype/README.md`).
@@ -71,7 +92,10 @@ dynamic pruning, batch updates, benchmarking, and a small HTTP API.
 Code search over a repository (the common case):
 
 ```sh
+git clone --recurse-submodules https://github.com/jasonthird/high-performance-search-engine
+cd high-performance-search-engine                # ggml is vendored as a submodule
 cargo install --path . --features semantic     # installs `hips`
+# Arch Linux: cd packaging/arch && makepkg -si  (see "Arch Linux package" below)
 hips index-repo --root .                        # once; later runs are incremental
 hips search --root . --query "where do we validate auth tokens"
 hips status --root .                            # what is indexed, watcher, sessions
@@ -131,14 +155,28 @@ cargo run --release -- repl --index ./index --top-k 10
 - `src/reorder.rs`, `src/reorder/gpu.rs` - document reordering (BP on CPU,
   zero-copy Metal behind `--features gpu`).
 - `src/api.rs` - Axum HTTP API.
-- `src/embedder.rs`, `src/coreml.rs`, `src/embeddings.rs`, `src/embcache.rs`,
-  `src/ivf.rs`, `src/pq.rs`, `src/hybrid.rs` - CodeRankEmbed inference
-  (Candle; CoreML/ANE on macOS), FP16 vector storage and scoring, the
-  content-keyed embedding cache, IVF/PQ, and score fusion.
+- `src/ggml.rs`, `src/wordpiece.rs`, `src/embedder.rs`, `src/coreml.rs` -
+  the encoder: the NomicBert graph on ggml (weights from the GGUF, one
+  graph per padded batch, batched flash attention, `[CLS]` pooling), the
+  WordPiece tokenizer fed from the same GGUF, the embedder API around them
+  (model fetch, batching, query cache, validation), and the CoreML/ANE
+  backend for macOS.
+- `crates/ggml-sys/`, `vendor/ggml/` - the vendored ggml (a pinned git
+  submodule) built as static libraries with Vulkan or Metal, and its
+  pre-generated bindings.
+- `src/embeddings.rs`, `src/embcache.rs`, `src/ivf.rs`, `src/pq.rs`,
+  `src/hnsw.rs`, `src/hybrid.rs` - FP16 vector storage and scoring, the
+  content-keyed embedding cache, IVF/PQ, HNSW routing, and score fusion.
+- `src/fetch.rs` - verified downloads (SHA-256 sidecar, size cap,
+  validation before publication) shared by the grammar loader and the
+  model fetch.
 - `src/repo.rs`, `src/treesit.rs`, `src/grammar.rs`, `src/codeindex.rs`,
   `tree-sitters/` - repository walking, declaration chunking across 41 grammar
   variants, lazy library loading, embedded definition queries, heuristic
   fallback, PDF pages, and incremental segmented rebuilds.
+- `packaging/arch/` - the Arch Linux `PKGBUILD`; `.cargo/config.toml` -
+  the GCC flag the Haskell grammar needs on Linux (see
+  [grammar packaging](grammars/README.md)).
 - `grammars/` - independent Cargo workspace of native grammar libraries;
   `.github/workflows/grammars.yml` builds/tests four platforms and publishes
   individual libraries and checksums on a grammar release tag.
@@ -152,11 +190,17 @@ cargo run --release -- repl --index ./index --top-k 10
 - `scripts/` - corpus converters (CirrusSearch dumps, directory crawls) and
   the CoreML conversion of CodeRankEmbed (`scripts/ane-prototype/`).
 - `examples/` - micro-benchmarks and equivalence checks behind the numbers
-  in this README (`pq_scoring_bench`, `bucket_equiv`, `embed_bench`, ...).
+  in this README (`embed_dump` for backend comparisons, `embed_bench`,
+  `token_lengths`, `bucket_equiv`, `pq_scoring_bench`, ...).
 - `docs/THEORY.md` - algorithm notes and paper references.
 - `tests/` - Block-Max WAND vs naive-BM25 oracles, persistence and
   reordering, external builds, segmented indexes, the repo lifecycle, the
-  MCP transport, and the background watcher.
+  MCP transport, the background watcher, CLI fallback contracts, and an
+  end-to-end hybrid search against the real model; unit tests next to the
+  code cover the tokenizer (including parity with the reference
+  tokenizer), the download helper, and the engine's equivalences (batched
+  vs single rows, flash vs naive attention, GPU vs CPU, and a fixture of
+  fp32 reference vectors).
 
 ## What this engine does
 
@@ -467,18 +511,77 @@ for measured latency/recall, construction costs and limitations.
 
 Inference runs in-process, no Python at query time. Two backends:
 
-- **Candle** (`src/embedder.rs`): NomicBert on Metal, CUDA-less CPU, or
-  Accelerate; portable, and the only backend off macOS. A Candle fork with
-  a fused Metal SDPA kernel in NomicBert attention is patched in
-  (`Cargo.toml`), 1.7x faster document encoding at sequence 512.
+- **ggml** (`src/ggml.rs`, `src/embedder.rs`): hips' own NomicBert graph
+  built directly on the vendored ggml tensor library, no llama.cpp model
+  zoo in between. The model is one GGUF (F16 weights plus the WordPiece
+  vocabulary, tokenized by `src/wordpiece.rs`), fetched once from the
+  pinned `models-v1` release with a SHA-256 check, like the grammars.
+  Vulkan on Linux, Metal on macOS, the CPU otherwise or with
+  `HPS_EMBED_DEVICE=cpu`; the CPU backend is always the fallback for an op a
+  device lacks. Batches are padded per sequence, not packed, so attention
+  runs as one batched flash-attention op per graph with a per-sequence key
+  mask instead of a block-diagonal mask over a packed stream, and the last
+  layer runs attention, the output projection and the MLP for the `[CLS]`
+  rows only. See [Encoder engine](#encoder-engine) for the knobs and the
+  measurements.
 - **CoreML on the Apple Neural Engine** (`src/coreml.rs`): the same weights
   compiled to static-shape models (batch-8 document models at sequence
   64/128/256/512, a batch-1 query model) under `<cache>/coreml/`, produced
   by `scripts/ane-prototype/ane_convert.py`. Used automatically when the
   compiled models cover the configured token limit; incomplete families fall
-  back to Candle. Document shapes also undergo a once-per-loaded-shape batch-row
+  back to ggml. Document shapes also undergo a once-per-loaded-shape batch-row
   equivalence check; failed shapes are skipped, and encoding reports an error
-  if no fitting shape passes. `HIPS_ENCODER=candle` forces the fallback.
+  if no fitting shape passes. `HIPS_ENCODER=ggml` forces the fallback.
+
+#### Encoder engine
+
+`crates/ggml-sys` builds `vendor/ggml` as static libraries (CPU with OpenMP
+and the tinyBLAS GEMM kernels, plus Vulkan on Linux or Metal and Accelerate
+on macOS) and ships pre-generated bindings, so building hips needs CMake and
+a C/C++ toolchain but not libclang. The graph per batch is plain ggml,
+about 280 nodes: `get_rows` embeddings, LayerNorms, one fused QKV matmul
+whose output is read through strided views (no copies), NeoX RoPE,
+`flash_attn_ext` straight on those views, one fused gate|up matmul (the two
+weights are concatenated at load) followed by a single SwiGLU node, and
+`[CLS]` pooling. A query is padded to 32 tokens so every query reuses one
+built and allocated graph; only its inputs are uploaded. `HIPS_GGML_FLASH=0`
+swaps in the naive matmul/softmax attention, `HIPS_GGML_CLS_ONLY=0` disables
+the last-layer shortcut, `HIPS_GGML_CAST_KV=1` casts K/V to F16 before
+attention (the macOS default until Metal is measured) and
+`HIPS_GGML_FA_F16=1` accumulates attention in F16, all A/B knobs that
+produce the same vectors. `HPS_EMBED_PROFILE=1` prints per-graph timings.
+`HPS_EMBED_BATCH` (sequences per graph, default 32), `HPS_EMBED_TOKENS`
+(padded tokens per graph: 8192 on a GPU, 1024 on the CPU where activations
+must stay in cache) and `HPS_EMBED_THREADS` tune batching.
+`HIPS_MODEL_PATH` points at any local GGUF, `HIPS_MODEL_URL` at another
+asset, and `HIPS_MODEL_OFFLINE=1` forbids downloads.
+
+Measured on this repository (256 sampled chunks, 47k tokens, cap 512), same
+inputs for every backend, cosine against the original fp32 model:
+
+```
+                                  doc tokens/s   query     doc cosine   top-10 agreement
+candle CPU F32 (former Linux path)      1,202    63 ms     reference    reference
+ggml CPU F16, 8 threads (Ryzen 5800X3D) 3,400   7.5 ms     1.00000      100%
+ggml Vulkan F16 (Radeon RX 9070 XT)   154,000   1.4 ms     0.99998      100%
+llama.cpp Vulkan, same GGUF           102,000   1.8 ms     0.99998      100%
+```
+
+Where a query's 1.4 ms goes: 283 nodes at about 4.5 µs of dispatch each,
+the cached graph having removed the scheduler's 0.5 ms allocation pass.
+A `hips search` process spends far more starting up than encoding:
+about 120 ms creating the Vulkan instance (paid even in CPU mode, since
+the backend registry enumerates devices) and 60-80 ms reading and
+uploading the 274 MB of weights, for 0.24 s wall; the MCP server and the
+watcher keep the model resident and pay it once.
+
+A full hybrid index of this repository (1,859 chunks) takes 2.5 s on the
+GPU; a hybrid query 2.6 ms end to end. The GGUF is produced from the
+published safetensors with llama.cpp's converter
+(`convert_hf_to_gguf.py <snapshot> --outtype f16`) and published as
+`CodeRankEmbed-f16.gguf` plus a `CodeRankEmbed-f16.gguf.sha256` sidecar in
+the `models-v1` release; a new conversion means a new release and a bump of
+`MODEL_RELEASE` in `src/embedder.rs`, never a replaced asset.
 
 #### macOS caches and restricted processes
 
@@ -486,7 +589,7 @@ CoreML uses two distinct caches. Compiled CodeRankEmbed shapes live at
 `<CSEARCH_CACHE_DIR>/coreml` (default `~/.cache/csearch/coreml`). Loading a
 shape creates another, device-specialized E5RT cache, normally under
 `~/Library/Caches/hips/com.apple.e5rt.e5bundlecache/`. Changing
-`CSEARCH_CACHE_DIR`, `HF_HOME`, `XDG_CACHE_HOME`, or `TMPDIR` does not relocate
+`CSEARCH_CACHE_DIR`, `HIPS_MODEL_PATH`, `XDG_CACHE_HOME`, or `TMPDIR` does not relocate
 that E5RT cache.
 
 The macOS CLI supports an explicit writable cache base:
@@ -509,7 +612,7 @@ home-directory override present in [Apple's CoreFoundation implementation](https
 This affects **all Foundation home-relative paths in the hips process**,
 including its child processes, and takes precedence over an inherited
 `CFFIXED_USER_HOME`. It does not change the shell's `HOME`, hips' index
-selection, or `HF_HOME`. This is an opt-in compatibility mechanism, not a
+selection, or the model cache. This is an opt-in compatibility mechanism, not a
 CoreML API guarantee; verify it on your target macOS version. Library users
 must arrange `CFFIXED_USER_HOME` at process startup themselves; loading an
 encoder never mutates the process environment.
@@ -527,12 +630,12 @@ runtime services are available.
 hips checks cache writability, requires successful encoder warmup, and
 rejects wrong-sized, non-finite, zero, or non-normalized predictions before
 ranking or caching them. If CoreML initialization fails, it prints the
-cause and retries CodeRankEmbed with Candle, preferring Metal when a GPU is
-accessible and using CPU otherwise. The device check also prevents Candle's
-empty-device-list panic when the sandbox hides every GPU. Hybrid retrieval
-uses the same stored document vectors. This may increase startup time
-and memory usage. `HIPS_ENCODER=candle HPS_EMBED_DEVICE=cpu` explicitly selects
-that backend for one invocation if needed.
+cause and retries CodeRankEmbed with ggml, using Metal when a GPU is
+accessible and the CPU otherwise (a sandbox that hides every GPU simply
+yields no GPU device). Hybrid retrieval uses the same stored document
+vectors. This may increase startup time and memory usage.
+`HIPS_ENCODER=ggml HPS_EMBED_DEVICE=cpu` explicitly selects that backend for
+one invocation if needed.
 
 If encoder initialization is still unavailable, default/hybrid search
 prints `using lexical BM25 only` to **stderr** and returns lexical results
@@ -565,7 +668,7 @@ ancestor-index resolution. For real CoreML coverage with cached models:
 
 ```sh
 HIPS_TEST_COREML_MODELS="$HOME/.cache/csearch/coreml" \
-HIPS_TEST_HF_HOME="$HOME/.cache/huggingface" \
+HIPS_TEST_MODEL_PATH="$HOME/.cache/csearch/models/CodeRankEmbed-f16.gguf" \
   cargo test --features semantic --test search_runtime \
   native_coreml_cache_relocation -- --ignored
 ```
@@ -581,7 +684,7 @@ the former byte-bucketed serial scheduler with the new path using
 `cargo run --release --features semantic --example cold_embed_bench -- . 128`.
 This measures uncached encoding after model/shape warmup, not downloads or
 the complete first index build.
-  Measured on an M3: 25.4k tok/s vs Candle/Metal's 6.3k for document
+  Measured on an M3: 25.4k tok/s vs the former Candle/Metal path's 6.3k for document
   batches, an 810-chunk cold index in 13.0 s instead of 28.6 s, a hybrid
   query in 0.10 s wall including model load, and embeddings within mean
   cosine 0.99968 of the fp32 reference. That fidelity measurement supports
@@ -594,7 +697,7 @@ the complete first index build.
 cargo build --release --features semantic
 
 # 1. one index directory: inverted postings + CodeRankEmbed vectors
-#    (same internal doc_ids; downloads ~550 MB of weights on first run)
+#    (same internal doc_ids; downloads the 274 MB CodeRankEmbed GGUF on first run)
 ./target/release/hips index \
   --input data/code_eval/corpus.jsonl --out ./index-code --code --embed
 
@@ -743,7 +846,7 @@ src/auth/mod.rs:12-40        AuthLayer
 ```
 
 Encoder loading is silent when the model is cached. It prints a line only
-when it is actually downloading (first run, ~550 MB) or when it cannot be
+when it is actually downloading (first run, 274 MB) or when it cannot be
 loaded at all (offline with an empty cache), in which case the search
 degrades to BM25 with a `note:` explaining that. Pass `-v` for the old
 verbose output: scores, per-stage timing, WAND stats, device and cache
@@ -779,6 +882,21 @@ claude plugin install hips@hips -s user
 The plugin costs about 200 always-on tokens per session (the skill line plus
 one SessionStart note saying the index is handled); the hint fires only on
 prompts containing words like "where", "find", "how does", "which file".
+
+#### Arch Linux package
+
+`packaging/arch/PKGBUILD` builds `hips-git` from the main branch with
+`--features semantic`, runs the test suite in `check()` (`--nocheck` skips
+it), and installs the binary as `/usr/lib/hips/hips` with all 41 grammar
+libraries under `/usr/lib/hips/grammars/`. `/usr/bin/hips` is a launcher
+that points `HIPS_GRAMMAR_DIR` at them, so no grammar is ever downloaded;
+an explicit `HIPS_GRAMMAR_DIR` in the environment still wins. The watcher
+and MCP server spawned from it inherit the setting. Only the CodeRankEmbed
+weights are fetched at run time, on the first hybrid index.
+
+```sh
+cd packaging/arch && makepkg -si
+```
 
 #### Always fresh: the session-leased watcher
 
@@ -899,7 +1017,7 @@ GPU, or IOSurface access to a sandboxed CLI.
 `verbose` and `include_snippet` both default to `false`. Set
 `include_snippet: true` to include up to 4 source lines for every returned hit.
 Normal results include their effective retrieval mode and report any
-CoreML-to-Candle recovery. Hybrid or semantic inference failures produce
+CoreML-to-ggml recovery. Hybrid or semantic inference failures produce
 `isError: true`; the server remains available for another call. An explicit
 lexical retry is labeled lexical. Failed hybrid retrieval never returns
 arbitrary results as success.
@@ -924,7 +1042,7 @@ index means vectors exist; it does not prove runtime availability.
 `backend: "coreml"` after a successful semantic search proves CoreML inference.
 CoreML `compute_units` are permitted devices, while
 `execution_device: "not_observed"` explicitly avoids claiming that individual
-operations ran on ANE. Candle reports its actual CPU or Metal device.
+operations ran on ANE. ggml reports its actual device (`ggml_device`).
 
 `expected_root` rejects a request aimed at a different repository before
 retrieval or rebuilding. MCP also rejects an explicitly supplied index that
@@ -1004,7 +1122,7 @@ Measured:
 
 ```
                                 387k chunks (lexical)   this repo (embedded)
-first build                            3.8 s            13 s CoreML / ~42 s Candle
+first build                            3.8 s            2.5 s ggml/Vulkan (RX 9070 XT), 13 s CoreML (M3)
 one-file edit -> reindexed             0.15 s                 0.20 s
   (non-segmented rebuild)             (2.4 s+)                  --
 ```
@@ -1041,7 +1159,7 @@ proportional to the edit:
   (`--retrain`, or `reindex` with `{"retrain": true}`).
 - **Chunking.** Files are read and split in parallel across cores.
 
-Measured with the Candle encoder on this repository (812 chunks, 46 files)
+Measured with the former Candle encoder on this repository (812 chunks, 46 files)
 and on the whole crates.io source cache (358k chunks, 15k files) — Apple
 M-series, 8 cores:
 
@@ -1126,6 +1244,20 @@ cargo test --locked --features semantic
 cargo check --locked --no-default-features
 ```
 
+The semantic suite tests the encoder itself, so it needs the CodeRankEmbed
+GGUF: it is resolved the way the program resolves it (`HIPS_MODEL_PATH`,
+the csearch cache, else a one-time 274 MB download from the pinned
+release), and a test that cannot get it fails. `HIPS_TEST_SKIP_MODEL=1`
+skips those tests deliberately on an offline machine. They check batch
+rows against single-sequence rows, flash against naive attention, the
+`[CLS]`-only last layer against the full one, GPU against CPU, a fixture
+of fp32 reference vectors (`tests/fixtures/coderank_reference.json`), and
+an end-to-end hybrid index-and-search on a small tree ranked by meaning.
+The WordPiece parity test against the reference tokenizer additionally
+needs CodeRankEmbed's `tokenizer.json` (the Hugging Face cache, or
+`HIPS_TEST_TOKENIZER_JSON`) and skips without it. `examples/embed_dump.rs` encodes a chunk sample plus fixed
+queries to JSON with timings, for comparing backends and devices.
+
 The loader tests use a localhost HTTP server and the watcher tests need
 filesystem events and child-process access; restrictive sandboxes may block
 those integration checks. CI builds the libraries before testing.
@@ -1173,7 +1305,9 @@ Low `num_docs_scored` relative to `num_docs_total`, and high
 - `unsafe` is confined to audited areas, each with its invariant documented
   at the call site: the `mmap` call in storage (standard accepted risk,
   same as Lucene's MMapDirectory); the NEON f16 dot product in
-  `src/embeddings.rs`; the CoreML bindings in `src/coreml.rs` (objc2);
+  `src/embeddings.rs`; the ggml FFI in `src/ggml.rs` (every object owned
+  by one `Engine` and freed in `Drop`); the CoreML bindings in
+  `src/coreml.rs` (objc2);
   native grammar loading and symbol conversion in `src/grammar.rs` (the
   library owner outlives its language and queries); the watcher's `setsid`,
   `kill(pid, 0)` liveness probes and signal

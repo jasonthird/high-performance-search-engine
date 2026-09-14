@@ -1,12 +1,7 @@
 //! On-demand, versioned native grammars. Keep the library alive with its language.
 use anyhow::{bail, Context, Result};
 use libloading::Library;
-use sha2::{Digest, Sha256};
-use std::{
-    io::{Read, Write},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Parser};
 use tree_sitter_language::LanguageFn;
 
@@ -89,64 +84,23 @@ fn open(path: &Path) -> Result<LoadedGrammar> {
 }
 
 fn download(url: &str, path: &Path) -> Result<()> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(120))
-        .build();
-    let mut checksum = String::new();
-    agent
-        .get(&format!("{url}.sha256"))
-        .call()?
-        .into_reader()
-        .take(1024)
-        .read_to_string(&mut checksum)?;
-    let expected = checksum
-        .split_whitespace()
-        .next()
-        .context("empty grammar checksum")?;
-    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("invalid grammar checksum");
-    }
-    let dir = path.parent().context("grammar cache has no parent")?;
-    std::fs::create_dir_all(dir)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    let mut reader = agent
-        .get(url)
-        .call()?
-        .into_reader()
-        .take(128 * 1024 * 1024 + 1);
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    let mut total = 0;
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if total > 128 * 1024 * 1024 {
-            bail!("grammar exceeds size limit");
-        }
-        hash.update(&buffer[..n]);
-        temp.write_all(&buffer[..n])?;
-    }
-    if format!("{:x}", hash.finalize()) != expected.to_ascii_lowercase() {
-        bail!("grammar checksum mismatch");
-    }
-    temp.as_file().sync_all()?;
-    // Validate before publishing. Unique temporary files + no-clobber publication
-    // also allow independent hips processes to download the same grammar safely.
-    drop(open(temp.path())?);
-    match temp.persist_noclobber(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e.error.into()),
-    }
+    // Validate before publishing: the library must load and expose a
+    // parser-compatible language. Unique temporary files plus no-clobber
+    // publication (in `fetch`) let independent hips processes download the
+    // same grammar safely.
+    crate::fetch::download_verified(url, path, 128 * 1024 * 1024, |temp| open(temp).map(drop))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, thread};
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+        time::Duration,
+    };
 
     // Exercise real HTTP streaming, validation, dlopen, and cache publication.
     fn serve(checksum: String, body: Vec<u8>) -> (String, thread::JoinHandle<()>) {

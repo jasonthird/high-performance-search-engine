@@ -1,0 +1,13 @@
+[package]
+name = "ggml-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Static ggml (CPU + Vulkan on Linux, CPU + Metal + Accelerate on macOS) with pre-generated bindings, for the hips encoder"
+license = "MIT"
+links = "ggml"
+
+[dependencies]
+
+[build-dependencies]
+cmake = "0.1"

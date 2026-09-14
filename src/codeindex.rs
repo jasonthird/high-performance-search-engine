@@ -252,7 +252,7 @@ struct TrainedQuantizer {
 /// Builds (and rebuilds) the index for one source tree.
 ///
 /// The encoder is loaded once and reused across rebuilds — model load and
-/// Metal pipeline compilation cost far more than a typical incremental
+/// GPU pipeline compilation cost far more than a typical incremental
 /// rebuild does.
 pub struct RepoIndexer {
     root: PathBuf,
@@ -260,7 +260,7 @@ pub struct RepoIndexer {
     opts: BuildOpts,
     /// Loaded on first use and kept for the process lifetime. Lazy because a
     /// rebuild that changed nothing needs no encoder at all — and model load
-    /// plus Metal pipeline compilation costs about a second, which would
+    /// plus GPU pipeline compilation costs about a second, which would
     /// otherwise dominate an incremental rebuild.
     #[cfg(feature = "semantic")]
     embedder: std::cell::OnceCell<crate::embedder::Embedder>,

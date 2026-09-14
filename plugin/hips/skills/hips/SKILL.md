@@ -44,9 +44,9 @@ semantic or hybrid search first. Repeating a successful query should report
 `backend: coreml` plus a successful semantic search confirms CoreML inference.
 Its `compute_units` are allowed devices; `execution_device: not_observed`
 means hips has not measured whether individual operations ran on CPU or ANE.
-`backend: candle` and `candle_device` identify the alternative runtime. A
-CoreML-to-Candle retry retains semantic search and is disclosed in the normal
-response. A failed hybrid/semantic call has `isError: true`; do not present it
+`backend: ggml` and `ggml_device` identify the alternative runtime (hips'
+own ggml engine on Vulkan, Metal or the CPU). A CoreML-to-ggml retry retains
+semantic search and is disclosed in the normal response. A failed hybrid/semantic call has `isError: true`; do not present it
 as a successful search. Report an explicit lexical recovery if one is used.
 
 If MCP returns `structuredContent.error.code: insufficient_disk_space`, alert
@@ -65,7 +65,7 @@ hips search --root /absolute/path/to/repository --query "<what the code does>" -
 ```
 
 Use `-v` for runtime diagnostics and `--json` for JSONL results. A `using
-lexical BM25` note means semantic retrieval was unavailable. A Candle retry
+lexical BM25` note means semantic retrieval was unavailable. A ggml retry
 can still provide hybrid results. Cache access alone does not grant macOS
 GPU, ANE, or IOSurface access; see the sibling `hips-install` skill for setup.
 

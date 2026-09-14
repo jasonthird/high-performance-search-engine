@@ -1,13 +1,13 @@
 //! Token-length distribution of a repo's chunks under the CodeRankEmbed
-//! tokenizer — CPU-only, so it can run while the GPU is busy encoding.
+//! tokenizer — vocabulary only, no model weights, so it can run while the
+//! GPU is busy encoding.
 //!
 //! This predicts what a shorter sequence cap costs (chunks truncated) and
 //! saves (padded tokens not computed) before spending any GPU time on it.
 //!
 //! ```sh
-//! cargo run --release --features semantic --example token_lengths -- <repo>
+//! cargo run --release --features semantic --example token_lengths -- <repo> [model.gguf]
 //! ```
-
 #[cfg(not(feature = "semantic"))]
 fn main() {
     eprintln!("build with --features semantic");
@@ -15,24 +15,17 @@ fn main() {
 
 #[cfg(feature = "semantic")]
 fn main() -> anyhow::Result<()> {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use high_performance_search_engine::repo;
-    use tokenizers::Tokenizer;
+    use high_performance_search_engine::{embedder, ggml, repo, wordpiece::WordPiece};
 
-    let root = std::env::args().nth(1).expect("usage: token_lengths <repo>");
-    let tok_path = std::env::args().nth(2).unwrap_or_else(|| {
-        format!(
-            "{}/.cache/huggingface/hub/models--nomic-ai--CodeRankEmbed/snapshots/3c4b60807d71f79b43f3c4363786d9493691f8b1/tokenizer.json",
-            std::env::var("HOME").unwrap()
-        )
-    });
-    let mut tokenizer =
-        Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    // The shipped tokenizer.json pads and truncates to 512, which would make
-    // every length read as exactly 512; strip both to see true lengths.
-    let _ = tokenizer.with_padding(None);
-    let _ = tokenizer.with_truncation(None);
+    let root = std::env::args().nth(1).expect("usage: token_lengths <repo> [model.gguf]");
+    let model = match std::env::args().nth(2) {
+        Some(p) => PathBuf::from(p),
+        None => embedder::model_path()?,
+    };
+    let vocab = ggml::read_vocab(&model)?;
+    let tokenizer = WordPiece::from_gguf(&vocab.tokens, &vocab.token_types, vocab.unk, vocab.cls, vocab.sep);
     let chunks = repo::collect_chunks(Path::new(&root))?;
     let texts: Vec<String> = chunks
         .iter()
@@ -40,14 +33,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     // Keep file order too: padded cost depends on batching order.
-    let mut lens: Vec<usize> = Vec::with_capacity(texts.len());
-    for batch in texts.chunks(512) {
-        let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
-        let encs = tokenizer
-            .encode_batch(refs, true)
-            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-        lens.extend(encs.iter().map(|e| e.len()));
-    }
+    let mut lens: Vec<usize> = texts.iter().map(|t| tokenizer.encode(t, usize::MAX).len()).collect();
     let file_order = lens.clone();
     lens.sort_unstable();
     let n = lens.len();
@@ -58,38 +44,37 @@ fn main() -> anyhow::Result<()> {
 
     println!("\n{n} chunks tokenized (CodeRankEmbed tokenizer)");
     println!(
-        "tokens: p50 {}  p75 {}  p90 {}  p95 {}  p99 {}  max {}",
-        pct(50), pct(75), pct(90), pct(95), pct(99), lens[n - 1]
+        "tokens: p50 {}, p90 {}, p95 {}, p99 {}, max {}, mean {:.1}",
+        pct(50),
+        pct(90),
+        pct(95),
+        pct(99),
+        lens[n - 1],
+        total as f64 / n as f64
     );
-    println!("\n{:>6} {:>12} {:>14} {:>16}", "cap", "truncated", "% truncated", "token work vs 512");
-    for cap in [512usize, 384, 256, 192, 128] {
-        let t = over(cap);
+    println!("\n{:>6} {:>10} {:>12} {:>14}", "cap", "truncated", "tokens kept", "of untruncated");
+    for cap in [128usize, 192, 256, 384, 512, 1024, 2048] {
         println!(
-            "{cap:>6} {t:>12} {:>13.1}% {:>15.1}%",
-            100.0 * t as f64 / n as f64,
-            100.0 * capped_total(cap) as f64 / capped_total(512).max(1) as f64
+            "{cap:>6} {:>10} {:>12} {:>13.1}%",
+            over(cap),
+            capped_total(cap),
+            100.0 * capped_total(cap) as f64 / total as f64
         );
     }
-    let _ = total;
 
-    // Padded cost model: a batch computes batch_size x max(len) tokens, so
-    // padding waste depends entirely on how similar batch members are.
-    let padded = |order: &[usize], batch: usize, cap: usize| -> usize {
+    // Padded cost of batches of 32 in file order versus sorted by length:
+    // what bucketing buys at each cap.
+    let padded = |order: &[usize], cap: usize| -> usize {
         order
-            .chunks(batch)
-            .map(|b| b.len() * b.iter().map(|&l| l.min(cap)).max().unwrap_or(0))
+            .chunks(32)
+            .map(|b| b.iter().map(|&l| l.min(cap)).max().unwrap_or(0) * b.len())
             .sum()
     };
-    let real: usize = lens.iter().map(|&l| l.min(512)).sum();
-    println!("padded token work at cap 512 (100% = tokens actually needed):");
-    for (label, order) in [("file order", &file_order), ("sorted (bucketed)", &lens)] {
-        for batch in [4usize, 16, 64] {
-            println!(
-                "  {label:<18} batch {batch:>3}: {:>6.0}%",
-                100.0 * padded(order, batch, 512) as f64 / real as f64
-            );
-        }
+    println!("\n{:>6} {:>14} {:>14} {:>8}", "cap", "padded (file)", "padded (sort)", "saving");
+    for cap in [256usize, 512, 2048] {
+        let f = padded(&file_order, cap);
+        let s = padded(&lens, cap);
+        println!("{cap:>6} {f:>14} {s:>14} {:>7.1}%", 100.0 * (1.0 - s as f64 / f as f64));
     }
-    println!();
     Ok(())
 }
