@@ -381,9 +381,12 @@ impl Embedder {
         let t0 = std::time::Instant::now();
         // WordPiece is cheap per text but a batch of thousands adds up next
         // to a GPU that encodes 100k tokens a second: spread it over cores.
+        // Only the tokenizer crosses threads: the embedder as a whole is not
+        // Sync on macOS (CoreML's model handles are single-threaded).
         let tokens: Vec<Vec<u32>> = {
             use rayon::prelude::*;
-            texts.par_iter().map(|t| self.tokenizer.encode(t, self.max_seq)).collect()
+            let (tokenizer, max_seq) = (&self.tokenizer, self.max_seq);
+            texts.par_iter().map(|t| tokenizer.encode(t, max_seq)).collect()
         };
         if matches!(std::env::var("HPS_EMBED_PROFILE").as_deref(), Ok("1") | Ok("true")) {
             let n: usize = tokens.iter().map(Vec::len).sum();
