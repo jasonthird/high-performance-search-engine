@@ -1,0 +1,99 @@
+# Maintainer: Iason Malkotsis <imalkotsis@gmail.com>
+#
+# hips from the main branch, built with the semantic (CodeRankEmbed) encoder
+# on hips' own ggml engine (Vulkan) and all 41 tree-sitter grammar libraries
+# bundled, so nothing is downloaded at run time except the 274 MB model GGUF
+# on the first hybrid index.
+#
+#   cd packaging/arch && makepkg -si        # add --nocheck to skip the test suite
+#
+# The binary is installed as /usr/lib/hips/hips; /usr/bin/hips is a launcher
+# that points HIPS_GRAMMAR_DIR at the packaged grammars (an explicit
+# HIPS_GRAMMAR_DIR in the environment still wins).
+
+pkgname=hips-git
+_pkgname=hips
+pkgver=r40.0c97c80
+pkgrel=1
+pkgdesc="Hybrid BM25 + CodeRankEmbed code search for coding agents, with an MCP server (git)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jasonthird/high-performance-search-engine"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'vulkan-icd-loader')
+# cmake, shaderc (glslc), the Vulkan headers and SPIRV-Headers build the
+# encoder's ggml Vulkan backend (vendor/ggml, a git submodule).
+makedepends=('cargo' 'git' 'cmake' 'shaderc' 'vulkan-headers' 'spirv-headers')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+# makepkg's LTOFLAGS would reach the C parse tables through cc-rs, and rustc
+# links those objects with lld, which cannot read GCC LTO objects. Cargo's
+# own release profile still applies to the Rust code.
+options=('!lto')
+source=("$_pkgname::git+$url.git"
+        "ggml::git+https://github.com/ggml-org/ggml.git")
+sha256sums=('SKIP'
+            'SKIP')
+
+_host_target() {
+  rustc -vV | sed -n 's/host: //p'
+}
+
+pkgver() {
+  cd "$_pkgname"
+  # No release tags yet: monotonic revision count plus the commit.
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  # Point the vendored ggml submodule at makepkg's clone of it.
+  git submodule init
+  git config submodule.vendor/ggml.url "$srcdir/ggml"
+  git -c protocol.file.allow=always submodule update
+  export RUSTUP_TOOLCHAIN=stable
+  # The hips crate and the grammar libraries are separate Cargo workspaces
+  # with their own lockfiles; fetch both so build() and check() run frozen.
+  cargo fetch --locked --target "$(_host_target)"
+  cargo fetch --locked --target "$(_host_target)" --manifest-path grammars/Cargo.toml
+}
+
+build() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Run from the repository root: .cargo/config.toml there adds
+  # -fno-strict-aliasing for the GCC-built targets (see grammars/README.md).
+  cargo build --frozen --release --features semantic
+  # The grammar workspace keeps its own target directory so check() and
+  # package() find the libraries where the README documents them.
+  CARGO_TARGET_DIR=grammars/target \
+    cargo build --frozen --release --manifest-path grammars/Cargo.toml
+}
+
+check() {
+  cd "$_pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  export HIPS_GRAMMAR_DIR="$PWD/grammars/target/release"
+  export HIPS_GRAMMAR_OFFLINE=1
+  cargo test --frozen --release --features semantic
+}
+
+package() {
+  cd "$_pkgname"
+  install -Dm0755 target/release/hips "$pkgdir/usr/lib/hips/hips"
+  install -Dm0755 -t "$pkgdir/usr/lib/hips/grammars/" grammars/target/release/libhips_grammar_*.so
+  install -dm0755 "$pkgdir/usr/bin"
+  cat > "$pkgdir/usr/bin/hips" <<'LAUNCHER'
+#!/bin/sh
+# hips launcher: use the packaged grammar libraries unless the caller
+# already chose a directory. The watcher and MCP server it spawns inherit it.
+: "${HIPS_GRAMMAR_DIR:=/usr/lib/hips/grammars}"
+export HIPS_GRAMMAR_DIR
+exec /usr/lib/hips/hips "$@"
+LAUNCHER
+  chmod 0755 "$pkgdir/usr/bin/hips"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm0644 -t "$pkgdir/usr/share/doc/$pkgname/" README.md docs/THEORY.md
+  install -Dm0644 grammars/README.md "$pkgdir/usr/share/doc/$pkgname/grammars/README.md"
+}

@@ -14,11 +14,19 @@ jobs:
       HIPS_GRAMMAR_OFFLINE: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
             grammars -> target
+      # The semantic tests exercise the real encoder: cache the model
+      # (274 MB, fetched once from the pinned release).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/csearch/models
+          key: coderank-gguf-models-v1
       - name: Build shared grammar libraries
         run: cargo build --manifest-path grammars/Cargo.toml --release --locked
       # Both feature configurations: a cfg() mistake that breaks one but
@@ -31,4 +39,44 @@ jobs:
         run: |
           cargo check --examples --features semantic
           cargo check 2>&1 | tee /tmp/check.log
+          ! grep -q '^warning' /tmp/check.log
+
+  test-linux:
+    name: build + test (Linux)
+    runs-on: ubuntu-latest
+    env:
+      HIPS_GRAMMAR_DIR: ${{ github.workspace }}/grammars/target/release
+      HIPS_GRAMMAR_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            grammars -> target
+      # The encoder's Vulkan backend (vendor/ggml) compiles its shaders at
+      # build time.
+      - name: Install Vulkan build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake glslc libvulkan-dev spirv-headers
+      # From the repository root: .cargo/config.toml adds -fno-strict-aliasing
+      # for the GCC-built targets (the Haskell scanner needs it).
+      # The semantic tests exercise the real encoder: cache the model
+      # (274 MB, fetched once from the pinned release).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/csearch/models
+          key: coderank-gguf-models-v1
+      - name: Build shared grammar libraries
+        run: cargo build --manifest-path grammars/Cargo.toml --release --locked
+      - name: Test (default features)
+        run: cargo test --locked
+      - name: Test (--features semantic)
+        run: cargo test --locked --features semantic
+      - name: Check no-default-features, examples and warnings
+        run: |
+          cargo check --locked --no-default-features
+          cargo check --locked --examples --features semantic
+          cargo check --locked 2>&1 | tee /tmp/check.log
           ! grep -q '^warning' /tmp/check.log
