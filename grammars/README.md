@@ -16,6 +16,16 @@ cargo build --manifest-path grammars/Cargo.toml --release --locked
 HIPS_GRAMMAR_DIR="$PWD/grammars/target/release" HIPS_GRAMMAR_OFFLINE=1 cargo test --locked
 ```
 
+Run those from the repository root (or below it). The root `.cargo/config.toml`
+adds `-fno-strict-aliasing` for the GCC-built Linux targets: tree-sitter-haskell
+0.23.1's scanner type-puns its typed arrays through `Array *` (`gcc
+-Wstrict-aliasing=2` reports six sites), and GCC at `-O2` or above then keeps
+a stale buffer pointer across a reallocation. Parsing any Haskell file
+corrupts the heap and the process later aborts with glibc's "corrupted size
+vs. prev_size". clang, which builds the macOS artifacts, does not exploit
+it; the flag is scoped to the Linux targets and is appended after any
+`CFLAGS` a packager sets.
+
 Package maintainers can include no grammars, any subset, or all of them. To
 build a subset, append repeated package selections, for example
 `-p hips-grammar-python -p hips-grammar-rust`, to the build command. Install

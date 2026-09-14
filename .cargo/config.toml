@@ -1,0 +1,17 @@
+# Applies to both the hips crate and the grammars workspace: Cargo reads this
+# file from the working directory, so run cargo from the repository root (or
+# below it), as the README and CI do.
+#
+# tree-sitter-haskell 0.23.1's scanner.c type-puns its typed arrays through
+# `Array *` (the array.h macros; `gcc -Wstrict-aliasing=2` reports six sites).
+# GCC at -O2 and above exploits that and keeps using a stale `contents`
+# pointer after a reallocation, so parsing Haskell corrupts the heap and the
+# process aborts with "corrupted size vs. prev_size" (glibc) somewhere later.
+# clang, which builds the macOS artifacts, does not exploit it, so only the
+# GCC-built Linux targets get the flag. The tree-sitter runtime in the hips
+# binary uses the same array.h pattern and is covered by the same variable.
+# cc-rs appends a target-specific CFLAGS after a generic one, so a packager's
+# CFLAGS still applies.
+[env]
+CFLAGS_x86_64_unknown_linux_gnu = "-fno-strict-aliasing"
+CFLAGS_aarch64_unknown_linux_gnu = "-fno-strict-aliasing"
