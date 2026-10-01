@@ -37,6 +37,17 @@ use ggml_sys as g;
 /// Graph nodes per batch: about 40 per layer plus inputs and pooling.
 const GRAPH_SIZE: usize = 2048;
 
+/// Unlike get_rows, a view does not dequantize. Addition needs a floating
+/// type embedding even when the GGUF stores this matrix in Q8_0/Q4_0.
+unsafe fn type_embedding_row(ctx: *mut g::ggml_context, tensor: *mut g::ggml_tensor, width: i64) -> *mut g::ggml_tensor {
+    let row = g::ggml_view_1d(ctx, tensor, width, 0);
+    if (*row).type_ != g::GGML_TYPE_F32 {
+        g::ggml_cast(ctx, row, g::GGML_TYPE_F32)
+    } else {
+        row
+    }
+}
+
 fn fa_f16_accumulation() -> bool {
     matches!(std::env::var("HIPS_GGML_FA_F16").as_deref(), Ok("1") | Ok("true"))
 }
@@ -614,7 +625,7 @@ impl Engine {
 
         // Embeddings: token rows plus the "sentence A" type row.
         let mut x = g::ggml_get_rows(ctx, self.tok_embd, t_ids);
-        let type_row = g::ggml_view_1d(ctx, self.type_embd, n_embd, 0);
+        let type_row = type_embedding_row(ctx, self.type_embd, n_embd);
         x = g::ggml_add(ctx, x, type_row);
         x = layer_norm(x, self.tok_norm_w, self.tok_norm_b);
 
@@ -717,6 +728,35 @@ impl Drop for Engine {
 mod tests {
     use super::*;
     use crate::wordpiece::WordPiece;
+
+    #[test]
+    fn quantized_type_embedding_addition_runs_on_cpu() {
+        // Reproduce the failing graph without a downloaded encoder. The old
+        // uncast view reaches ggml_add as Q8_0/Q4_0 and aborts the process.
+        for kind in [g::GGML_TYPE_Q8_0, g::GGML_TYPE_Q4_0] {
+            unsafe {
+                let ctx = g::ggml_init(g::ggml_init_params {
+                    mem_size: 1024 * 1024, mem_buffer: ptr::null_mut(), no_alloc: false,
+                });
+                assert!(!ctx.is_null());
+                let tensor = g::ggml_new_tensor_2d(ctx, kind, 32, 2);
+                let values = vec![1.0_f32; 64];
+                let written = g::ggml_quantize_chunk(kind, values.as_ptr(), (*tensor).data,
+                    0, 2, 32, ptr::null());
+                assert_eq!(written, g::ggml_nbytes(tensor));
+                let input = g::ggml_new_tensor_2d(ctx, g::GGML_TYPE_F32, 32, 3);
+                g::ggml_set_f32(input, 2.0);
+                let row = type_embedding_row(ctx, tensor, 32);
+                let output = g::ggml_add(ctx, input, row);
+                let graph = g::ggml_new_graph(ctx);
+                g::ggml_build_forward_expand(graph, output);
+                assert_eq!(g::ggml_graph_compute_with_ctx(ctx, graph, 2), g::GGML_STATUS_SUCCESS);
+                let result = std::slice::from_raw_parts((*output).data.cast::<f32>(), 96);
+                assert!(result.iter().all(|x| x.is_finite() && (*x - 3.0).abs() < 0.02));
+                g::ggml_free(ctx);
+            }
+        }
+    }
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
@@ -829,9 +869,17 @@ mod tests {
         let a = flash.forward(&refs, pad).unwrap();
         let b = naive.forward(&refs, pad).unwrap();
         let c = cls_only.forward(&refs, pad).unwrap();
+        // Quantized matmul rounds activations in blocks. Different graph
+        // shapes can choose different kernels/rounding even with identical
+        // weights; retain the tighter equivalence bound for float models.
+        let min_cosine = if unsafe { g::ggml_is_quantized((*flash.layers[0].wqkv).type_) } {
+            0.999
+        } else {
+            0.99999
+        };
         for i in 0..seqs.len() {
-            assert!(cosine(&a[i], &b[i]) > 0.99999, "flash vs naive row {i}: {}", cosine(&a[i], &b[i]));
-            assert!(cosine(&a[i], &c[i]) > 0.99999, "full vs cls-only row {i}: {}", cosine(&a[i], &c[i]));
+            assert!(cosine(&a[i], &b[i]) > min_cosine, "flash vs naive row {i}: {}", cosine(&a[i], &b[i]));
+            assert!(cosine(&a[i], &c[i]) > min_cosine, "full vs cls-only row {i}: {}", cosine(&a[i], &c[i]));
         }
     }
 
