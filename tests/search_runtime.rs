@@ -332,10 +332,12 @@ fn native_ggml_gpu_request_handles_an_inaccessible_gpu_without_panicking() {
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.contains("using lexical BM25"), "{stderr}");
-    assert!(
-        stderr.contains("CodeRankEmbed device: Metal") || stderr.contains("falling back to CPU"),
-        "{stderr}"
-    );
+    // ggml names the device itself ("MTL0 (Apple M3)" on Metal): any
+    // non-CPU device line, or an explicit CPU fallback, is the contract.
+    let on_gpu = stderr
+        .lines()
+        .any(|l| l.starts_with("CodeRankEmbed device: ") && !l.starts_with("CodeRankEmbed device: cpu"));
+    assert!(on_gpu || stderr.contains("falling back to CPU"), "{stderr}");
     assert!(!output.stdout.is_empty());
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let hit: serde_json::Value = serde_json::from_str(line).unwrap();

@@ -18,9 +18,9 @@
 //!
 //! Per iteration the only CPU↔GPU "transfer" is the 12-byte params struct
 //! (`setBytes`). Command buffers are committed as soon as an iteration's
-//! inputs are final, and sibling partitions are driven concurrently
-//! (`rayon::join`) so one partition's CPU phase (sort, swap, degree patch)
-//! overlaps the other's in-flight kernel.
+//! inputs are final. Sibling partitions run as local async tasks, overlapping
+//! CPU work with in-flight GPU commands without sharing Metal handles across
+//! threads. The CPU fallback continues to use Rayon.
 //!
 //! The kernel itself is the fused per-document gain pass (one thread per
 //! document, gains accumulated in registers), written in Metal Shading
@@ -36,9 +36,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use rayon::prelude::*;
 
@@ -258,15 +258,6 @@ impl<T> SendPtr<T> {
     }
 }
 
-// SAFETY: Metal devices, queues, pipeline states, and buffer objects are
-// documented as thread-safe; what is *not* synchronized is buffer contents,
-// which this module guards by `waitUntilCompleted` before any CPU access
-// and by giving concurrent partitions disjoint buffers/ranges.
-unsafe impl<T: Send> Send for SharedBuf<T> {}
-unsafe impl<T: Sync> Sync for SharedBuf<T> {}
-unsafe impl Send for MetalCtx {}
-unsafe impl Sync for MetalCtx {}
-
 /// Compute a BP ordering with GPU-assisted top levels. Same contract as
 /// [`super::bp_order`].
 pub fn bp_order_gpu(doc_terms: &[Vec<u32>]) -> Vec<u32> {
@@ -324,12 +315,13 @@ pub fn bp_order_gpu(doc_terms: &[Vec<u32>]) -> Vec<u32> {
     // and `order_mem` outlives `corpus` (declared before it, so it drops
     // after; no deallocator, so Metal never frees memory it does not own).
     let order_mtl = unsafe {
-        ctx.device.newBufferWithBytesNoCopy_length_options_deallocator(
-            order_mem.ptr.cast(),
-            order_mem.byte_cap,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        )
+        ctx.device
+            .newBufferWithBytesNoCopy_length_options_deallocator(
+                order_mem.ptr.cast(),
+                order_mem.byte_cap,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
     }
     .expect("newBufferWithBytesNoCopy failed");
 
@@ -341,15 +333,71 @@ pub fn bp_order_gpu(doc_terms: &[Vec<u32>]) -> Vec<u32> {
         num_terms,
     };
 
-    bisect_gpu(order_mem.as_mut_slice(), 0, doc_terms, &corpus, 0);
-
-    drop(corpus); // release the Metal buffer before reading the memory back
+    // These futures only await Metal completion. Poll on this thread with a
+    // short bounded sleep: no runtime nesting, spinning, callbacks or Send
+    // assertions for Objective-C objects. Metal's bindings expose completion
+    // handlers only through an unsafe raw block pointer API.
+    let leaves = drive_gpu(bisect_gpu(
+        order_mem.as_mut_slice(),
+        0,
+        doc_terms,
+        &corpus,
+        0,
+    ));
+    drop(corpus); // all GPU work is complete before CPU leaf work starts
+                  // Defer CPU leaves so a long CPU recursion cannot block polling/submitting
+                  // still-active GPU siblings. The returned slices are disjoint by construction.
+    leaves
+        .into_par_iter()
+        .for_each(|(order, depth)| super::bisect(order, doc_terms, depth));
     order_mem.as_slice().to_vec()
 }
 
-/// Encode, commit, and wait for one gain pass over `n` slots starting at
+fn drive_gpu<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => return result,
+            std::task::Poll::Pending => std::thread::sleep(std::time::Duration::from_micros(50)),
+        }
+    }
+}
+
+/// A cancelled sibling (including panic unwinding) must finish its GPU reads
+/// before the caller's page-backed input/output buffers can be released.
+struct InFlight(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
+
+#[cfg(test)]
+thread_local! {
+    static IN_FLIGHT_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+impl InFlight {
+    fn new(cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
+        #[cfg(test)]
+        IN_FLIGHT_COUNTS.with(|counts| {
+            let (active, peak) = counts.get();
+            counts.set((active + 1, peak.max(active + 1)));
+        });
+        Self(cmd)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.waitUntilCompleted();
+        #[cfg(test)]
+        IN_FLIGHT_COUNTS.with(|counts| {
+            let (active, peak) = counts.get();
+            counts.set((active - 1, peak));
+        });
+    }
+}
+
+/// Encode, commit, and cooperatively await one gain pass over `n` slots at
 /// element `base` of the order buffer.
-fn dispatch_gains(
+async fn dispatch_gains(
     corpus: &GpuCorpus,
     base: usize,
     side: &SharedBuf<u32>,
@@ -357,7 +405,7 @@ fn dispatch_gains(
     deg_right: &SharedBuf<AtomicU32>,
     gains: &SharedBuf<f32>,
     params: Params,
-) {
+) -> bool {
     let ctx = &corpus.ctx;
     let cmd = ctx.queue.commandBuffer().expect("command buffer");
     let enc = cmd.computeCommandEncoder().expect("compute encoder");
@@ -389,20 +437,33 @@ fn dispatch_gains(
     );
     enc.endEncoding();
     cmd.commit();
-    cmd.waitUntilCompleted();
+    let pending = InFlight::new(cmd);
+    // Private to drive_gpu's periodic local executor. Returning Pending lets
+    // tokio::join! poll the sibling before the next completion check.
+    std::future::poll_fn(|_| match pending.0.status() {
+        MTLCommandBufferStatus::Completed => std::task::Poll::Ready(true),
+        MTLCommandBufferStatus::Error => {
+            eprintln!(
+                "GPU bisection command failed: {:?}; using CPU",
+                pending.0.error()
+            );
+            std::task::Poll::Ready(false)
+        }
+        _ => std::task::Poll::Pending,
+    })
+    .await
 }
 
-fn bisect_gpu(
-    order: &mut [u32],
+async fn bisect_gpu<'a>(
+    order: &'a mut [u32],
     base: usize,
     doc_terms: &[Vec<u32>],
     corpus: &GpuCorpus,
     depth: usize,
-) {
+) -> Vec<(&'a mut [u32], usize)> {
     let n = order.len();
     if n < gpu_min_partition() || depth >= BP_MAX_DEPTH {
-        super::bisect(order, doc_terms, depth);
-        return;
+        return vec![(order, depth)];
     }
     let num_terms = corpus.num_terms;
     let mid = n / 2;
@@ -413,7 +474,7 @@ fn bisect_gpu(
     };
     let num_edges: usize = order.iter().map(|&doc| doc_terms[doc as usize].len()).sum();
     if num_edges == 0 || num_terms == 0 {
-        return;
+        return Vec::new();
     }
 
     // Partition-local shared state. The degree counters are atomics living
@@ -444,7 +505,9 @@ fn bisect_gpu(
 
     for iter in 0..BP_MAX_ITERS {
         let t_start = std::time::Instant::now();
-        dispatch_gains(corpus, base, &side, &deg_total, &deg_right, &gains, params);
+        if !dispatch_gains(corpus, base, &side, &deg_total, &deg_right, &gains, params).await {
+            return vec![(order, depth)];
+        }
         let t_gpu = t_start.elapsed();
 
         // The GPU wrote gains into shared memory; sort candidates directly
@@ -500,8 +563,8 @@ fn bisect_gpu(
     }
 
     // Stable-partition `order` in place (shared memory: the next level's
-    // dispatches see the permuted ids without any transfer), then recurse
-    // on both halves concurrently to keep the GPU queue fed.
+    // dispatches see the permuted ids without any transfer), then overlap
+    // siblings locally. Box the recursive futures to bound their stack size.
     let side_slice = side.mem.as_slice();
     let reordered: Vec<u32> = (0..n)
         .filter(|&i| side_slice[i] == 0)
@@ -509,12 +572,26 @@ fn bisect_gpu(
         .map(|i| order[i])
         .collect();
     order.copy_from_slice(&reordered);
+    // Parent counters and scratch are no longer used. Release them before
+    // both children allocate their own state on the shared-memory device.
+    drop(side);
+    drop(gains);
+    drop(deg_total);
+    drop(deg_right);
 
     let (left_half, right_half) = order.split_at_mut(mid);
-    rayon::join(
-        || bisect_gpu(left_half, base, doc_terms, corpus, depth + 1),
-        || bisect_gpu(right_half, base + mid, doc_terms, corpus, depth + 1),
+    let (mut left, right) = tokio::join!(
+        Box::pin(bisect_gpu(left_half, base, doc_terms, corpus, depth + 1)),
+        Box::pin(bisect_gpu(
+            right_half,
+            base + mid,
+            doc_terms,
+            corpus,
+            depth + 1
+        )),
     );
+    left.extend(right);
+    left
 }
 
 #[cfg(test)]
@@ -533,6 +610,11 @@ mod tests {
 
     #[test]
     fn gpu_bp_returns_a_permutation_and_reduces_cost() {
+        let metal_available = MTLCreateSystemDefaultDevice().is_some();
+        if std::env::var_os("HIPS_REQUIRE_METAL_TESTS").is_some() {
+            assert!(metal_available, "Metal hardware is required for this run");
+        }
+        IN_FLIGHT_COUNTS.with(|counts| counts.set((0, 0)));
         // Large enough that the top levels actually run on the GPU.
         let docs = interleaved_corpus(2 * GPU_MIN_PARTITION);
         let order = bp_order_gpu(&docs);
@@ -543,6 +625,13 @@ mod tests {
             seen[d as usize] = true;
         }
         assert_eq!(order.len(), docs.len());
+        if metal_available {
+            IN_FLIGHT_COUNTS.with(|counts| {
+                let (active, peak) = counts.get();
+                assert_eq!(active, 0, "all GPU commands must finish before returning");
+                assert!(peak >= 2, "GPU siblings must overlap; peak={peak}");
+            });
+        }
 
         let identity: Vec<u32> = (0..docs.len() as u32).collect();
         let before = super::super::tests::log_gap_cost(&identity, &docs);

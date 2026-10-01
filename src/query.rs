@@ -167,6 +167,15 @@ fn embed_and_bm25(
     f64,
     f64,
 )> {
+    if embedder.query_cached(query) {
+        // A cached vector has no inference to overlap. Keep the lexical work
+        // on this thread instead of paying for a short-lived helper thread.
+        let t_embed = Instant::now();
+        let qvec = embedder.embed_query(query)?;
+        let embed_ms = t_embed.elapsed().as_secs_f64() * 1000.0;
+        let (hits, stats, bm25_ms) = searcher::search_hits(disk, query, k);
+        return Ok((qvec, hits, stats, bm25_ms, embed_ms));
+    }
     std::thread::scope(|s| {
         let bm25 = s.spawn(|| searcher::search_hits(disk, query, k));
         let t_embed = Instant::now();
@@ -319,25 +328,37 @@ fn run_ranked_segmented(
     let total = Instant::now();
     let pool = opts.semantic_candidates.max(top_k);
 
-    // Query embed and BM25 in parallel, mirroring the single-index path.
-    let (qvec, bm25_hits, mut stats, embed_ms, bm25_ms) = std::thread::scope(|scope| {
-        let bm25 = scope.spawn(|| {
-            let t = Instant::now();
-            let (hits, stats) = if opts.mode == RankMode::Semantic {
-                (Vec::new(), crate::block_max_wand::SearchStats::default())
-            } else {
-                seg.search_hits_raw_with_stats(query, pool)
-            };
-            (hits, stats, t.elapsed().as_secs_f64() * 1000.0)
-        });
+    let lexical = || {
+        let t = Instant::now();
+        let (hits, stats) = if opts.mode == RankMode::Semantic {
+            (Vec::new(), crate::block_max_wand::SearchStats::default())
+        } else {
+            seg.search_hits_raw_with_stats(query, pool)
+        };
+        (hits, stats, t.elapsed().as_secs_f64() * 1000.0)
+    };
+    let encode = || -> anyhow::Result<_> {
         let t = Instant::now();
         let qvec = embedder.embed_query(query)?;
-        let embed_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let (hits, stats, bm25_ms) = bm25
-            .join()
-            .map_err(|_| anyhow::anyhow!("BM25 helper thread panicked"))?;
-        Ok::<_, anyhow::Error>((qvec, hits, stats, embed_ms, bm25_ms))
-    })?;
+        Ok((qvec, t.elapsed().as_secs_f64() * 1000.0))
+    };
+    // Only spawn a helper when there is real work to overlap: neither an LRU
+    // hit nor semantic-only retrieval benefits from creating a BM25 thread.
+    let (qvec, bm25_hits, mut stats, embed_ms, bm25_ms) =
+        if opts.mode == RankMode::Semantic || embedder.query_cached(query) {
+            let (qvec, embed_ms) = encode()?;
+            let (hits, stats, bm25_ms) = lexical();
+            (qvec, hits, stats, embed_ms, bm25_ms)
+        } else {
+            std::thread::scope(|scope| {
+                let bm25 = scope.spawn(lexical);
+                let (qvec, embed_ms) = encode()?;
+                let (hits, stats, bm25_ms) = bm25
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("BM25 helper thread panicked"))?;
+                Ok::<_, anyhow::Error>((qvec, hits, stats, embed_ms, bm25_ms))
+            })?
+        };
 
     let t_score = Instant::now();
     let live = |si: usize, doc: u32| seg.is_live(si, doc);

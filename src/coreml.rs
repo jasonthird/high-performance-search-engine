@@ -44,7 +44,7 @@ struct ShapeModel {
 
 impl ShapeModel {
     /// A compiled model must preserve row identity under batch permutation.
-    /// Some traced artifacts specialize masking/unpadding to example inputs.
+    /// Some CoreML/ANE plans for short batch shapes corrupt selected rows.
     fn batch_stable(&self) -> anyhow::Result<bool> {
         if let Some(&valid) = self.batch_valid.get() { return Ok(valid); }
         let rows: Vec<Vec<u32>> = (0..self.batch).map(|i| {
@@ -79,8 +79,9 @@ pub struct CoreMlEncoder {
     /// Document models, ascending by sequence length. Scheduling uses their
     /// minimum batch capacity (8 in the intended family).
     docs: Vec<ShapeModel>,
-    /// Batch-1 short-sequence model for queries, when present.
-    query: Option<ShapeModel>,
+    /// Batch-1 query shapes in ascending sequence order. Short queries use
+    /// the smallest fit while the largest shape preserves the configured cap.
+    query: Vec<ShapeModel>,
 }
 
 #[cfg(test)]
@@ -147,14 +148,19 @@ mod shape_tests {
 
     #[test]
     fn partial_families_cannot_silently_shorten_documents() {
-        let query_only = CoreMlEncoder { docs: vec![], query: Some(shape(1, 64)) };
+        let query_only = CoreMlEncoder { docs: vec![], query: vec![shape(1, 32), shape(1, 64)] };
         assert!(!query_only.supports_documents(512));
         assert!(query_only.supports_queries(64));
         assert!(!query_only.supports_queries(128));
-        let partial = CoreMlEncoder { docs: vec![shape(8, 128)], query: None };
+        assert_eq!(query_only.query_shape(20).unwrap().seq, 32);
+        assert_eq!(query_only.query_shape(32).unwrap().seq, 32);
+        assert_eq!(query_only.query_shape(33).unwrap().seq, 64);
+        assert_eq!(query_only.query_shape(64).unwrap().seq, 64);
+        assert!(query_only.query_shape(65).is_none());
+        let partial = CoreMlEncoder { docs: vec![shape(8, 128)], query: vec![] };
         assert!(!partial.supports_documents(512));
         assert!(partial.encode_docs(&[vec![1; 129]]).is_err());
-        let mixed = CoreMlEncoder { docs: vec![shape(8, 64), shape(4, 512)], query: None };
+        let mixed = CoreMlEncoder { docs: vec![shape(8, 64), shape(4, 512)], query: vec![] };
         assert!(mixed.supports_documents(512));
         assert_eq!(mixed.doc_batch(), 4);
     }
@@ -272,7 +278,7 @@ impl CoreMlEncoder {
         let dir = model_dir();
         let entries = std::fs::read_dir(&dir).ok()?;
         let mut docs = Vec::new();
-        let mut query: Option<ShapeModel> = None;
+        let mut query = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let Some(spec) = name
@@ -294,20 +300,21 @@ impl CoreMlEncoder {
                 batch_valid: std::cell::OnceCell::new(),
             };
             if batch == 1 {
-                if query.as_ref().is_none_or(|q| q.seq < seq) { query = Some(sm); }
+                query.push(sm);
             } else {
                 docs.push(sm);
             }
         }
         docs.sort_by_key(|m| m.seq);
-        if docs.is_empty() && query.is_none() {
+        query.sort_by_key(|m| m.seq);
+        if docs.is_empty() && query.is_empty() {
             return None;
         }
         Some(Self { docs, query })
     }
 
     pub fn has_query_model(&self) -> bool {
-        self.query.is_some()
+        !self.query.is_empty()
     }
 
     /// Only select CoreML when installed shapes preserve the requested cap.
@@ -316,7 +323,11 @@ impl CoreMlEncoder {
     }
 
     pub fn supports_queries(&self, cap: usize) -> bool {
-        self.query.as_ref().is_some_and(|m| m.seq >= cap)
+        self.query_shape(cap).is_some()
+    }
+
+    fn query_shape(&self, tokens: usize) -> Option<&ShapeModel> {
+        self.query.iter().find(|m| m.seq >= tokens)
     }
 
     pub fn doc_batch(&self) -> usize {
@@ -326,10 +337,7 @@ impl CoreMlEncoder {
     /// Encode one query's token ids (already truncated to the query cap).
     /// Returns `None` when no batch-1 model is installed.
     pub fn encode_query(&self, ids: &[u32]) -> Option<anyhow::Result<Vec<f32>>> {
-        let m = self.query.as_ref()?;
-        if ids.len() > m.seq {
-            return None; // longer than the compiled shape: caller falls back
-        }
+        let m = self.query_shape(ids.len())?;
         Some(run(m, &[ids]).map(|mut v| v.pop().expect("one row")))
     }
 

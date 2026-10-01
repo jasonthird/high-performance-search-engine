@@ -629,7 +629,9 @@ mod tests {
         };
         let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
 
-        let index = Embedder::load_from_file(&path, EmbedUse::Index).unwrap();
+        // This test measures the ggml engine: on a Mac with compiled CoreML
+        // shapes installed the default loader would pick CoreML instead.
+        let index = Embedder::load_with_backend(&path, EmbedUse::Index, false).unwrap();
         assert_eq!(index.diagnostics()["backend"], "ggml");
         assert_eq!(index.diagnostics()["warmup_validated"], true);
         let docs = rows("docs");
@@ -644,7 +646,7 @@ mod tests {
         }
         assert_eq!(index.tokenize(&docs[0].0)[0], 101);
 
-        let query = Embedder::load_from_file(&path, EmbedUse::Query).unwrap();
+        let query = Embedder::load_with_backend(&path, EmbedUse::Query, false).unwrap();
         for (i, (text, expected)) in rows("queries").iter().enumerate() {
             assert!(!query.query_cached(text));
             let v = query.embed_query(text).unwrap();
