@@ -128,7 +128,7 @@ fn is_relevant_event(root: &Path, path: &Path, kind: &EventKind) -> bool {
         return true;
     }
     match name.rsplit_once('.') {
-        Some((_, ext)) => repo::SOURCE_EXTS.contains(&ext),
+        Some((_, ext)) => repo::SOURCE_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)),
         // Removed directories no longer pass is_dir(). An extensionless
         // path can be a directory notification for an entire source subtree.
         None => true,
@@ -171,6 +171,9 @@ mod tests {
         let root = Path::new("/repo");
         assert!(would_trigger(root, Path::new("/repo/src/main.rs")));
         assert!(would_trigger(root, Path::new("/repo/pkg/app.tsx")));
+        for ext in ["docx", "DOCX", "xlsx", "xlsm", "xls", "xlsb", "pptx", "PPTX"] {
+            assert!(would_trigger(root, &root.join(format!("docs/report.{ext}"))));
+        }
 
         assert!(!would_trigger(root, Path::new("/repo/target/debug/x.rs")));
         assert!(!would_trigger(root, Path::new("/repo/.git/index")));

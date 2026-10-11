@@ -17,6 +17,41 @@ use crate::searcher;
 #[cfg(feature = "semantic")]
 use crate::storage;
 
+/// Query encoders share the document model's vector space. Static word lookups
+/// are experimental approximations, not exact query-cache entries.
+#[cfg(feature = "semantic")]
+pub trait QueryEncoder {
+    fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>>;
+    fn query_cached(&self, _query: &str) -> bool {
+        false
+    }
+    fn cheap_query(&self, query: &str) -> bool {
+        self.query_cached(query)
+    }
+}
+
+#[cfg(feature = "semantic")]
+impl QueryEncoder for crate::embedder::Embedder {
+    fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
+        self.embed_query(query)
+    }
+    fn query_cached(&self, query: &str) -> bool {
+        self.query_cached(query)
+    }
+}
+
+#[cfg(feature = "semantic")]
+impl QueryEncoder for crate::static_query::StaticQueryEncoder {
+    fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
+        Ok(self.approximate(query)?.vector)
+    }
+    // Lookup has no inference to overlap with a helper thread. This is not an
+    // exact cached model prediction; the method only controls scheduling.
+    fn cheap_query(&self, _query: &str) -> bool {
+        true
+    }
+}
+
 // Fusion defaults (weighted, alpha 0.15) come from two eval sets over 31k
 // real code chunks (examples in `eval-gen`): R@10 on natural-language
 // doc-comment queries / on identifier queries —
@@ -157,7 +192,7 @@ pub fn run_ranked(
 #[cfg(feature = "semantic")]
 fn embed_and_bm25(
     disk: &storage::DiskIndex,
-    embedder: &crate::embedder::Embedder,
+    embedder: &dyn QueryEncoder,
     query: &str,
     k: usize,
 ) -> anyhow::Result<(
@@ -167,9 +202,9 @@ fn embed_and_bm25(
     f64,
     f64,
 )> {
-    if embedder.query_cached(query) {
-        // A cached vector has no inference to overlap. Keep the lexical work
-        // on this thread instead of paying for a short-lived helper thread.
+    if embedder.cheap_query(query) {
+        // Cached vectors and static lookups have no inference to overlap.
+        // Keep lexical work here instead of paying for a short-lived helper.
         let t_embed = Instant::now();
         let qvec = embedder.embed_query(query)?;
         let embed_ms = t_embed.elapsed().as_secs_f64() * 1000.0;
@@ -191,7 +226,7 @@ fn embed_and_bm25(
 #[cfg(feature = "semantic")]
 pub fn run_ranked_with(
     index: &searcher::AnyIndex,
-    embedder: &crate::embedder::Embedder,
+    embedder: &dyn QueryEncoder,
     query: &str,
     top_k: usize,
     opts: &SearchOpts,
@@ -305,7 +340,7 @@ pub fn run_ranked_with(
 #[cfg(feature = "semantic")]
 fn run_ranked_segmented(
     index: &searcher::AnyIndex,
-    embedder: &crate::embedder::Embedder,
+    embedder: &dyn QueryEncoder,
     query: &str,
     top_k: usize,
     opts: &SearchOpts,
@@ -342,10 +377,10 @@ fn run_ranked_segmented(
         let qvec = embedder.embed_query(query)?;
         Ok((qvec, t.elapsed().as_secs_f64() * 1000.0))
     };
-    // Only spawn a helper when there is real work to overlap: neither an LRU
-    // hit nor semantic-only retrieval benefits from creating a BM25 thread.
+    // Only spawn a helper when there is inference to overlap: neither a cheap
+    // lookup nor semantic-only retrieval benefits from creating a BM25 thread.
     let (qvec, bm25_hits, mut stats, embed_ms, bm25_ms) =
-        if opts.mode == RankMode::Semantic || embedder.query_cached(query) {
+        if opts.mode == RankMode::Semantic || embedder.cheap_query(query) {
             let (qvec, embed_ms) = encode()?;
             let (hits, stats, bm25_ms) = lexical();
             (qvec, hits, stats, embed_ms, bm25_ms)

@@ -1,0 +1,15 @@
+{
+  "source": "/Users/jason/gitProjects/gemma4agentcomp",
+  "tasks_sha256": "e4b3fd60f69dbc2b9213e54eeb9636db78aefe92c1d06269d73d9f5f8f3c8ad6",
+  "query_extractor_sha256": "b37a38c9ab9db2d9a4b79f5cc8eed0d2c655448ec4d8d60b081874ffc9b34644",
+  "trace_dirs": [
+    "/Users/jason/gitProjects/gemma4agentcomp/artifacts/EXP-020-run-f/full/results/exp020/traces",
+    "/Users/jason/gitProjects/gemma4agentcomp/artifacts/EXP-020-run-g/full/results/exp020_6min/traces"
+  ],
+  "tasks": 129,
+  "queries": {
+    "issue": 129,
+    "idq": 129,
+    "agent": 37
+  }
+}

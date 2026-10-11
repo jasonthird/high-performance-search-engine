@@ -1,0 +1,71 @@
+{
+  "encoder": {
+    "backend": "ggml",
+    "coreml": null,
+    "fallbacks": [],
+    "flash_attention": true,
+    "ggml_device": "MTL0 (Apple M3)",
+    "model": "nomic-ai/CodeRankEmbed",
+    "query_cache_entries": 256,
+    "query_disk_cache": "/Users/jason/gitProjects/search_test/target/query-cache-async/cache/b6ee308863d55206e429671870211b69e888a5ee89afe2c1d8cf7526663cc3de",
+    "query_disk_hits": 0,
+    "query_model_calls": 295,
+    "state": "ready",
+    "warmup_validated": true
+  },
+  "queries": 295,
+  "reloaded_encoder": {
+    "backend": "ggml",
+    "coreml": null,
+    "fallbacks": [],
+    "flash_attention": true,
+    "ggml_device": "MTL0 (Apple M3)",
+    "model": "nomic-ai/CodeRankEmbed",
+    "query_cache_entries": 256,
+    "query_disk_cache": "/Users/jason/gitProjects/search_test/target/query-cache-async/cache/b6ee308863d55206e429671870211b69e888a5ee89afe2c1d8cf7526663cc3de",
+    "query_disk_hits": 295,
+    "query_model_calls": 0,
+    "state": "ready",
+    "warmup_validated": true
+  },
+  "source_queries": "benchmarks/gemma/queries.jsonl",
+  "summary": {
+    "agent": {
+      "first_encode_ms": 7.5061670000000005,
+      "full_encode_ms": 7.649292,
+      "initial_cache_hits": 0,
+      "queries": 37,
+      "reload_encode_ms": 0.0505,
+      "repeat_encode_ms": 0.001667
+    },
+    "idq": {
+      "first_encode_ms": 7.785666999999999,
+      "full_encode_ms": 8.262916,
+      "initial_cache_hits": 0,
+      "queries": 129,
+      "reload_encode_ms": 0.050374999999999996,
+      "repeat_encode_ms": 0.001542
+    },
+    "issue": {
+      "first_encode_ms": 10.660375,
+      "full_encode_ms": 10.900125000000001,
+      "initial_cache_hits": 0,
+      "queries": 129,
+      "reload_encode_ms": 0.053833,
+      "repeat_encode_ms": 0.001834
+    }
+  },
+  "unchanged_vectors": 295,
+  "raw_report": "target/query-cache-async/report.json",
+  "cache_bytes": 2956423,
+  "identity": {
+    "queries_sha256": "ac6e64fb3f3c1d37216c556b9e09f1404b494b894ac88620279ca1f35dd7cfb7",
+    "binary_sha256": "12c549db76b88016a6a5db042b958a2522236e3398b24be487f6e75ac3b48b8e"
+  },
+  "persistence": {
+    "mode": "background",
+    "queue_capacity": 64,
+    "overflow": "skip disk save; retain memory entry",
+    "drain": "after output flush on normal shutdown"
+  }
+}

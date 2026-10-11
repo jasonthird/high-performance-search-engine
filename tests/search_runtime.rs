@@ -505,6 +505,48 @@ fn mcp_lexical_flag_keeps_an_existing_vector_index_lexical() {
 
 #[cfg(feature = "semantic")]
 #[test]
+fn mcp_query_vectors_persist_across_servers_and_repository_indexes() {
+    use serde_json::json;
+    if std::env::var_os("HIPS_TEST_SKIP_MODEL").is_some_and(|v| v == "1") { return; }
+    let model = high_performance_search_engine::embedder::model_path().unwrap();
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let cache = first._temp.path().join("query-vectors");
+    let command = |fixture: &Fixture| {
+        let mut cmd = fixture.mcp_command();
+        cmd.env("HIPS_MODEL_PATH", &model).env("HIPS_ENCODER", "ggml")
+            .env("HPS_EMBED_DEVICE", "cpu").env("HIPS_QUERY_CACHE", "1")
+            .env("HPS_EMBED_MAX_SEQ", "512")
+            .env("HIPS_QUERY_CACHE_DIR", &cache).env("HIPS_GRAMMAR_OFFLINE", "1");
+        cmd
+    };
+    let search = json!({"name":"search_code", "arguments":{"query":"permission validation", "mode":"semantic", "verbose":true}});
+    let (out, responses) = mcp_calls(command(&first), &[search.clone(), search.clone()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for (i, response) in responses.iter().enumerate() {
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let diag = &response["result"]["structuredContent"]["diagnostics"];
+        assert_eq!(diag["last_search"]["query_cache_hit"], i == 1);
+        assert_eq!(diag["encoder"]["query_model_calls"], 1);
+    }
+    let original_hits = responses[0]["result"]["structuredContent"]["diagnostics"]["last_search"]["hits"].clone();
+    for fixture in [&first, &second] {
+        let (out, responses) = mcp_calls(command(fixture), &[search.clone()]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(responses[0]["result"]["isError"], false, "{}", responses[0]);
+        let diag = &responses[0]["result"]["structuredContent"]["diagnostics"];
+        assert_eq!(diag["last_search"]["query_cache_hit"], true);
+        assert_eq!(diag["encoder"]["query_model_calls"], 0);
+        assert_eq!(diag["encoder"]["query_disk_hits"], 1);
+        if fixture.root == first.root { assert_eq!(diag["last_search"]["hits"], original_hits); }
+        for hit in diag["last_search"]["hits"].as_array().unwrap() {
+            assert!(fixture.root.join(hit["path"].as_str().unwrap()).is_file());
+        }
+    }
+}
+
+#[cfg(feature = "semantic")]
+#[test]
 fn mcp_failed_document_repair_is_visible_and_lexical_still_works() {
     use serde_json::json;
     let f = Fixture::new();

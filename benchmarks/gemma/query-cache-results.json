@@ -1,0 +1,76 @@
+{
+  "encoder": {
+    "backend": "ggml",
+    "coreml": null,
+    "fallbacks": [],
+    "flash_attention": true,
+    "ggml_device": "MTL0 (Apple M3)",
+    "model": "nomic-ai/CodeRankEmbed",
+    "query_cache_entries": 256,
+    "query_disk_cache": "/Users/jason/gitProjects/search_test/target/exact-query-cache-final/cache/b6ee308863d55206e429671870211b69e888a5ee89afe2c1d8cf7526663cc3de",
+    "query_disk_hits": 0,
+    "query_model_calls": 295,
+    "state": "ready",
+    "warmup_validated": true
+  },
+  "queries": 295,
+  "reloaded_encoder": {
+    "backend": "ggml",
+    "coreml": null,
+    "fallbacks": [],
+    "flash_attention": true,
+    "ggml_device": "MTL0 (Apple M3)",
+    "model": "nomic-ai/CodeRankEmbed",
+    "query_cache_entries": 256,
+    "query_disk_cache": "/Users/jason/gitProjects/search_test/target/exact-query-cache-final/cache/b6ee308863d55206e429671870211b69e888a5ee89afe2c1d8cf7526663cc3de",
+    "query_disk_hits": 295,
+    "query_model_calls": 0,
+    "state": "ready",
+    "warmup_validated": true
+  },
+  "source_queries": "benchmarks/gemma/queries.jsonl",
+  "summary": {
+    "agent": {
+      "first_encode_ms": 12.286040999999999,
+      "full_encode_ms": 9.616583,
+      "initial_cache_hits": 0,
+      "queries": 37,
+      "reload_encode_ms": 0.044458,
+      "repeat_encode_ms": 0.0025830000000000002
+    },
+    "idq": {
+      "first_encode_ms": 13.531583,
+      "full_encode_ms": 10.861042,
+      "initial_cache_hits": 0,
+      "queries": 129,
+      "reload_encode_ms": 0.044584,
+      "repeat_encode_ms": 0.002833
+    },
+    "issue": {
+      "first_encode_ms": 17.765417,
+      "full_encode_ms": 13.723166,
+      "initial_cache_hits": 0,
+      "queries": 129,
+      "reload_encode_ms": 0.047667,
+      "repeat_encode_ms": 0.003083
+    }
+  },
+  "unchanged_vectors": 295,
+  "identity": {
+    "queries_sha256": "ac6e64fb3f3c1d37216c556b9e09f1404b494b894ac88620279ca1f35dd7cfb7",
+    "binary_sha256": "25ab090f77209d606ef6fa72691df736719a46ab8c6c1177dd8379089a739030",
+    "model_sha256": "b32741fa1da1bf91de153575919582047563c235b81dd4c23273b39fd9403e84"
+  },
+  "cache_bytes": 2956423,
+  "raw_report": "target/exact-query-cache-final/report.json",
+  "verification": {
+    "immediate_repeats_without_query_inference": 295,
+    "reloaded_queries_without_query_inference": 295,
+    "every_cached_vector_equal_to_uncached_full_model": true,
+    "first_pass_complete_query_misses": 295,
+    "mcp_cache_hit_after_server_restart_and_index_switch": true,
+    "indexing_documents_does_not_populate_query_cache": true,
+    "runtime_tests_passed": 13,
+    "runtime_tests_ignored": 4
+  }
+}

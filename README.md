@@ -725,9 +725,35 @@ L2-normalized. Default fusion is min-max weighted BM25+cosine
 (`--fusion weighted --alpha 0.15`); reciprocal rank fusion is optional
 (`--fusion rrf`).
 
+Search queries automatically use a persistent vector cache shared across
+repositories and indexes. The encoder checks the exact, complete query text in
+memory, then in JSON on disk; a miss runs full CodeRankEmbed, caches its
+768-dimensional float32 vector in memory, and queues its JSON save on a
+background worker. Results do not wait for serialization or disk writes.
+A new issue misses even when its individual
+words have been seen. Indexing uses its separate document cache.
+
+Query entries live under `query-vectors/` in the csearch cache root. Set
+`HIPS_QUERY_CACHE_DIR` to relocate just these entries, or
+`HIPS_QUERY_CACHE=0` to disable disk caching. Model weights, query prefix,
+sequence cap and encoder settings identify the cache namespace. Invalid entries
+are treated as misses; a cache write failure does not prevent search.
+The worker uses a bounded queue; if it is full, that disk save is skipped while
+the memory entry remains usable. Normal shutdown flushes client output before
+draining queued writes. Library callers can use `flush_query_cache_writes()`
+at shutdown when they need to wait for pending persistence.
+See the [full-query cache validation](benchmarks/gemma/query-cache-async-results.md).
+
 To index a real source tree, use `index-repo` (below) rather than
 `scripts/code_to_jsonl.py` — the script is kept only for reproducing the
 eval corpus, and its ids carry no line numbers.
+
+An experimental [static query encoder](benchmarks/gemma/README.md) replaces
+query inference with a JSON lookup of standalone 768-dimensional word
+vectors, while searching the existing CodeRankEmbed document embeddings.
+The `static_query` example builds the table, searches existing indexes, and
+compares both encoders on the copied gemma4agentcomp benchmarks. It is opt-in;
+normal CLI and MCP queries continue to use full CodeRankEmbed.
 
 ### Code search in a codebase: `index-repo`
 
@@ -856,6 +882,16 @@ PDFs under the tree are indexed too: each page's extracted text becomes a
 chunk named `report.pdf::page 7`, so design docs and papers checked into a
 repo are searchable alongside the code. Encrypted or malformed PDFs are
 skipped with a warning, never fatal.
+
+Office documents are indexed alongside source files: Word `.docx` (body, tables,
+headers, footers, footnotes and endnotes), Excel `.xlsx`, `.xlsm`, `.xls` and
+`.xlsb` (worksheet cell values), and PowerPoint `.pptx` (slides and speaker
+notes). Hits identify the document part, worksheet or slide; Excel text includes
+cell addresses. Snippet line numbers refer to extracted text. These files use
+the same incremental updates and ignore rules as source files, with a 64 MiB
+file limit. Malformed or encrypted documents are skipped with a warning.
+Formulas use saved values; macros and external links are never executed.
+Images/OCR and legacy `.doc`/`.ppt` files are not supported.
 
 Every `hips search` and MCP `search_code` call appends one JSON line
 (timestamp, calling agent, root, query, mode, hit ids, latency) to

@@ -35,7 +35,7 @@ pub const SOURCE_EXTS: &[&str] = &[
     "rs", "py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "java", "kt", "kts", "rb", "c", "h",
     "cpp", "cc", "cxx", "hpp", "hh", "cs", "swift", "scala", "php", "sh", "bash", "zsh", "sql",
     "lua", "ml", "hs", "ex", "exs", "erl", "clj", "vue", "svelte", "proto", "tf", "md", "toml",
-    "yaml", "yml", "pdf",
+    "yaml", "yml", "pdf", "docx", "xlsx", "xlsm", "xls", "xlsb", "pptx",
     // Grammar-covered languages beyond the original list (see treesit.rs).
     "pyi", "mts", "cts", "hxx", "ipp", "cu", "cuh", "phtml", "rake", "gemspec", "sc", "dart",
     "pl", "pm", "r", "m", "mm", "ps1", "psm1", "psd1", "hrl", "jl", "zig", "groovy", "gradle",
@@ -43,9 +43,11 @@ pub const SOURCE_EXTS: &[&str] = &[
     "tfvars", "hcl", "nix", "elm", "cmake", "s", "asm", "markdown", "mli",
 ];
 
-/// Byte cap for a file, by name: PDFs get their own, larger limit.
+/// Byte cap for a file, by name: binary documents get a larger limit.
 pub fn max_file_bytes(name: &str) -> u64 {
-    if is_pdf(name) {
+    if crate::office::is_office(name) {
+        crate::office::MAX_BYTES
+    } else if is_pdf(name) {
         MAX_PDF_BYTES
     } else {
         MAX_FILE_BYTES
@@ -139,6 +141,9 @@ pub fn snippet_for(root: &Path, id: &str, max_lines: usize) -> Option<String> {
         // A PDF hit's line range is over the extracted text, so re-extract
         // to show it. Slower than a file read, but only on the snippet path.
         pdf_text(&root.join(path))?
+    } else if crate::office::is_office(path) {
+        let abs = root.join(path);
+        crate::office::extract(&abs, &fs::read(&abs).ok()?)?.text()
     } else {
         fs::read_to_string(root.join(path)).ok()?
     };
@@ -453,7 +458,7 @@ fn walk_dir(dir: &Path, prefix: &str, ignores: &IgnoreSet, out: &mut Vec<SourceF
 
 fn is_source(name: &str) -> bool {
     match name.rsplit_once('.') {
-        Some((_, ext)) => SOURCE_EXTS.contains(&ext),
+        Some((_, ext)) => SOURCE_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)),
         None => false,
     }
 }
@@ -927,6 +932,10 @@ pub fn chunk_files(files: &[SourceFile]) -> anyhow::Result<Vec<Chunk>> {
                 // but an I/O failure must not publish a successful empty file.
                 let bytes = fs::read(&file.abs).with_context(|| format!("read {}", file.abs.display()))?;
                 return Ok(chunk_pdf_pages(&file.rel, extract_pdf_pages(&file.abs, &bytes)));
+            }
+            if crate::office::is_office(&file.rel) {
+                let bytes = fs::read(&file.abs).with_context(|| format!("read {}", file.abs.display()))?;
+                return Ok(crate::office::extract(&file.abs, &bytes).map(|doc| doc.chunks(&file.rel)).unwrap_or_default());
             }
             match fs::read_to_string(&file.abs) {
                 Ok(text) => Ok(chunk_source(&file.rel, &text)),

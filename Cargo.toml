@@ -46,6 +46,9 @@ sha2 = { version = "0.10", optional = true }
 
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 pdf-extract = "0.12.0"
+calamine = { version = "0.36.1", default-features = false }
+quick-xml = "0.41"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 
 # CoreML/ANE encoder backend and the optional Metal BP reorder.
 [target.'cfg(target_os = "macos")'.dependencies]

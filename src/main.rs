@@ -11,8 +11,17 @@ fn main() {
     if std::env::var_os("MESA_VK_IGNORE_CONFORMANCE_WARNING").is_none() {
         std::env::set_var("MESA_VK_IGNORE_CONFORMANCE_WARNING", "1");
     }
-    if let Err(err) = high_performance_search_engine::cli::run() {
+    let result = high_performance_search_engine::cli::run();
+    if let Err(err) = &result {
         eprintln!("error: {err:#}");
+    }
+    // Deliver CLI/MCP output before waiting for best-effort cache persistence
+    // during normal shutdown. The encoder itself never waits for disk writes.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    high_performance_search_engine::flush_query_cache_writes();
+    if result.is_err() {
         std::process::exit(1);
     }
 }

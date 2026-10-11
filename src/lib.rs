@@ -34,11 +34,22 @@ pub mod mcp;
 pub mod migrate;
 pub mod postings;
 pub mod query;
+#[cfg(feature = "semantic")]
+mod query_cache;
+
+/// Drain queued query-cache writes at shutdown, after responses have been flushed.
+/// Long-lived clients should not call this for individual searches.
+pub fn flush_query_cache_writes() {
+    #[cfg(feature = "semantic")]
+    query_cache::flush_pending();
+}
+mod office;
 pub mod repo;
 pub mod reorder;
 pub mod searcher;
 pub mod segments;
 pub mod spell;
+pub mod static_query;
 pub mod storage;
 pub mod tokenizer;
 #[cfg(feature = "treesitter")]

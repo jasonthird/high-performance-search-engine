@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 
@@ -69,8 +70,12 @@ pub struct Embedder {
     /// forward pass. Agents re-issue queries (retries, refinement loops,
     /// "the same search with a different top_k") often enough that this is
     /// the cheapest latency win in the whole retrieval path. Document
-    /// encoding is NOT cached here — that is `embcache`'s job.
+    /// encoding is NOT cached here — that is `embcache`'s job. Exact query
+    /// vectors also persist in a shared disk cache, independent of indexes.
     query_cache: Mutex<QueryCache>,
+    disk_query_cache: Option<crate::query_cache::DiskQueryCache>,
+    disk_query_hits: AtomicU64,
+    query_model_calls: AtomicU64,
     fallbacks: Vec<String>,
 }
 
@@ -233,7 +238,7 @@ impl Embedder {
         };
         let tokenizer = WordPiece::from_gguf(&vocab.tokens, &vocab.token_types, vocab.unk, vocab.cls, vocab.sep);
 
-        let embedder = Self {
+        let mut embedder = Self {
             engine,
             tokenizer,
             pad_id: vocab.pad,
@@ -244,6 +249,9 @@ impl Embedder {
             #[cfg(target_os = "macos")]
             coreml,
             query_cache: Mutex::new(QueryCache::new()),
+            disk_query_cache: None,
+            disk_query_hits: AtomicU64::new(0),
+            query_model_calls: AtomicU64::new(0),
             fallbacks: Vec::new(),
         };
         // A model is ready only after a successful, validated prediction.
@@ -260,7 +268,37 @@ impl Embedder {
             }
             return Err(err.context("CodeRankEmbed warmup failed"));
         }
+        // Warmup must validate actual inference, even when its text is cached.
+        // Attach the disk cache only afterwards. MCP reuses its indexing
+        // encoder for queries; caching is attached to embed_query, never to
+        // document embedding, regardless of the instance's sequence cap.
+        embedder.query_model_calls.store(0, Ordering::Relaxed);
+        if env_flag("HIPS_QUERY_CACHE", true) {
+            let root = std::env::var_os("HIPS_QUERY_CACHE_DIR").map(PathBuf::from)
+                .unwrap_or_else(|| crate::codeindex::cache_root().join("query-vectors"));
+            let cache = (|| -> anyhow::Result<_> {
+                let recipe = serde_json::json!({"version":1,"model":MODEL_ID,
+                    "model_sha256":crate::query_cache::model_digest(path)?,
+                    "prefix":QUERY_PREFIX,"pooling":"cls","dimensions":CODERANK_DIM,
+                    "max_tokens":max_seq,"backend":if embedder.coreml_active() { "coreml" } else { "ggml" },
+                    "device":embedder.device,"flash":embedder.flash,
+                    "cls_only":env_flag("HIPS_GGML_CLS_ONLY",true),
+                    "cast_kv":env_flag("HIPS_GGML_CAST_KV",cfg!(target_os="macos"))});
+                crate::query_cache::DiskQueryCache::new(&root, &recipe)
+            })();
+            match cache {
+                Ok(cache) => embedder.disk_query_cache = Some(cache),
+                Err(e) => eprintln!("note: persistent query cache unavailable ({e:#})"),
+            }
+        }
         Ok(embedder)
+    }
+
+    fn coreml_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        { self.coreml.is_some() }
+        #[cfg(not(target_os = "macos"))]
+        { false }
     }
 
     /// Inspect the resident encoder without loading a model or running inference.
@@ -279,11 +317,15 @@ impl Embedder {
             "warmup_validated": true,
             "fallbacks": self.fallbacks,
             "query_cache_entries": self.query_cache.lock().ok().map(|c| c.map.len()),
+            "query_disk_cache": self.disk_query_cache.as_ref().map(|c| c.directory()),
+            "query_disk_hits": self.disk_query_hits.load(Ordering::Relaxed),
+            "query_model_calls": self.query_model_calls.load(Ordering::Relaxed),
         })
     }
 
     pub fn query_cached(&self, query: &str) -> bool {
         self.query_cache.lock().is_ok_and(|c| c.map.contains_key(query))
+            || self.disk_query_cache.as_ref().is_some_and(|c| c.get(query).is_some())
     }
 
     /// Token ids for one text under this instance's sequence cap
@@ -315,11 +357,22 @@ impl Embedder {
                 return Ok(vector);
             }
         }
+        if let Some(vector) = self.disk_query_cache.as_ref().and_then(|c| c.get(query)) {
+            self.disk_query_hits.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut cache) = self.query_cache.lock() { cache.put(query.into(), vector.clone()); }
+            return Ok(vector);
+        }
+        self.query_model_calls.fetch_add(1, Ordering::Relaxed);
         let prefixed = format!("{QUERY_PREFIX}{query}");
         let mut batch = self.embed_batch(&[prefixed.as_str()])?;
         let vector = batch.pop().expect("one query");
         if let Ok(mut cache) = self.query_cache.lock() {
             cache.put(query.to_string(), vector.clone());
+        }
+        if let Some(cache) = &self.disk_query_cache {
+            if let Err(e) = cache.enqueue(query, &vector) {
+                if crate::verbosity::verbose() { eprintln!("note: query cache enqueue failed ({e:#})"); }
+            }
         }
         Ok(vector)
     }
@@ -618,6 +671,9 @@ mod tests {
     #[test]
     fn matches_reference_vectors_and_batching_is_transparent() {
         let Some(path) = crate::test_util::model() else { return };
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = tempfile::tempdir().unwrap();
+        let _g = EnvGuard::set(&[("HIPS_QUERY_CACHE_DIR", Some(cache.path().to_str().unwrap())), ("HIPS_QUERY_CACHE", Some("1")), ("HPS_EMBED_MAX_SEQ", Some("512"))]);
         let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/coderank_reference.json")).unwrap();
         let rows = |key: &str| -> Vec<(String, Vec<f32>)> {
             fixture[key]
@@ -662,6 +718,52 @@ mod tests {
         validate_vector(&query.embed_query(&long).unwrap()).unwrap();
         // Empty input is a no-op, not an error.
         assert!(index.embed_docs(&[]).unwrap().is_empty());
+        crate::flush_query_cache_writes();
+    }
+
+    #[test]
+    fn persistent_query_lookup_misses_on_complete_issue_and_survives_reload() {
+        let Some(path) = crate::test_util::model() else { return };
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = tempfile::tempdir().unwrap();
+        let _g = EnvGuard::set(&[("HIPS_QUERY_CACHE_DIR", Some(cache.path().to_str().unwrap())), ("HIPS_QUERY_CACHE", Some("1")), ("HPS_EMBED_MAX_SEQ", Some("512"))]);
+        let encoder = Embedder::load_with_backend(&path, EmbedUse::Query, false).unwrap();
+        let short = "user";
+        assert!(!encoder.query_cached(short));
+        encoder.embed_query(short).unwrap();
+        let issue = "user ".repeat(100);
+        // Every individual word is cached. The complete issue still misses.
+        assert!(!encoder.query_cached(&issue));
+        let prefix = format!("{QUERY_PREFIX}{issue}");
+        let expected = encoder.embed_docs(&[&prefix]).unwrap().pop().unwrap();
+        let calls = encoder.query_model_calls.load(Ordering::Relaxed);
+        let first = encoder.embed_query(&issue).unwrap();
+        assert_eq!(first, expected);
+        assert_eq!(encoder.query_model_calls.load(Ordering::Relaxed), calls + 1);
+        assert_eq!(encoder.embed_query(&issue).unwrap(), expected);
+        assert_eq!(encoder.query_model_calls.load(Ordering::Relaxed), calls + 1);
+        crate::flush_query_cache_writes();
+        drop(encoder);
+        let restarted = Embedder::load_with_backend(&path, EmbedUse::Query, false).unwrap();
+        assert!(restarted.query_cached(&issue));
+        assert_eq!(restarted.embed_query(&issue).unwrap(), expected);
+        assert_eq!(restarted.query_model_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(restarted.disk_query_hits.load(Ordering::Relaxed), 1);
+        let index_encoder = Embedder::load_with_backend(&path, EmbedUse::Index, false).unwrap();
+        let index_cache = index_encoder.disk_query_cache.as_ref().unwrap();
+        assert_ne!(index_cache.directory(), restarted.disk_query_cache.as_ref().unwrap().directory());
+        assert!(!index_encoder.query_cached(&issue));
+        assert!(!index_cache.directory().exists());
+        index_encoder.embed_docs(&["indexing documents does not populate query entries"]).unwrap();
+        assert!(!index_cache.directory().exists());
+        // This is MCP's shared-encoder path. Only the search call populates it.
+        let shared_vector = index_encoder.embed_query(&issue).unwrap();
+        crate::flush_query_cache_writes();
+        drop(index_encoder);
+        let shared_restart = Embedder::load_with_backend(&path, EmbedUse::Index, false).unwrap();
+        assert!(shared_restart.query_cached(&issue));
+        assert_eq!(shared_restart.embed_query(&issue).unwrap(), shared_vector);
+        assert_eq!(shared_restart.query_model_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

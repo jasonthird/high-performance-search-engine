@@ -539,6 +539,7 @@ impl Server {
         let started = std::time::Instant::now();
         let effective_mode = mode.unwrap_or(if self.hybrid_enabled() { "hybrid" } else { "lexical" });
         let query_cache_hit = effective_mode != "lexical" && self.indexer.query_cached(&query);
+        let disk_hits_before = self.indexer.encoder_diagnostics()["query_disk_hits"].as_u64().unwrap_or(0);
         // A global cutoff cannot prove that a scoped query has no matches.
         // Expand until the scope has enough hits or every document was eligible.
         let total_docs = self.index()?.num_docs() as usize;
@@ -555,6 +556,10 @@ impl Server {
         anyhow::ensure!(hits.iter().all(|h| h.score.is_finite() &&
             h.components.is_none_or(|(b, s)| b.is_finite() && s.is_finite())),
             "search returned non-finite scores; results withheld");
+        // The encoder may have loaded during retrieval. Its first query can
+        // already be on disk even though no resident encoder existed above.
+        let query_cache_hit = query_cache_hit || (effective_mode != "lexical"
+            && self.indexer.encoder_diagnostics()["query_disk_hits"].as_u64().unwrap_or(0) > disk_hits_before);
         let hits: Vec<Hit> = hits
             .into_iter()
             .filter(|h| match &path_glob {
