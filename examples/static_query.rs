@@ -396,6 +396,26 @@ mod experiment {
                         variants.insert(key, serde_json::json!({"hits":run.results.iter().map(|r| &r.id).collect::<Vec<_>>(),"total_ms":run.total_ms+encode_ms,"encode_ms":encode_ms}));
                     }
                 }
+                // The legacy BM25-then-cosine mode, and 50-chunk first-stage
+                // pools that external rerankers (scripts/bench_rerank.py) reorder.
+                let opts = |mode| SearchOpts {
+                    mode,
+                    semantic_candidates: 200,
+                    fusion: FusionArg::Weighted,
+                    alpha: 0.15,
+                    rrf_k: 60.0,
+                    nprobe: 0,
+                    pq: PqMode::Off,
+                    ann_ef: 128,
+                    exact_vectors: true,
+                };
+                let run = query::run_ranked_with(&disk, &Fixed(&full), query, 20, &opts(RankMode::Rerank))?;
+                variants.insert("rerank_full", serde_json::json!({"hits":run.results.iter().map(|r| &r.id).collect::<Vec<_>>(),"total_ms":run.total_ms+full_ms,"encode_ms":full_ms}));
+                let run = query::run_ranked_with(&disk, &Fixed(&full), query, 50, &opts(RankMode::Hybrid))?;
+                let pools = serde_json::json!({
+                    "hybrid_full": run.results.iter().map(|r| &r.id).collect::<Vec<_>>(),
+                    "bm25": disk.search(query, 50).results.iter().map(|r| &r.id).collect::<Vec<_>>(),
+                });
                 let (coverage, cosine, error) = match &approx {
                     Ok(a) => (
                         Some(a.known_terms as f64 / a.total_terms as f64),
@@ -404,7 +424,7 @@ mod experiment {
                     ),
                     Err(e) => (None, None, Some(e.to_string())),
                 };
-                results.push(serde_json::json!({"id":item["id"],"mode":item["mode"],"query":query,"full_cached":cached,"full_encode_ms":full_ms,"static_encode_ms":static_ms,"coverage":coverage,"query_cosine":cosine,"static_error":error,"dynamic":dynamic_stats,"variants":variants}));
+                results.push(serde_json::json!({"id":item["id"],"mode":item["mode"],"query":query,"full_cached":cached,"full_encode_ms":full_ms,"static_encode_ms":static_ms,"coverage":coverage,"query_cosine":cosine,"static_error":error,"dynamic":dynamic_stats,"variants":variants,"pools":pools}));
             }
             writeln!(
                 output,
