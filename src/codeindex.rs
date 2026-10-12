@@ -254,10 +254,24 @@ struct TrainedQuantizer {
 /// The encoder is loaded once and reused across rebuilds — model load and
 /// GPU pipeline compilation cost far more than a typical incremental
 /// rebuild does.
+/// One step of a build, for clients that show progress (the MCP server
+/// forwards these as `notifications/progress`). `done`/`total` count the
+/// phase's own units; `total == 0` means indeterminate.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    pub phase: &'static str,
+    pub done: usize,
+    pub total: usize,
+    pub message: String,
+}
+
+pub type ProgressSink = std::sync::Arc<dyn Fn(&Progress) + Send + Sync>;
+
 pub struct RepoIndexer {
     root: PathBuf,
     index_dir: PathBuf,
     opts: BuildOpts,
+    progress: Option<ProgressSink>,
     /// Loaded on first use and kept for the process lifetime. Lazy because a
     /// rebuild that changed nothing needs no encoder at all — and model load
     /// plus GPU pipeline compilation costs about a second, which would
@@ -278,9 +292,21 @@ impl RepoIndexer {
             root,
             index_dir: index_dir.to_path_buf(),
             opts,
+            progress: None,
             #[cfg(feature = "semantic")]
             embedder: std::cell::OnceCell::new(),
         })
+    }
+
+    /// Receive build progress until replaced or cleared.
+    pub fn set_progress(&mut self, sink: Option<ProgressSink>) {
+        self.progress = sink;
+    }
+
+    fn report(&self, phase: &'static str, done: usize, total: usize, message: impl FnOnce() -> String) {
+        if let Some(sink) = &self.progress {
+            sink(&Progress { phase, done, total, message: message() });
+        }
     }
 
     /// Load the encoder now rather than on the first cache miss. The MCP
@@ -385,6 +411,7 @@ impl RepoIndexer {
         }
         let start = Instant::now();
         let mut timer = PhaseTimer::new();
+        self.report("scanning", 0, 0, || "Scanning files".into());
         let files = repo::walk(&self.root)?;
         timer.mark("walk");
         // Byte-identical tree: nothing downstream can change, so the only
@@ -406,6 +433,7 @@ impl RepoIndexer {
                 }
             }
         }
+        self.report("chunking", 0, files.len(), || format!("Reading {} files", files.len()));
         let docs = repo::docs_from_chunks(repo::chunk_files(&files)?)?;
         timer.mark("chunk");
         anyhow::ensure!(
@@ -484,6 +512,7 @@ impl RepoIndexer {
             return self.migrate_to_segments();
         }
         let mut writer = self.open_writer_waiting(WRITER_WAIT)?;
+        self.report("scanning", 0, 0, || "Scanning files".into());
         let files = repo::walk(&self.root)?;
         timer.mark("walk");
         let tree_fingerprint = repo::fingerprint(&files);
@@ -556,6 +585,9 @@ impl RepoIndexer {
 
         // Chunk only the changed files.
         let changed_files: Vec<repo::SourceFile> = changed.iter().map(|f| (*f).clone()).collect();
+        self.report("chunking", 0, changed_files.len(), || {
+            format!("Reading {} new or changed files (of {})", changed_files.len(), files.len())
+        });
         let chunks = repo::chunk_files(&changed_files)?;
         let mut docs_by_file: HashMap<String, Vec<crate::indexer::InputDoc>> = HashMap::new();
         for chunk in chunks {
@@ -663,16 +695,25 @@ impl RepoIndexer {
             self.log(format!(
                 "encoding {encoded} unique chunks ({cached} rows reused from cache or duplicates)"
             ));
+            if !self.encoder_loaded() {
+                self.report("model", 0, 0, || {
+                    "Loading the CodeRankEmbed model (the first run downloads 274 MB)".into()
+                });
+            }
             let embedder = self.embedder()?;
             let mut done = 0usize;
-            // Give token-aware scheduling a larger, bounded lookahead window.
-            for chunk in misses.chunks(batch.max(4096)) {
+            self.report("encoding", 0, encoded, || format!("Embedding {encoded} chunks"));
+            // Give token-aware scheduling a larger, bounded lookahead window;
+            // smaller when someone is watching progress.
+            let window = if self.progress.is_some() { batch.max(1024) } else { batch.max(4096) };
+            for chunk in misses.chunks(window) {
                 let refs: Vec<&str> = chunk.iter().map(|&i| texts[i].as_str()).collect();
                 let vectors = embedder.embed_docs(&refs)?;
                 for (&i, vector) in chunk.iter().zip(vectors.iter()) {
                     cache.insert(keys[i], vector);
                 }
                 done += chunk.len();
+                self.report("encoding", done, encoded, || format!("Embedding chunks: {done} / {encoded}"));
                 if progress && !self.opts.quiet && (done.is_multiple_of(512) || done == encoded) {
                     eprintln!("  encoded {done}/{encoded}");
                 }

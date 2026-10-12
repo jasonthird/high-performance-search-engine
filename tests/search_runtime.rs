@@ -719,3 +719,35 @@ fn mcp_search_returns_structured_hits_for_editor_clients() {
     // Agents do not ask for it, and do not pay for it.
     assert!(responses[2]["result"].get("structuredContent").is_none());
 }
+
+#[test]
+fn mcp_refresh_builds_with_progress_notifications() {
+    use serde_json::json;
+    let f = Fixture::new();
+    let fresh = f.root.parent().unwrap().join("fresh-index");
+    let mut cmd = f.command();
+    cmd.args(["mcp", "--no-watch", "--lexical", "--root"]).arg(&f.root).arg("--index").arg(&fresh);
+    let (output, messages) = mcp_calls(cmd, &[
+        json!({"name":"index_status", "arguments":{"refresh":true}, "_meta":{"progressToken":"t1"}}),
+        json!({"name":"search_code", "arguments":{"query":"permission"}}),
+    ]);
+    assert!(output.status.success());
+    let progress: Vec<f64> = messages.iter()
+        .filter(|m| m["method"] == "notifications/progress")
+        .inspect(|m| {
+            assert_eq!(m["params"]["progressToken"], "t1");
+            assert_eq!(m["params"]["total"], 100);
+            assert!(m["params"]["message"].as_str().is_some_and(|s| !s.is_empty()));
+        })
+        .map(|m| m["params"]["progress"].as_f64().unwrap())
+        .collect();
+    assert!(progress.len() >= 2, "expected scanning and reading steps, got {progress:?}");
+    assert!(progress.windows(2).all(|w| w[1] > w[0]), "progress must increase: {progress:?}");
+    // The build happened during the status call; the reply reports it.
+    let status = messages.iter().find(|m| m["id"] == 0).unwrap();
+    let text = status["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("chunks: 2 from 2 files"), "{text}");
+    // Calls without a token get no notifications.
+    let search = messages.iter().position(|m| m["id"] == 1).unwrap();
+    assert!(messages[search..].iter().all(|m| m["method"] != "notifications/progress"));
+}

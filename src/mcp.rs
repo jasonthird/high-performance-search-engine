@@ -339,7 +339,8 @@ impl Server {
                 "description": "Report what is indexed: root, chunk count, retrieval mode, \
                                 freshness, and rebuild statistics.",
                 "inputSchema": {"type": "object", "properties": {
-                    "verbose": {"type": "boolean", "default": false, "description": "Inspect resident encoder and last search diagnostics without loading the model (default false)."}
+                    "verbose": {"type": "boolean", "default": false, "description": "Inspect resident encoder and last search diagnostics without loading the model (default false)."},
+                    "refresh": {"type": "boolean", "default": false, "description": "Build the index, or bring it up to date, before reporting (default false). Editors call this at startup."}
                 }}
             },
             {
@@ -374,6 +375,11 @@ impl Server {
             Some(_) => return Ok(tool_error("`verbose` must be a boolean")),
         };
         let started = std::time::Instant::now();
+        // A client that sent a progress token sees builds this call triggers.
+        let token = params.get("_meta").and_then(|m| m.get("progressToken")).cloned();
+        if let Some(token) = token.filter(|t| t.is_string() || t.is_number()) {
+            self.indexer.set_progress(Some(progress_notifier(token)));
+        }
         if name == "search_code" {
             self.last_search = Some(json!({
                 "requested_mode": args.get("mode").cloned().unwrap_or(json!("auto")),
@@ -384,7 +390,9 @@ impl Server {
         // Failed semantic execution is a tool error, never a successful
         // lexical response. CoreML -> ggml is still semantic execution.
         self.structured = None;
-        let mut result = match self.dispatch(&name, &args) {
+        let dispatched = self.dispatch(&name, &args);
+        self.indexer.set_progress(None);
+        let mut result = match dispatched {
             Ok(text) => {
                 let mut result = json!({"content": [{"type": "text", "text": text}], "isError": false});
                 if let Some(structured) = self.structured.take() {
@@ -433,7 +441,12 @@ impl Server {
     fn dispatch(&mut self, name: &str, args: &Value) -> anyhow::Result<String> {
         match name {
             "search_code" => self.tool_search(args),
-            "index_status" => self.tool_status(),
+            "index_status" => {
+                if args.get("refresh").and_then(Value::as_bool).unwrap_or(false) {
+                    self.ensure_fresh(false)?;
+                }
+                self.tool_status()
+            }
             "reindex" => {
                 self.refresh_pending = true;
                 let before = self.manifest.num_docs;
@@ -805,6 +818,48 @@ impl Hit {
             components,
         })
     }
+}
+
+/// Forward build progress as MCP `notifications/progress` on stdout.
+///
+/// MCP requires each token's `progress` to increase, while the phases count
+/// their own units; so phases map onto one 0..100 scale weighted by where
+/// the time goes (scan 0-1, read 1-4, model 4-6, embed 6-99) and the
+/// readable detail goes in `message`. Lines are throttled to ~10/s except
+/// on a phase change.
+fn progress_notifier(token: Value) -> crate::codeindex::ProgressSink {
+    struct State {
+        sent: f64,
+        phase: &'static str,
+        at: std::time::Instant,
+    }
+    let state = std::sync::Mutex::new(State { sent: -1.0, phase: "", at: std::time::Instant::now() });
+    std::sync::Arc::new(move |p: &crate::codeindex::Progress| {
+        let (lo, hi) = match p.phase {
+            "scanning" => (0.0, 1.0),
+            "chunking" => (1.0, 4.0),
+            "model" => (4.0, 6.0),
+            "encoding" => (6.0, 99.0),
+            _ => (99.0, 99.5),
+        };
+        let fraction = if p.total > 0 { p.done as f64 / p.total as f64 } else { 0.0 };
+        let mut state = state.lock().unwrap();
+        let value = (lo + (hi - lo) * fraction).max(state.sent);
+        let phase_changed = state.phase != p.phase;
+        if !phase_changed && (value <= state.sent || state.at.elapsed() < std::time::Duration::from_millis(100)) {
+            return;
+        }
+        // Equal values are not an increase: nudge within the phase.
+        let value = if value <= state.sent { (state.sent + 0.01).min(hi) } else { value };
+        *state = State { sent: value, phase: p.phase, at: std::time::Instant::now() };
+        let note = json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
+            "progressToken": token, "progress": (value * 100.0).round() / 100.0, "total": 100,
+            "message": p.message,
+        }});
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{note}");
+        let _ = out.flush();
+    })
 }
 
 fn manifest_mtime(index_dir: &Path) -> Option<std::time::SystemTime> {
