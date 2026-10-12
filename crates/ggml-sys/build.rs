@@ -91,7 +91,7 @@ fn main() {
     }
 }
 
-/// Every directory under `root` that holds a static archive.
+/// Every directory under `root` that holds a static archive (`.a`, or MSVC `.lib`).
 fn walk_archive_dirs(root: &std::path::Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -102,7 +102,9 @@ fn walk_archive_dirs(root: &std::path::Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "a") {
+            } else if path.extension().is_some_and(|e| e == "a" || e == "lib") {
+                // `.lib` is the MSVC static archive; cmake's multi-config
+                // generators also nest it under `Release/`.
                 has_archive = true;
             }
         }

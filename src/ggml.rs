@@ -27,7 +27,6 @@
 //! [`Engine`] owns every ggml object it creates and frees them in `Drop`.
 
 use std::ffi::{CStr, CString};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::ptr;
 
@@ -277,11 +276,34 @@ pub fn read_vocab(path: &Path) -> Result<Vocab> {
     Gguf::open(path, None)?.vocab()
 }
 
+/// Positional read that leaves no shared cursor behind (`pread` on Unix).
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Windows' `seek_read` may return short reads and moves the cursor; callers
+/// only use positional reads, so the cursor is irrelevant.
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset)? {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// True if the file starts with the GGUF magic; the cheap check a
 /// download runs before publishing the file.
 pub fn looks_like_gguf(path: &Path) -> Result<()> {
     let mut magic = [0u8; 4];
-    std::fs::File::open(path)?.read_exact_at(&mut magic, 0)?;
+    read_exact_at(&std::fs::File::open(path)?, &mut magic, 0)?;
     ensure!(&magic == b"GGUF", "{} is not a GGUF file", path.display());
     Ok(())
 }
@@ -462,7 +484,7 @@ impl Engine {
             buffer.resize(total, 0);
             let mut at = 0;
             for (offset, size) in parts {
-                file.read_exact_at(&mut buffer[at..at + size], offset).context("read tensor data")?;
+                read_exact_at(&file, &mut buffer[at..at + size], offset).context("read tensor data")?;
                 at += size;
             }
             unsafe { g::ggml_backend_tensor_set(tensor, buffer.as_ptr().cast(), 0, total) };

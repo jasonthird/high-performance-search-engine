@@ -39,7 +39,12 @@ fn cache_dir(target: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn load(name: &str) -> Result<LoadedGrammar> {
-    let filename = format!("libhips_grammar_{name}.{}", std::env::consts::DLL_EXTENSION);
+    // `libhips_grammar_x.so`/`.dylib`; Windows cdylibs carry no `lib` prefix.
+    let filename = format!(
+        "{}hips_grammar_{name}.{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_EXTENSION
+    );
     // Packages may bundle any subset. Installed libraries take precedence and
     // stay in place; only missing languages use the user's cache/download path.
     if let Some(dir) = std::env::var_os("HIPS_GRAMMAR_DIR") {
