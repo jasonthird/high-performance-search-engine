@@ -59,6 +59,9 @@ pub struct Server {
     config: ServerConfig,
     rebuilds: u64,
     last_search: Option<Value>,
+    /// Hits of the search being answered, returned as `structuredContent`
+    /// so editor clients need not parse the text rendering.
+    structured: Option<Value>,
     refresh_pending: bool,
     /// Modification time of the on-disk manifest when `index` was opened.
     /// The background watcher (or another agent's `index-repo`) rebuilds
@@ -126,6 +129,7 @@ impl Server {
             config,
             rebuilds: 0,
             last_search: None,
+            structured: None,
             refresh_pending,
             manifest_mtime,
         })
@@ -317,6 +321,11 @@ impl Server {
                             "default": false,
                             "description": "Include runtime backend, fallback, timing, cache reuse and score diagnostics (default false)."
                         },
+                        "structured": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Also return the hits as structuredContent, for editor integrations (default false)."
+                        },
                         "expected_root": {
                             "type": "string",
                             "description": "Optional absolute repository root; fail if this server serves a different root."
@@ -374,8 +383,15 @@ impl Server {
         }
         // Failed semantic execution is a tool error, never a successful
         // lexical response. CoreML -> ggml is still semantic execution.
+        self.structured = None;
         let mut result = match self.dispatch(&name, &args) {
-            Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
+            Ok(text) => {
+                let mut result = json!({"content": [{"type": "text", "text": text}], "isError": false});
+                if let Some(structured) = self.structured.take() {
+                    result["structuredContent"] = structured;
+                }
+                result
+            }
             Err(e) => {
                 if name == "search_code" {
                     if let Some(search) = self.last_search.as_mut() {
@@ -514,6 +530,10 @@ impl Server {
             Some(v) => v.as_u64().filter(|k| (1..=50).contains(k))
                 .context("`top_k` must be an integer between 1 and 50")? as usize,
         };
+        let structured = match args.get("structured") {
+            None => false,
+            Some(v) => v.as_bool().context("`structured` must be a boolean")?,
+        };
         let include_snippet = match args.get("include_snippet") {
             None => false,
             Some(v) => v.as_bool().context("`include_snippet` must be a boolean")?,
@@ -599,6 +619,19 @@ impl Server {
                 "score": h.score,
                 "bm25": h.components.map(|(b, _)| b),
                 "semantic": h.components.map(|(_, s)| s),
+            })).collect::<Vec<_>>(),
+        }));
+        // Opt-in: clients that show structuredContent to the model would
+        // otherwise pay for every hit twice.
+        self.structured = structured.then(|| json!({
+            "root": self.config.root,
+            "mode": effective_mode,
+            "hits": hits.iter().map(|h| json!({
+                "path": h.path, "start_line": h.start_line, "end_line": h.end_line,
+                "name": h.name, "score": h.score,
+                "snippet": include_snippet
+                    .then(|| repo::snippet_for(&self.config.root, &h.id, SNIPPET_LINES))
+                    .flatten(),
             })).collect::<Vec<_>>(),
         }));
         let mut text = format!("Retrieval: {effective_mode}\n");

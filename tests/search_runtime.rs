@@ -692,3 +692,30 @@ fn failed_migration_keeps_the_original_single_index_readable() {
     assert_eq!(index.num_docs(), 2);
     assert!(!index.search("permission", 5).results.is_empty());
 }
+
+#[test]
+fn mcp_search_returns_structured_hits_for_editor_clients() {
+    use serde_json::json;
+    let f = Fixture::new();
+    let (output, responses) = mcp_calls(f.mcp_command(), &[
+        json!({"name":"search_code", "arguments":{"query":"permission validation", "mode":"lexical", "include_snippet":true, "structured":true}}),
+        json!({"name":"search_code", "arguments":{"query":"permission", "mode":"lexical", "path_glob":"server/**", "structured":true}}),
+        json!({"name":"search_code", "arguments":{"query":"permission", "mode":"lexical"}}),
+    ]);
+    assert!(output.status.success());
+    let found = &responses[0]["result"]["structuredContent"];
+    assert_eq!(found["mode"], "lexical");
+    assert_eq!(found["root"], json!(f.root.canonicalize().unwrap()));
+    let top = &found["hits"][0];
+    assert_eq!(top["path"], "server/inside.toml");
+    assert_eq!((top["start_line"].as_u64(), top["end_line"].as_u64()), (Some(1), Some(1)));
+    assert!(top["score"].as_f64().unwrap() > 0.0);
+    assert_eq!(top["snippet"], "permission_validation = true");
+    // Without include_snippet the field is null; filters apply to the structured hits too.
+    let scoped = responses[1]["result"]["structuredContent"]["hits"].as_array().unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0]["path"], "server/inside.toml");
+    assert!(scoped[0]["snippet"].is_null());
+    // Agents do not ask for it, and do not pay for it.
+    assert!(responses[2]["result"].get("structuredContent").is_none());
+}
