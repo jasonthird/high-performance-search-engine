@@ -898,6 +898,15 @@ Every `hips search` and MCP `search_code` call appends one JSON line
 `~/.cache/csearch/usage.jsonl`, for offline analysis of how agents actually
 use the tool. `HIPS_NO_LOG=1` disables it.
 
+### VS Code extension
+
+[hips-vscode](https://github.com/jasonthird/hips-vscode) adds a native-style
+Search view to VS Code: results as you type, grouped by file with snippet
+previews, backed by a resident `hips mcp` server per workspace folder. It also
+registers hips as an MCP server for Copilot. Platform builds bundle the binary
+and grammars from this repository's releases (`.github/workflows/release.yml`:
+macOS arm64/x64, Windows x64, and Linux x64 built on Arch).
+
 ### Installing for agents
 
 The search skill uses a simple rule: **sandboxed shell → prefer MCP; no

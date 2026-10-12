@@ -1,0 +1,105 @@
+name: Release builds
+
+# Builds hips (with CodeRankEmbed) and its grammar libraries for each
+# platform, as hips-<target>.tar.gz: `hips` (or `hips.exe`) beside a
+# `grammars/` directory for HIPS_GRAMMAR_DIR. The VS Code extension
+# (jasonthird/hips-vscode) bundles these archives. Pushing to a release/**
+# branch or running the workflow manually produces artifacts only; a v* tag
+# also publishes a GitHub release.
+on:
+  push:
+    tags: ['v*']
+    branches: ['release/**']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          # Linux builds target Arch only for now (same toolchain and
+          # dependencies as packaging/arch/PKGBUILD).
+          - os: ubuntu-latest
+            container: archlinux:latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Before checkout: the submodule fetch needs git inside the container.
+      - name: Install Arch build dependencies
+        if: matrix.container
+        run: pacman -Syu --noconfirm --needed base-devel git rust cmake shaderc vulkan-headers spirv-headers vulkan-icd-loader
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.container }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          workspaces: |
+            . -> target
+            grammars -> target
+      - name: Build hips
+        run: cargo build --release --locked --features semantic
+      # Grammars give declaration-aware chunks; without them hips falls back
+      # to heuristic chunking, so a failure here does not block the package.
+      - name: Build grammar libraries
+        id: grammars
+        continue-on-error: ${{ runner.os == 'Windows' }}
+        run: cargo build --manifest-path grammars/Cargo.toml --release --locked
+      - name: Smoke test
+        run: |
+          exe=target/release/hips
+          [ "$RUNNER_OS" = Windows ] && exe=target/release/hips.exe
+          mkdir -p smoke && printf 'fn validate_token() {}\n' > smoke/auth.rs
+          HIPS_GRAMMAR_DIR="$PWD/grammars/target/release" "$exe" index-repo --root smoke --lexical
+          HIPS_GRAMMAR_DIR="$PWD/grammars/target/release" "$exe" search --root smoke --lexical --query "validate token" | grep auth.rs
+      - name: Package binary and grammars
+        run: |
+          stage=stage/hips
+          mkdir -p "$stage/grammars" dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/hips.exe "$stage/"
+            cp grammars/target/release/hips_grammar_*.dll "$stage/grammars/" 2>/dev/null || true
+          else
+            cp target/release/hips "$stage/"
+            cp grammars/target/release/libhips_grammar_*.{so,dylib} "$stage/grammars/" 2>/dev/null || true
+          fi
+          echo "grammars packaged: $(ls "$stage/grammars" | wc -l)"
+          tar -C "$stage" -czf "dist/hips-${{ matrix.target }}.tar.gz" .
+          cd dist
+          sum=$(command -v sha256sum || echo "shasum -a 256")
+          $sum "hips-${{ matrix.target }}.tar.gz" > "hips-${{ matrix.target }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hips-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hips-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --notes 'hips binaries with grammar libraries, per platform. Each archive holds `hips` and a `grammars/` directory for `HIPS_GRAMMAR_DIR`.'
