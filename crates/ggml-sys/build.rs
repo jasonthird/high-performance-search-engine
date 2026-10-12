@@ -3,7 +3,15 @@ use std::{env, path::PathBuf};
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let src = manifest.join("../../vendor/ggml");
-    let src = src.canonicalize().unwrap_or(src);
+    // Windows canonical paths are verbatim (`\\?\D:\...`), which MSBuild
+    // cannot open source files through; drop that prefix.
+    let src = match src.canonicalize() {
+        Ok(path) => match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+            Some(plain) => PathBuf::from(plain),
+            None => path,
+        },
+        Err(_) => src,
+    };
     if !src.join("CMakeLists.txt").exists() {
         panic!(
             "vendor/ggml is empty: ggml is a git submodule, run `git submodule update --init` \
