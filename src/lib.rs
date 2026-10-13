@@ -43,9 +43,11 @@ pub fn flush_query_cache_writes() {
     #[cfg(feature = "semantic")]
     query_cache::flush_pending();
 }
+mod notebook;
 mod office;
 pub mod repo;
 pub mod reorder;
+pub mod scope;
 pub mod searcher;
 pub mod segments;
 pub mod spell;

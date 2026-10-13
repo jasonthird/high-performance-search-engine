@@ -41,12 +41,38 @@ pub const SOURCE_EXTS: &[&str] = &[
     "pl", "pm", "r", "m", "mm", "ps1", "psm1", "psd1", "hrl", "jl", "zig", "groovy", "gradle",
     "gvy", "f", "f90", "f95", "f03", "f08", "for", "pas", "pp", "dpr", "adb", "ads", "sol",
     "tfvars", "hcl", "nix", "elm", "cmake", "s", "asm", "markdown", "mli",
+    // Prose and notebooks: the design docs, theses and analyses that live
+    // next to the code (chunked by heading / by cell, see `chunk_prose`).
+    "tex", "bib", "rst", "txt", "adoc", "asciidoc", "org", "ipynb",
+    // Web assets and schemas.
+    "html", "htm", "css", "scss", "sass", "less", "graphql", "gql", "prisma",
+    // Configuration formats that are plain text and small.
+    "ini", "cfg", "properties",
 ];
+
+/// Files indexed by name rather than extension: build and container
+/// recipes agents routinely ask about.
+pub const SOURCE_BASENAMES: &[&str] = &[
+    "Dockerfile", "Containerfile", "Makefile", "GNUmakefile", "Justfile", "justfile", "Procfile",
+    "Gemfile", "Rakefile", "Vagrantfile", "Jenkinsfile", "Brewfile", "Pipfile",
+];
+
+/// Prose formats: chunked by heading and paragraph, never by declaration
+/// keywords (which occur in English text and would cut it at random).
+pub fn is_prose(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ext)| {
+        ["tex", "bib", "rst", "txt", "adoc", "asciidoc", "org", "md", "markdown"]
+            .iter()
+            .any(|p| ext.eq_ignore_ascii_case(p))
+    })
+}
 
 /// Byte cap for a file, by name: binary documents get a larger limit.
 pub fn max_file_bytes(name: &str) -> u64 {
     if crate::office::is_office(name) {
         crate::office::MAX_BYTES
+    } else if crate::notebook::is_notebook(name) {
+        crate::notebook::MAX_BYTES
     } else if is_pdf(name) {
         MAX_PDF_BYTES
     } else {
@@ -144,6 +170,9 @@ pub fn snippet_for(root: &Path, id: &str, max_lines: usize) -> Option<String> {
     } else if crate::office::is_office(path) {
         let abs = root.join(path);
         crate::office::extract(&abs, &fs::read(&abs).ok()?)?.text()
+    } else if crate::notebook::is_notebook(path) {
+        let abs = root.join(path);
+        crate::notebook::extract(&abs, &fs::read(&abs).ok()?)?.text()
     } else {
         fs::read_to_string(root.join(path)).ok()?
     };
@@ -303,6 +332,39 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     glob_inner(pattern.as_bytes(), text.as_bytes())
 }
 
+/// The matcher for a caller-supplied path filter (the MCP `path_glob`):
+/// [`glob_match`] plus shell-style brace alternation, `**/*.{tex,rs}`,
+/// which agents write constantly. Gitignore rules never expand braces (git
+/// does not), so this stays separate from the ignore matcher.
+pub fn path_glob_match(pattern: &str, text: &str) -> bool {
+    expand_braces(pattern).iter().any(|p| glob_match(p, text))
+}
+
+/// `a{b,c}d{e,f}` -> `abde abdf acde acdf`. A brace with no comma, or an
+/// unclosed one, is literal. Nesting is not supported (the inner group is
+/// left as written).
+pub fn expand_braces(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_string()];
+    };
+    let Some(close_rel) = pattern[open..].find('}') else {
+        return vec![pattern.to_string()];
+    };
+    let close = open + close_rel;
+    let inner = &pattern[open + 1..close];
+    if !inner.contains(',') {
+        return vec![pattern.to_string()];
+    }
+    let (head, tail) = (&pattern[..open], &pattern[close + 1..]);
+    let mut out = Vec::new();
+    for alt in inner.split(',') {
+        for rest in expand_braces(tail) {
+            out.push(format!("{head}{alt}{rest}"));
+        }
+    }
+    out
+}
+
 fn glob_inner(p: &[u8], t: &[u8]) -> bool {
     // `**` crosses path separators; a single `*` and `?` do not. Nested
     // wildcards need real backtracking (a single remembered star position is
@@ -459,8 +521,32 @@ fn walk_dir(dir: &Path, prefix: &str, ignores: &IgnoreSet, out: &mut Vec<SourceF
 fn is_source(name: &str) -> bool {
     match name.rsplit_once('.') {
         Some((_, ext)) => SOURCE_EXTS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)),
-        None => false,
+        // Extensionless recipes (`Makefile`, `Dockerfile`).
+        None => SOURCE_BASENAMES.contains(&name),
     }
+}
+
+/// Extensions a path glob asks for that hips never indexes, so a scoped
+/// query that matches nothing can say why: `**/*.json` -> `["json"]`.
+/// Brace alternatives (`*.{tex,py}`) are expanded; globs without an
+/// extension yield nothing.
+pub fn unindexed_extensions(glob: &str) -> Vec<String> {
+    let last = glob.rsplit('/').next().unwrap_or(glob);
+    let Some((_, ext)) = last.rsplit_once('.') else {
+        return Vec::new();
+    };
+    let ext = ext.trim_end_matches('}');
+    let alternatives: Vec<&str> = match ext.strip_prefix('{') {
+        Some(inner) => inner.split(',').collect(),
+        None => vec![ext],
+    };
+    alternatives
+        .into_iter()
+        .map(|e| e.trim().trim_start_matches('.'))
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .filter(|e| !SOURCE_EXTS.iter().any(|known| e.eq_ignore_ascii_case(known)))
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +846,12 @@ pub fn chunk_text(rel: &str, text: &str) -> Vec<Chunk> {
     }
     let mut chunks = Vec::new();
     if starts.is_empty() {
-        push_split(&mut chunks, rel, &lines, 0, lines.len(), None);
+        // No declarations to cut at (configuration, data, prose with no
+        // headings): windows bounded by lines *and* bytes, cut at blank
+        // lines. Fixed-line slabs used to be truncated at `MAX_CHUNK_BYTES`,
+        // which silently dropped the tail of every long-lined file from
+        // the index.
+        push_windowed(&mut chunks, rel, &lines, 0, lines.len(), None, None, None);
         return chunks;
     }
     // A declaration's doc comment sits *above* it, so each chunk start is
@@ -859,6 +950,244 @@ pub(crate) fn push_split_full(
     }
 }
 
+/// Append `lines[start..end]` as windows of at most `MAX_CHUNK_LINES` lines
+/// and `PROSE_CHUNK_BYTES` bytes, preferring to end a window at a blank
+/// line (a paragraph boundary) when one falls in its second half. Unlike
+/// [`push_split_full`], every window keeps the name: a heading applies to
+/// all of its text, and a notebook cell split in two is still that cell.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_windowed(
+    out: &mut Vec<Chunk>,
+    rel: &str,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    name: Option<String>,
+    kind: Option<String>,
+    parent: Option<String>,
+) {
+    let mut at = start;
+    while at < end {
+        let mut stop = at;
+        let mut bytes = 0usize;
+        while stop < end && stop - at < MAX_CHUNK_LINES {
+            let next = lines[stop].len() + usize::from(stop > at);
+            if bytes + next > PROSE_CHUNK_BYTES && stop > at {
+                break;
+            }
+            bytes += next;
+            stop += 1;
+        }
+        if stop < end {
+            let half = at + (stop - at) / 2;
+            if let Some(blank) = (half..stop).rev().find(|&i| lines[i].trim().is_empty()) {
+                // The blank line closes the paragraph before it.
+                stop = blank + 1;
+            }
+        }
+        let body = lines[at..stop].join("\n");
+        if !body.trim().is_empty() {
+            let mut body = body;
+            if body.len() > MAX_CHUNK_BYTES {
+                // Only a single line longer than the cap gets here.
+                let cut = body
+                    .char_indices()
+                    .take_while(|(i, _)| *i <= MAX_CHUNK_BYTES)
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                body.truncate(cut);
+            }
+            out.push(Chunk {
+                path: rel.to_string(),
+                start_line: at + 1,
+                end_line: stop,
+                name: name.clone(),
+                kind: kind.clone(),
+                parent: parent.clone(),
+                body,
+            });
+        }
+        at = stop;
+    }
+}
+
+/// Target window size for prose and notebook cells: about a thousand
+/// tokens, so the encoder sees most of each chunk. `MAX_CHUNK_BYTES` stays
+/// the hard cap for a single overlong line.
+pub const PROSE_CHUNK_BYTES: usize = 4 * 1024;
+
+/// Heading recognized in a prose file: its nesting level and title.
+fn prose_heading(rel: &str, lines: &[&str], i: usize) -> Option<(usize, String, usize)> {
+    let ext = rel.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let line = lines[i].trim();
+    if line.is_empty() {
+        return None;
+    }
+    match ext.as_str() {
+        "tex" => {
+            let t = line.strip_prefix('\\')?;
+            const LEVELS: &[(&str, usize)] = &[
+                ("part", 0),
+                ("chapter", 1),
+                ("section", 2),
+                ("subsection", 3),
+                ("subsubsection", 4),
+                ("paragraph", 5),
+            ];
+            let (cmd, level) = LEVELS.iter().find(|(c, _)| {
+                t.strip_prefix(c)
+                    .is_some_and(|r| r.starts_with('{') || r.starts_with('*') || r.starts_with('['))
+            })?;
+            let rest = &t[cmd.len()..];
+            let open = rest.find('{')?;
+            let title = brace_content(&rest[open..])?;
+            Some((*level, title, 1))
+        }
+        "md" | "markdown" => {
+            let hashes = line.bytes().take_while(|&b| b == b'#').count();
+            if hashes == 0 || hashes > 6 || !line[hashes..].starts_with(' ') {
+                return None;
+            }
+            let title = line[hashes..].trim().trim_end_matches('#').trim();
+            (!title.is_empty()).then(|| (hashes, title.to_string(), 1))
+        }
+        "adoc" | "asciidoc" => {
+            let eqs = line.bytes().take_while(|&b| b == b'=').count();
+            if eqs == 0 || eqs > 6 || !line[eqs..].starts_with(' ') {
+                return None;
+            }
+            let title = line[eqs..].trim();
+            (!title.is_empty()).then(|| (eqs, title.to_string(), 1))
+        }
+        "org" => {
+            let stars = line.bytes().take_while(|&b| b == b'*').count();
+            if stars == 0 || !line[stars..].starts_with(' ') {
+                return None;
+            }
+            let title = line[stars..].trim();
+            (!title.is_empty()).then(|| (stars, title.to_string(), 1))
+        }
+        "rst" => {
+            // A title underlined (and optionally overlined) with one
+            // repeated punctuation character at least as long as the title.
+            let under = *lines.get(i + 1)?;
+            let under_t = under.trim_end();
+            let c = under_t.chars().next()?;
+            let is_rule = |s: &str| {
+                let s = s.trim_end();
+                s.len() >= 3 && s.len() >= line.len() && s.chars().all(|x| x == c)
+            };
+            if !"=-~^\"'*+#`:._".contains(c) || !is_rule(under_t) || is_rule(line) {
+                return None;
+            }
+            let over = i > 0 && is_rule(lines[i - 1]) && lines[i - 1].trim_end().starts_with(c);
+            // Level by the underline character: ranks are assigned in order
+            // of first appearance by the caller.
+            Some((c as usize + 1000, line.to_string(), if over { 2 } else { 1 }))
+        }
+        _ => None,
+    }
+}
+
+/// Text inside the first balanced `{...}` of `s`, with TeX markup thinned
+/// to words: `\emph{Fast} search` -> `Fast search`.
+fn brace_content(s: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut out = String::new();
+    let mut chars = s.char_indices();
+    let (_, first) = chars.next()?;
+    if first != '{' {
+        return None;
+    }
+    depth += 1;
+    let mut in_cmd = false;
+    for (_, c) in chars {
+        match c {
+            '{' => {
+                depth += 1;
+                in_cmd = false;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            '\\' => in_cmd = true,
+            c if in_cmd && c.is_alphabetic() => {}
+            c => {
+                in_cmd = false;
+                out.push(c);
+            }
+        }
+    }
+    let title = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
+}
+
+/// Chunk a prose file (TeX, RST, AsciiDoc, Org, Markdown without its
+/// grammar, plain text) by heading, then by paragraph-bounded windows.
+/// Each section chunk is named after its heading and parented by the
+/// nearest enclosing heading, so a hit reads as
+/// `thesis.tex::Evaluation::Equivalence testing`.
+pub fn chunk_prose(rel: &str, text: &str) -> Vec<Chunk> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    // (first line of the heading, lines the heading itself occupies, level, title)
+    let mut headings: Vec<(usize, usize, usize, String)> = Vec::new();
+    let mut rst_ranks: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some((level, title, span)) = prose_heading(rel, &lines, i) {
+            let level = if level >= 1000 {
+                // RST: rank underline characters by first appearance.
+                if !rst_ranks.contains(&level) {
+                    rst_ranks.push(level);
+                }
+                rst_ranks.iter().position(|l| *l == level).unwrap() + 1
+            } else {
+                level
+            };
+            // An RST overline belongs to the heading above the title.
+            let start = if span == 2 { i - 1 } else { i };
+            headings.push((start, span, level, title));
+            i += if span == 2 { 2 } else { 1 };
+            continue;
+        }
+        i += 1;
+    }
+    let mut chunks = Vec::new();
+    // Everything before the first heading (a preamble, front matter).
+    let first_heading = headings.first().map(|h| h.0).unwrap_or(lines.len());
+    if first_heading > 0 {
+        push_windowed(&mut chunks, rel, &lines, 0, first_heading, None, None, None);
+    }
+    // Enclosing headings by level, for the parent of each section.
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    for (idx, (start, _span, level, title)) in headings.iter().enumerate() {
+        let end = headings.get(idx + 1).map(|h| h.0).unwrap_or(lines.len());
+        while stack.last().is_some_and(|(l, _)| *l >= *level) {
+            stack.pop();
+        }
+        let parent = stack.last().map(|(_, t)| t.clone());
+        push_windowed(
+            &mut chunks,
+            rel,
+            &lines,
+            *start,
+            end,
+            Some(title.clone()),
+            Some("section".to_string()),
+            parent,
+        );
+        stack.push((*level, title.clone()));
+    }
+    chunks
+}
+
 /// The user's global git ignore file(s): `core.excludesFile` when set in
 /// `~/.gitconfig` or `$XDG_CONFIG_HOME/git/config`, else git's default
 /// `~/.config/git/ignore`. A minimal INI scan — no `git` subprocess, so
@@ -937,6 +1266,10 @@ pub fn chunk_files(files: &[SourceFile]) -> anyhow::Result<Vec<Chunk>> {
                 let bytes = fs::read(&file.abs).with_context(|| format!("read {}", file.abs.display()))?;
                 return Ok(crate::office::extract(&file.abs, &bytes).map(|doc| doc.chunks(&file.rel)).unwrap_or_default());
             }
+            if crate::notebook::is_notebook(&file.rel) {
+                let bytes = fs::read(&file.abs).with_context(|| format!("read {}", file.abs.display()))?;
+                return Ok(crate::notebook::extract(&file.abs, &bytes).map(|nb| nb.chunks(&file.rel)).unwrap_or_default());
+            }
             match fs::read_to_string(&file.abs) {
                 Ok(text) => Ok(chunk_source(&file.rel, &text)),
                 // Binary or non-UTF-8: skip it, as the walker's extension
@@ -952,11 +1285,15 @@ pub fn chunk_files(files: &[SourceFile]) -> anyhow::Result<Vec<Chunk>> {
 }
 
 /// Chunk one file: grammar-aware when a tree-sitter grammar covers it and
-/// finds definitions, the keyword heuristic otherwise.
+/// finds definitions, heading-aware for prose, the keyword heuristic
+/// otherwise.
 pub fn chunk_source(rel: &str, text: &str) -> Vec<Chunk> {
     #[cfg(feature = "treesitter")]
     if let Some(chunks) = crate::treesit::chunk(rel, text) {
         return chunks;
+    }
+    if is_prose(rel) {
+        return chunk_prose(rel, text);
     }
     chunk_text(rel, text)
 }
@@ -1117,6 +1454,17 @@ mod tests {
         assert!(glob_match("**/*.log", "a/b/debug.log"));
         assert!(glob_match("build", "build"));
 
+        // Brace alternation is for caller-supplied path filters only.
+        assert_eq!(expand_braces("**/*.{tex,rs}"), ["**/*.tex", "**/*.rs"]);
+        assert_eq!(expand_braces("{a,b}/x.{c,d}"), ["a/x.c", "a/x.d", "b/x.c", "b/x.d"]);
+        assert_eq!(expand_braces("plain.rs"), ["plain.rs"]);
+        assert_eq!(expand_braces("odd{x}.rs"), ["odd{x}.rs"]);
+        assert_eq!(expand_braces("open{a,b"), ["open{a,b"]);
+        assert!(path_glob_match("**/*.{tex,rs}", "ch/7.Results.tex"));
+        assert!(path_glob_match("**/*.{tex,rs}", "src/main.rs"));
+        assert!(!path_glob_match("**/*.{tex,rs}", "src/main.py"));
+        assert!(!glob_match("**/*.{tex,rs}", "src/main.rs"), "gitignore matcher stays literal");
+
         let mut set = IgnoreSet::default();
         set.layers.push((
             String::new(),
@@ -1126,6 +1474,104 @@ mod tests {
         assert!(!set.is_ignored("target", false), "dir-only rule");
         assert!(set.is_ignored("src/a.tmp", false));
         assert!(!set.is_ignored("src/keep.tmp", false), "negation wins");
+    }
+
+    #[test]
+    fn prose_and_recipes_are_source() {
+        for name in ["thesis.tex", "notes.rst", "README.txt", "guide.adoc", "analysis.ipynb", "index.html",
+                     "site.scss", "schema.graphql", "Makefile", "Dockerfile", "Justfile"] {
+            assert!(is_source(name), "{name}");
+        }
+        for name in ["data.json", "image.png", "archive.zip", "Unknownfile", "LICENSE"] {
+            assert!(!is_source(name), "{name}");
+        }
+        assert!(is_prose("a.tex") && is_prose("A.TXT") && !is_prose("a.rs"));
+        assert_eq!(max_file_bytes("nb.ipynb"), crate::notebook::MAX_BYTES);
+    }
+
+    #[test]
+    fn unindexed_extensions_explain_an_empty_scope() {
+        assert_eq!(unindexed_extensions("**/*.json"), ["json"]);
+        assert_eq!(unindexed_extensions("docs/**/*.{tex,json,csv}"), ["json", "csv"]);
+        assert_eq!(unindexed_extensions("src/**/*.rs"), Vec::<String>::new());
+        assert_eq!(unindexed_extensions("src/**"), Vec::<String>::new());
+        assert_eq!(unindexed_extensions("03-simulation/*.py"), Vec::<String>::new());
+        assert_eq!(unindexed_extensions("lib/*.PNG"), ["png"]);
+    }
+
+    #[test]
+    fn declaration_less_files_are_windowed_not_truncated() {
+        // 300 long lines: the old fixed 200-line slab lost everything past
+        // 8 KiB of each slab. Every line must now land in some chunk.
+        let text: String = (0..300).map(|i| format!("key{i} = \"{}\"\n", "v".repeat(100))).collect();
+        let chunks = chunk_text("settings.toml", &text);
+        assert!(chunks.len() > 2, "{}", chunks.len());
+        let mut next = 1;
+        for c in &chunks {
+            assert_eq!(c.start_line, next, "gap before {}", c.id());
+            assert!(c.body.len() <= MAX_CHUNK_BYTES);
+            assert_eq!(c.body.lines().count(), c.end_line - c.start_line + 1);
+            next = c.end_line + 1;
+        }
+        assert_eq!(next, 301);
+        assert!(chunks.last().unwrap().body.contains("key299"));
+    }
+
+    #[test]
+    fn tex_chunks_by_section_with_parents() {
+        let text = "\\documentclass{article}\n\\begin{document}\n\
+                    \\chapter{Evaluation}\nIntro.\n\n\
+                    \\section{Equivalence testing}\nTOST with margin $\\Delta = 0.02$.\n\n\
+                    \\subsection*{Holm \\emph{family}}\nCorrection details.\n\
+                    \\section{Latency}\nNumbers.\n\\end{document}\n";
+        let chunks = chunk_source("thesis/eval.tex", text);
+        let titles: Vec<String> = chunks.iter().map(|c| c.title()).collect();
+        assert_eq!(
+            titles,
+            [
+                "thesis/eval.tex",
+                "thesis/eval.tex::Evaluation",
+                "thesis/eval.tex::Evaluation::Equivalence testing",
+                "thesis/eval.tex::Equivalence testing::Holm family",
+                "thesis/eval.tex::Evaluation::Latency",
+            ],
+            "{titles:?}"
+        );
+        assert_eq!(chunks[2].start_line, 6);
+        assert!(chunks[2].body.contains("TOST"));
+        assert_eq!(chunks[2].kind.as_deref(), Some("section"));
+        // The whole file is covered in order.
+        let mut next = 1;
+        for c in &chunks {
+            assert_eq!(c.start_line, next);
+            next = c.end_line + 1;
+        }
+        assert_eq!(next, text.lines().count() + 1);
+    }
+
+    #[test]
+    fn rst_adoc_and_plain_text_prose() {
+        let rst = "Title\n=====\n\nIntro.\n\nMethods\n-------\n\nDetails.\n\n~~~~~~~~~~\nOverlined\n~~~~~~~~~~\n\nMore.\n";
+        let chunks = chunk_source("docs/guide.rst", rst);
+        let names: Vec<Option<&str>> = chunks.iter().map(|c| c.name.as_deref()).collect();
+        assert_eq!(names, [Some("Title"), Some("Methods"), Some("Overlined")], "{names:?}");
+        assert_eq!(chunks[1].parent.as_deref(), Some("Title"));
+        assert_eq!(chunks[2].start_line, 11, "overline belongs to its heading");
+
+        let adoc = "= Book\n\nPreface.\n\n== Install\n\nSteps.\n";
+        let chunks = chunk_source("README.adoc", adoc);
+        assert_eq!(chunks[1].title(), "README.adoc::Book::Install");
+
+        // Plain text: paragraph-bounded windows, no fake declarations.
+        let para = format!("{}\n\n", "class struct fn def words ".repeat(20));
+        let txt: String = para.repeat(40);
+        let chunks = chunk_source("notes.txt", &txt);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.name.is_none()), "prose has no keyword declarations");
+        assert!(chunks.iter().all(|c| c.body.len() <= PROSE_CHUNK_BYTES + 600));
+        // Windows end at paragraph boundaries.
+        assert!(chunks.iter().take(chunks.len() - 1).all(|c| c.body.trim_end().ends_with("words")),
+            "{:?}", chunks.iter().map(|c| c.body.lines().last().unwrap_or("")).collect::<Vec<_>>());
     }
 }
 

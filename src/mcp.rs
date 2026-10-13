@@ -309,7 +309,7 @@ impl Server {
                         },
                         "path_glob": {
                             "type": "string",
-                            "description": "Optional glob over the repo-relative path, e.g. `src/**/*.rs`."
+                            "description": "Optional glob over the repo-relative path, e.g. `src/**/*.rs` or `docs/*.md`. Ranking runs within the matching files only; a glob that selects no indexed file is reported as such."
                         },
                         "include_snippet": {
                             "type": "boolean",
@@ -562,30 +562,42 @@ impl Server {
 
         let repaired_embeddings = self.ensure_fresh(mode != Some("lexical"))?;
 
-        // A path filter is applied after retrieval, so over-fetch to keep
-        // `top_k` results reachable through the filter.
-        let mut fetch = if path_glob.is_some() {
-            top_k.saturating_mul(8)
-        } else {
-            top_k
-        };
         let started = std::time::Instant::now();
         let effective_mode = mode.unwrap_or(if self.hybrid_enabled() { "hybrid" } else { "lexical" });
+        // A path filter is a document scope applied inside retrieval (see
+        // `scope.rs`): BM25 and the vector pool only ever see in-scope
+        // documents, so the top-k is exact within the scope and score
+        // normalization is not distorted by out-of-scope hits. A glob that
+        // matches no indexed file is reported as such instead of as an
+        // empty result the caller would keep rephrasing against.
+        let (scope, scope_cached) = match path_glob.as_deref() {
+            Some(glob) => {
+                let (scope, cached) = self.index()?.scope_for_glob(glob);
+                if scope.matched() == 0 {
+                    let text = self.unmatched_scope_message(glob);
+                    self.log_search(&query, mode, top_k, path_glob.as_deref(), &[], started);
+                    self.last_search = Some(json!({
+                        "requested_mode": mode.unwrap_or("auto"),
+                        "effective_mode": effective_mode,
+                        "success": true,
+                        "path_glob": path_glob,
+                        "scope_matched": 0,
+                        "scope_cached": cached,
+                        "hits": [],
+                    }));
+                    self.structured = structured.then(|| json!({
+                        "root": self.config.root, "mode": effective_mode, "hits": [],
+                        "path_glob": path_glob, "scope_matched": 0,
+                    }));
+                    return Ok(text);
+                }
+                (Some(scope), cached)
+            }
+            None => (None, false),
+        };
         let query_cache_hit = effective_mode != "lexical" && self.indexer.query_cached(&query);
         let disk_hits_before = self.indexer.encoder_diagnostics()["query_disk_hits"].as_u64().unwrap_or(0);
-        // A global cutoff cannot prove that a scoped query has no matches.
-        // Expand until the scope has enough hits or every document was eligible.
-        let total_docs = self.index()?.num_docs() as usize;
-        fetch = fetch.min(total_docs).max(1);
-        let hits = loop {
-            let hits = self.retrieve(&query, fetch, mode)?;
-            let scoped = hits.iter().filter(|h| path_glob.as_ref()
-                .is_none_or(|glob| repo::glob_match(glob, &h.path))).count();
-            if path_glob.is_none() || scoped >= top_k || fetch >= total_docs {
-                break hits;
-            }
-            fetch = fetch.saturating_mul(2).min(total_docs);
-        };
+        let hits = self.retrieve(&query, top_k, mode, scope.as_deref())?;
         anyhow::ensure!(hits.iter().all(|h| h.score.is_finite() &&
             h.components.is_none_or(|(b, s)| b.is_finite() && s.is_finite())),
             "search returned non-finite scores; results withheld");
@@ -593,31 +605,8 @@ impl Server {
         // already be on disk even though no resident encoder existed above.
         let query_cache_hit = query_cache_hit || (effective_mode != "lexical"
             && self.indexer.encoder_diagnostics()["query_disk_hits"].as_u64().unwrap_or(0) > disk_hits_before);
-        let hits: Vec<Hit> = hits
-            .into_iter()
-            .filter(|h| match &path_glob {
-                Some(glob) => repo::glob_match(glob, &h.path),
-                None => true,
-            })
-            .take(top_k)
-            .collect();
-        usagelog::record(&usagelog::UsageEvent {
-            ts: usagelog::now_secs(),
-            source: "mcp",
-            agent: usagelog::detect_agent(),
-            cwd: usagelog::cwd_string(),
-            root: usagelog::path_string(Some(&self.config.root)),
-            index_dir: self.config.index_dir.to_string_lossy().to_string(),
-            query: &query,
-            mode: mode
-                .map(str::to_string)
-                .unwrap_or_else(|| if self.hybrid_enabled() { "hybrid" } else { "lexical" }.to_string()),
-            top_k,
-            path_glob: path_glob.as_deref(),
-            n_hits: hits.len(),
-            took_ms: started.elapsed().as_secs_f64() * 1e3,
-            hits: hits.iter().map(|h| h.id.clone()).collect(),
-        });
+        debug_assert!(hits.iter().all(|h| path_glob.as_ref().is_none_or(|g| repo::path_glob_match(g, &h.path))));
+        self.log_search(&query, mode, top_k, path_glob.as_deref(), &hits, started);
 
         self.last_search = Some(json!({
             "requested_mode": mode.unwrap_or("auto"),
@@ -627,6 +616,8 @@ impl Server {
             "repaired_embeddings": repaired_embeddings,
             "retrieval_ms": started.elapsed().as_secs_f64() * 1000.0,
             "path_glob": path_glob,
+            "scope_matched": scope.as_ref().map(|s| s.matched()),
+            "scope_cached": path_glob.as_ref().map(|_| scope_cached),
             "hits": hits.iter().map(|h| json!({
                 "path": h.path, "start_line": h.start_line, "end_line": h.end_line,
                 "score": h.score,
@@ -668,14 +659,20 @@ impl Server {
     }
 
     /// Run the configured retrieval mode and normalize to [`Hit`].
-    fn retrieve(&self, query: &str, k: usize, mode: Option<&str>) -> anyhow::Result<Vec<Hit>> {
+    fn retrieve(
+        &self,
+        query: &str,
+        k: usize,
+        mode: Option<&str>,
+        scope: Option<&crate::scope::DocScope>,
+    ) -> anyhow::Result<Vec<Hit>> {
         let lexical = match mode {
             Some("lexical") | Some("bm25") => true,
             Some(_) => false,
             None => !self.hybrid_enabled(),
         };
         if lexical {
-            let outcome = self.index()?.search(query, k);
+            let outcome = self.index()?.search_scoped(query, k, scope);
             return Ok(outcome
                 .results
                 .into_iter()
@@ -686,7 +683,60 @@ impl Server {
             self.hybrid_enabled(),
             "semantic retrieval is disabled or this index has no embeddings; pass mode=\"lexical\" or rebuild with embeddings"
         );
-        self.retrieve_ranked(query, k, mode)
+        self.retrieve_ranked(query, k, mode, scope)
+    }
+
+    /// One usage-log line per `search_code` call, hits or not.
+    fn log_search(
+        &self,
+        query: &str,
+        mode: Option<&str>,
+        top_k: usize,
+        path_glob: Option<&str>,
+        hits: &[Hit],
+        started: std::time::Instant,
+    ) {
+        usagelog::record(&usagelog::UsageEvent {
+            ts: usagelog::now_secs(),
+            source: "mcp",
+            agent: usagelog::detect_agent(),
+            cwd: usagelog::cwd_string(),
+            root: usagelog::path_string(Some(&self.config.root)),
+            index_dir: self.config.index_dir.to_string_lossy().to_string(),
+            query,
+            mode: mode
+                .map(str::to_string)
+                .unwrap_or_else(|| if self.hybrid_enabled() { "hybrid" } else { "lexical" }.to_string()),
+            top_k,
+            path_glob,
+            n_hits: hits.len(),
+            took_ms: started.elapsed().as_secs_f64() * 1e3,
+            hits: hits.iter().map(|h| h.id.clone()).collect(),
+        });
+    }
+
+    /// Why a scoped query had nothing to search: the glob selects no indexed
+    /// file. Names the unindexed extension when the glob asks for one, so
+    /// the caller stops rephrasing and changes the scope instead.
+    fn unmatched_scope_message(&self, glob: &str) -> String {
+        let mut text = format!(
+            "No matches: `{glob}` selects none of the {} indexed files under {}.\n",
+            self.manifest.num_files,
+            self.config.root.display()
+        );
+        let unindexed = repo::unindexed_extensions(glob);
+        if !unindexed.is_empty() {
+            let list = unindexed.iter().map(|e| format!("`.{e}`")).collect::<Vec<_>>().join(", ");
+            text.push_str(&format!(
+                "{list} files are not indexed by hips (source code, Markdown, TeX/RST/AsciiDoc/plain text, \
+                 notebooks, PDF and Office documents are).\n"
+            ));
+        }
+        text.push_str(
+            "Globs match repo-relative paths (`src/**/*.rs`, `docs/*.md`); gitignored and hidden paths, \
+             empty files and files over the size cap are never indexed. Widen the glob or drop it.\n",
+        );
+        text
     }
 
     #[cfg(feature = "semantic")]
@@ -695,6 +745,7 @@ impl Server {
         query: &str,
         k: usize,
         mode: Option<&str>,
+        scope: Option<&crate::scope::DocScope>,
     ) -> anyhow::Result<Vec<Hit>> {
         let mut opts = self.config.search;
         opts.mode = match mode {
@@ -703,7 +754,7 @@ impl Server {
             _ => crate::query::RankMode::Hybrid,
         };
         let embedder = self.indexer.embedder()?;
-        let run = crate::query::run_ranked_with(self.index()?, embedder, query, k, &opts)?;
+        let run = crate::query::run_ranked_scoped(self.index()?, embedder, query, k, &opts, scope)?;
         Ok(run
             .results
             .into_iter()
@@ -717,6 +768,7 @@ impl Server {
         _query: &str,
         _k: usize,
         _mode: Option<&str>,
+        _scope: Option<&crate::scope::DocScope>,
     ) -> anyhow::Result<Vec<Hit>> {
         anyhow::bail!("this binary was built without CodeRankEmbed; use mode=\"lexical\"")
     }
@@ -1065,8 +1117,44 @@ mod freshness_regression_tests {
         let mut server = Server::start(lexical_config(root, temp.path().join("index"), false, true)).unwrap();
         let text = server.tool_search(&json!({"query":"needle", "top_k":1, "path_glob":"z.rs", "mode":"lexical"})).unwrap();
         assert!(text.contains("1. z.rs:"), "{text}");
+        assert_eq!(server.last_search.as_ref().unwrap()["scope_matched"], 1);
+        assert_eq!(server.last_search.as_ref().unwrap()["scope_cached"], false);
+        // The same glob again is served from the handle's resolved scopes.
+        server.tool_search(&json!({"query":"needle", "top_k":1, "path_glob":"z.rs", "mode":"lexical"})).unwrap();
+        assert_eq!(server.last_search.as_ref().unwrap()["scope_cached"], true);
+        // An edit reopens the index, and with it the scopes: the new file is
+        // in scope and the glob is resolved afresh.
+        std::fs::write(server.config.root.join("z2.rs"), "fn needle() {}\n").unwrap();
+        server.refresh_pending = true;
+        let text = server.tool_search(&json!({"query":"needle", "top_k":5, "path_glob":"z*.rs", "mode":"lexical"})).unwrap();
+        assert!(text.contains("z2.rs:1-1"), "{text}");
+        assert_eq!(server.last_search.as_ref().unwrap()["scope_matched"], 2);
+        assert_eq!(server.last_search.as_ref().unwrap()["scope_cached"], false);
         let absent = server.tool_search(&json!({"query":"needle", "top_k":1, "path_glob":"missing.rs", "mode":"lexical"})).unwrap();
         assert!(absent.contains("No matches"));
+        assert!(absent.contains("`missing.rs` selects none of the 26 indexed files"), "{absent}");
+    }
+
+    #[test]
+    fn glob_selecting_no_indexed_file_names_the_unindexed_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(root.join("data.json"), "{\"needle\": true}\n").unwrap();
+        let mut server = Server::start(lexical_config(root, temp.path().join("index"), false, true)).unwrap();
+        // The file exists in the tree but its type is never indexed: say so,
+        // instead of returning an empty list the caller keeps rephrasing against.
+        let text = server.tool_search(&json!({"query":"needle", "path_glob":"**/*.json", "mode":"lexical"})).unwrap();
+        assert!(text.contains("No matches: `**/*.json` selects none of the 1 indexed files"), "{text}");
+        assert!(text.contains("`.json` files are not indexed"), "{text}");
+        assert_eq!(server.last_search.as_ref().unwrap()["scope_matched"], 0);
+        // Brace alternatives are expanded; indexed extensions are not blamed.
+        let text = server.tool_search(&json!({"query":"needle", "path_glob":"docs/**/*.{tex,json}", "mode":"lexical"})).unwrap();
+        assert!(text.contains("`.json` files are not indexed") && !text.contains(".tex`"), "{text}");
+        // A scope with files but no lexical match is an ordinary empty result.
+        let text = server.tool_search(&json!({"query":"zebra", "path_glob":"a.rs", "mode":"lexical"})).unwrap();
+        assert!(text.contains("No matches for \"zebra\"") && !text.contains("selects none"), "{text}");
     }
 
     #[test]

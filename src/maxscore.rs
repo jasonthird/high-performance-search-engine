@@ -102,6 +102,19 @@ pub fn search<I: SearchableIndex + ?Sized>(
         if candidate == u32::MAX {
             break; // essential lists exhausted
         }
+        // A hidden candidate (out of the query scope) is skipped without
+        // scoring, together with every hidden document up to the next
+        // admitted one: documents before the candidate occur only in
+        // non-essential lists, whose summed bounds cannot clear the
+        // threshold, and documents between the two are hidden. So every
+        // cursor may seek straight to the admitted document.
+        let admitted = index.next_live(candidate);
+        if admitted != candidate {
+            for cursor in cursors.iter_mut() {
+                cursor.seek(admitted, &mut stats);
+            }
+            continue;
+        }
 
         // Gather contributions from every cursor already positioned on the
         // candidate (essential or not), advancing them past it. No cursor

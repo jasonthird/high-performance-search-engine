@@ -50,6 +50,15 @@ pub trait SearchableIndex: Sync {
     fn is_deleted(&self, _doc_id: u32) -> bool {
         false
     }
+    /// Smallest document at or after `doc` that a query may return, or
+    /// `u32::MAX` when none remains. A query scope answers from its bitmap,
+    /// so the evaluators seek straight past hidden documents instead of
+    /// scoring them; the default admits every document and leaves
+    /// tombstones to `is_deleted` after scoring. An override must never
+    /// skip a document `is_deleted` would admit.
+    fn next_live(&self, doc: u32) -> u32 {
+        doc
+    }
     fn total_postings(&self) -> u64;
     /// Posting data for one term, or None if the term is not in the index.
     fn term_postings(&self, term: &str) -> Option<TermPostings<'_>>;

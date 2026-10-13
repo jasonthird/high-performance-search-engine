@@ -19,7 +19,11 @@ If MCP is unavailable or serves a different repository, use the CLI with an
 explicit `--root`. Check the MCP root in its tool description or `index_status`
 when uncertain; a server does not follow shell `cd`. Pass `expected_root`
 with the absolute indexed repository root to reject mismatches. Use
-`path_glob` to restrict MCP results to a subtree.
+`path_glob` to rank within a subtree or file type (`src/**`, `**/*.{tex,md}`):
+it is a true filter, so the results are the best matches among those files.
+If the reply says the glob selects no indexed file, widen or drop the glob
+instead of rephrasing the query; it also names any extension hips never
+indexes.
 
 Open the top 1–3 returned `path:startLine-endLine` locations. Refine a query
 if needed; use grep for a known exact literal or when hips returns no relevant

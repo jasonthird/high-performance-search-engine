@@ -99,6 +99,9 @@ struct SegmentView<'a> {
     /// Global idf per query term (df summed across segments).
     idfs: &'a HashMap<String, f32>,
     remove_stopwords: bool,
+    /// Query scope bitmap (see [`crate::scope`]); `None` means every live
+    /// document is eligible.
+    allowed: Option<&'a [u64]>,
 }
 
 impl SearchableIndex for SegmentView<'_> {
@@ -128,6 +131,16 @@ impl SearchableIndex for SegmentView<'_> {
 
     fn is_deleted(&self, doc_id: u32) -> bool {
         self.segment.is_deleted(doc_id)
+            || self
+                .allowed
+                .is_some_and(|words| !crate::scope::bit_is_set(words, doc_id))
+    }
+
+    fn next_live(&self, doc: u32) -> u32 {
+        match self.allowed {
+            Some(words) => crate::scope::next_set_bit(words, doc),
+            None => doc,
+        }
     }
 
     fn total_postings(&self) -> u64 {
@@ -326,7 +339,12 @@ impl SegmentedIndex {
     /// statistics, and merge-sort-truncate the per-segment top-k heaps.
     /// Returns the merged (segment, doc_id, score) triples plus aggregated
     /// engine statistics.
-    fn search_core(&self, query: &str, k: usize) -> (Vec<(usize, u32, f32)>, SearchStats) {
+    fn search_core(
+        &self,
+        query: &str,
+        k: usize,
+        scope: Option<&crate::scope::DocScope>,
+    ) -> (Vec<(usize, u32, f32)>, SearchStats) {
         let remove_stopwords = self.manifest.remove_stopwords;
         let tokenizer = Tokenizer::with_flags(remove_stopwords, self.manifest.code_mode);
         let mut terms: Vec<String> = Vec::new();
@@ -361,6 +379,7 @@ impl SegmentedIndex {
                     avg_doc_len_global,
                     idfs: &idfs,
                     remove_stopwords,
+                    allowed: scope.map(|s| s.segment_bits(si)),
                 };
                 let (hits, stats) = if terms.len() >= MAXSCORE_MIN_TERMS {
                     maxscore::search(&view, &terms, k)
@@ -400,7 +419,7 @@ impl SegmentedIndex {
     /// (hybrid fusion) that need scores joined with other per-document
     /// signals before summaries are materialized.
     pub fn search_hits_raw(&self, query: &str, k: usize) -> Vec<(usize, u32, f32)> {
-        self.search_core(query, k).0
+        self.search_core(query, k, None).0
     }
 
     /// As [`Self::search_hits_raw`], also returning the aggregated engine
@@ -410,7 +429,37 @@ impl SegmentedIndex {
         query: &str,
         k: usize,
     ) -> (Vec<(usize, u32, f32)>, SearchStats) {
-        self.search_core(query, k)
+        self.search_core(query, k, None)
+    }
+
+    /// As [`Self::search_hits_raw_with_stats`], restricted to a document
+    /// scope: the exact top-k among in-scope live documents.
+    pub fn search_hits_raw_scoped(
+        &self,
+        query: &str,
+        k: usize,
+        scope: Option<&crate::scope::DocScope>,
+    ) -> (Vec<(usize, u32, f32)>, SearchStats) {
+        self.search_core(query, k, scope)
+    }
+
+    /// The scope of every live document whose path `accept`s, using the
+    /// index-lifetime [`crate::scope::PathIndex`] passed in.
+    pub fn scope_with(
+        &self,
+        paths: &crate::scope::PathIndex,
+        accept: &(dyn Fn(&str) -> bool + Sync),
+    ) -> crate::scope::DocScope {
+        paths.scope(accept, &|si| self.segments[si].deleted.as_slice())
+    }
+
+    /// Where each file's chunks live, built with one pass over the doc
+    /// stores. Kept by the reader handle (`AnyIndex`), not here.
+    pub fn path_index(&self) -> crate::scope::PathIndex {
+        let sizes: Vec<u32> = self.segments.iter().map(|s| s.entry.num_docs).collect();
+        crate::scope::PathIndex::build(&sizes, &|si, range, f| {
+            self.segments[si].index.for_each_doc_id_in(range, f)
+        })
     }
 
     /// Per-segment directory names, in manifest (and doc-compaction) order.
@@ -438,8 +487,18 @@ impl SegmentedIndex {
     }
 
     pub fn search(&self, query: &str, k: usize) -> SearchOutcome {
+        self.search_scoped(query, k, None)
+    }
+
+    /// As [`Self::search`], restricted to a document scope.
+    pub fn search_scoped(
+        &self,
+        query: &str,
+        k: usize,
+        scope: Option<&crate::scope::DocScope>,
+    ) -> SearchOutcome {
         let start = Instant::now();
-        let (merged, stats) = self.search_core(query, k);
+        let (merged, stats) = self.search_core(query, k, scope);
         let results = merged
             .into_iter()
             .map(|(si, doc_id, score)| {

@@ -10,8 +10,9 @@
 (union_item
     name: (type_identifier) @name) @definition.class
 
+; A type alias is a `type`, as in the other grammars; runs of aliases merge.
 (type_item
-    name: (type_identifier) @name) @definition.class
+    name: (type_identifier) @name) @definition.type
 
 (declaration_list
     (function_item

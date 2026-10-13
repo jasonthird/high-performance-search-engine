@@ -171,9 +171,16 @@ cargo run --release -- repl --index ./index --top-k 10
   validation before publication) shared by the grammar loader and the
   model fetch.
 - `src/repo.rs`, `src/treesit.rs`, `src/grammar.rs`, `src/codeindex.rs`,
-  `tree-sitters/` - repository walking, declaration chunking across 41 grammar
-  variants, lazy library loading, embedded definition queries, heuristic
-  fallback, PDF pages, and incremental segmented rebuilds.
+  `src/notebook.rs`, `tree-sitters/` - repository walking, declaration
+  chunking across 41 grammar variants, lazy library loading, embedded
+  definition queries, heading-aware prose chunks (TeX, RST, AsciiDoc, Org,
+  plain text), heuristic fallback, PDF pages, notebook cells, and
+  incremental segmented rebuilds.
+- `src/scope.rs` - query-time document scopes: the MCP `path_glob` as a
+  per-segment bitmap applied inside the evaluators, so a scoped top-k is
+  exact and fusion normalizes over in-scope candidates only; a
+  file-to-doc-run map built once per opened index keeps resolving a glob
+  cheaper than an unscoped query.
 - `packaging/arch/` - the Arch Linux `PKGBUILD`; `.cargo/config.toml` -
   the GCC flag the Haskell grammar needs on Linux (see
   [grammar packaging](grammars/README.md)).
@@ -791,14 +798,34 @@ definition's span, plus the comment block above it (across one blank
 line), is a cut point; the segments between cut points become chunks. A
 nested definition is its own chunk with `parent` set, so a method's title
 is `path::Class::method`; the class chunk keeps its header and fields. A
-closing brace after the last method joins the chunk before it. Runs of
-bodyless one-liners of header-like kinds — prototypes in C headers,
-`#define`s, typedefs — merge into chunks of up to 24 lines so a header does
-not become a thousand documents, while one-line functions in
-expression-bodied languages (OCaml, Haskell, Kotlin) stay separate. A
-file with no grammar, or whose parse yields no definitions, falls through
-to the keyword heuristic that preceded all this, so the worst case is what
-hips did before.
+closing brace after the last method joins the chunk before it. An `impl`
+block whose header segment is nothing but the header (`impl Tokenizer {`,
+every method already its own unit) is folded into its first method rather
+than becoming a one-line document: short and carrying the type name in its
+title, such chunks outranked the real code for that name, and in this
+repository they were a tenth of all chunks. Runs of bodyless one-liners of
+header-like kinds — prototypes in C headers, `#define`s, typedefs, type
+aliases, `pub mod x;` lines — merge into chunks of up to 24 lines so a
+header or crate root does not become a thousand documents, while one-line
+functions in expression-bodied languages (OCaml, Haskell, Kotlin) stay
+separate. A file with no grammar, or whose parse yields no definitions,
+falls through to the keyword heuristic that preceded all this, so the worst
+case is what hips did before. A file with no declarations at all
+(configuration, data) is cut into windows bounded by both lines and bytes
+at blank lines; the former fixed 200-line slabs were truncated at 8 KiB,
+which silently dropped the tail of every long-lined file from the index.
+
+Prose is chunked by heading instead: TeX sectioning commands, RST
+underlined titles, AsciiDoc and Org headings, and Markdown headings when
+the grammar is unavailable. A section chunk is named after its heading and
+parented by the enclosing one (`thesis.tex::Evaluation::Equivalence
+testing`); long sections split into paragraph-bounded windows of about 4
+KiB, so the encoder sees most of every chunk. Plain `.txt` files are just
+the windows. Jupyter notebooks (`.ipynb`) index one chunk per code or
+Markdown cell, parented by the latest Markdown heading
+(`analysis.ipynb::Training loop::cell 7`); outputs, attachments and
+metadata are never read, and line numbers refer to the extracted cell text
+as they do for Office documents.
 
 Measured against that heuristic on real checkouts (unnamed = chunks
 carrying no declaration name; lines = per-chunk size):
@@ -892,6 +919,15 @@ the same incremental updates and ignore rules as source files, with a 64 MiB
 file limit. Malformed or encrypted documents are skipped with a warning.
 Formulas use saved values; macros and external links are never executed.
 Images/OCR and legacy `.doc`/`.ppt` files are not supported.
+
+What is walked is decided by extension (`repo::SOURCE_EXTS`) plus a few
+extensionless recipes (`Makefile`, `Dockerfile`, `Justfile`, ...): source
+code in every grammar's languages and common others, Markdown, TeX and
+BibTeX, RST, AsciiDoc, Org, plain `.txt`, notebooks, HTML/CSS/SCSS,
+GraphQL and Prisma schemas, TOML/YAML/INI, PDF and Office documents. JSON,
+XML, CSV and other data formats are deliberately not indexed (lockfiles
+and fixtures would swamp the ranking); a scoped MCP query that asks for one
+of them is told so rather than handed an empty list.
 
 Every `hips search` and MCP `search_code` call appends one JSON line
 (timestamp, calling agent, root, query, mode, hit ids, latency) to
@@ -1095,6 +1131,33 @@ belongs to another root, so snippets cannot be read from an unrelated tree.
 Use `path_glob` to filter within the pinned repository; it does not switch
 repositories. Debug diagnostics can contain local paths and error details;
 they are returned only when requested.
+
+`path_glob` is a document scope, not a post-filter. The glob (`src/**`,
+`docs/*.md`, `**/*.{tex,rs}` — brace alternation is expanded) is resolved
+into a per-segment bitmap of matching live chunks (`src/scope.rs`), and
+that bitmap is applied inside the evaluators the way tombstones are:
+Block-Max WAND and MaxScore never score an out-of-scope document — a hidden
+pivot makes every cursor leap to the next admitted document, so a sparse
+scope means *fewer* postings touched, not more — the vector pool never
+returns one, and hybrid fusion normalizes BM25 over in-scope candidates
+only. The result is the exact top-k among the files the glob selects, and
+a scoped query is cheaper than an unscoped one, as a filter should be.
+Resolving the glob is cheap because the reader handle learns once, on its
+first scoped query, where every file's chunks live (one pass over the doc
+store, kept until the index is reopened); a glob is then one match per
+*file* plus word-wise bit fills, and the last eight globs' bitmaps are kept
+with the handle, since an agent's burst repeats one glob. Measured on a
+296k-chunk, 11.7k-file index: 0.16 ms unscoped, 0.04–0.08 ms scoped to a
+crate or to `**/*.md` (a tenth of the postings visited), 8 ms once for the
+file map. Earlier versions ranked the whole repository and filtered
+afterwards, over-fetching up to the whole index to get there; the in-scope
+hits then carried BM25 scores normalized against out-of-scope ones. A glob
+that selects no indexed file at all is answered with that fact — and with
+the extension's name when the glob asks for a type hips never indexes — so
+an agent widens the scope instead of rephrasing the query; the usage log
+for this repository's author showed nine consecutive rephrasings against
+`**/*.tex` before TeX was indexed. `last_search.scope_matched` and
+`scope_cached` report the scope size and whether it was reused.
 
 Older versions could persist invalid document embeddings after native runtime
 failure: warmup errors were ignored and CoreML outputs were checked for shape,

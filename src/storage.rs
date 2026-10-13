@@ -640,6 +640,20 @@ impl DiskIndex {
             .unwrap_or(u64::MAX)
     }
 
+    /// Visit the external id of every document in `range` without
+    /// materializing titles: the scope builder runs this over the whole
+    /// index per scoped query, so it borrows straight from the doc store.
+    pub fn for_each_doc_id_in(&self, range: std::ops::Range<u32>, f: &mut dyn FnMut(u32, &str)) {
+        let offsets = self.u64s(S_DOC_OFFSETS);
+        let bytes = &self.docs[..];
+        let end = range.end.min(self.num_docs as u32);
+        for doc in range.start..end {
+            let pos = offsets[doc as usize] as usize;
+            let len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+            f(doc, &String::from_utf8_lossy(&bytes[pos + 2..pos + 2 + len]));
+        }
+    }
+
     /// Raw docs.bin record for one document (for segment merging).
     pub(crate) fn doc_record_bytes(&self, doc_id: u32) -> &[u8] {
         let offsets = self.u64s(S_DOC_OFFSETS);

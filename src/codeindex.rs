@@ -53,8 +53,10 @@ pub struct Manifest {
 }
 
 /// Bumped whenever chunk boundaries or names can change for unchanged
-/// files: 1 was the keyword heuristic, 2 added tree-sitter grammars.
-pub const CHUNKER_VERSION: u32 = if cfg!(feature = "treesitter") { 2 } else { 1 };
+/// files: 1 was the keyword heuristic, 2 added tree-sitter grammars, 3/4
+/// added heading-aware prose chunks, byte-bounded windows for files with
+/// no declarations, folded `impl` headers and merged bodyless one-liners.
+pub const CHUNKER_VERSION: u32 = if cfg!(feature = "treesitter") { 4 } else { 3 };
 
 impl Manifest {
     /// A manifest for an index that does not exist yet: what the MCP server

@@ -311,12 +311,16 @@ fn is_bodyless(node: &tree_sitter::Node) -> bool {
 }
 
 /// Kinds whose bodyless one-liners merge into runs: the things headers
-/// are made of. Functions join the list only for languages with
+/// and crate roots are made of — prototypes, `#define`s, typedefs, and
+/// `pub mod x;` lines. Functions join the list only for languages with
 /// prototypes (`merge_prototypes`); in expression-bodied languages a
-/// one-line function is the whole function and keeps its own chunk.
+/// one-line function is the whole function and keeps its own chunk. Other
+/// kinds stay separate even when short: a Haskell `data`, an Erlang
+/// `-record`, a `CREATE INDEX` are distinct declarations an agent looks up
+/// by name.
 fn is_mergeable_kind(kind: &str, merge_prototypes: bool) -> bool {
     match kind {
-        "macro" | "type" | "constant" | "variable" | "field" => true,
+        "macro" | "type" | "constant" | "variable" | "field" | "module" => true,
         "function" | "method" => merge_prototypes,
         _ => false,
     }
@@ -428,6 +432,8 @@ pub fn cover(rel: &str, text: &str, defs: &[Def], merge_prototypes: bool) -> Vec
         parent: Option<String>,
         starts_unit: bool,
         bodyless: bool,
+        /// Last line of the unit starting here (`starts_unit`), else `a`.
+        unit_end: usize,
     }
     let mut segs: Vec<Seg> = Vec::new();
     for w in cuts.windows(2) {
@@ -463,7 +469,33 @@ pub fn cover(rel: &str, text: &str, defs: &[Def], merge_prototypes: bool) -> Vec
                     && is_mergeable_kind(&s.kind, merge_prototypes)
                     && s.end_line + 1 - s.doc_line <= 2
             }),
+            unit_end: starting.map(|s| s.end_line).unwrap_or(a),
         });
+    }
+    // An implementation block whose header segment is nothing but the
+    // header — `impl Tokenizer {`, every method already cut out as its own
+    // unit — would become a one-line document that outranks real code for
+    // its type name (short, and the name sits in the title). Fold it into
+    // its first member: the method keeps its name and parent, and gains
+    // the `impl ... for ...` line as context. Classes keep their own chunk
+    // because their header carries the fields.
+    let non_blank = |seg: &Seg| {
+        lines[seg.a - 1..seg.b - 1].iter().filter(|l| !l.trim().is_empty()).count()
+    };
+    let mut i = 0;
+    while i + 1 < segs.len() {
+        let header_only = segs[i].starts_unit
+            && segs[i].kind.as_deref() == Some("implementation")
+            && non_blank(&segs[i]) <= 2
+            && segs[i + 1].starts_unit
+            && segs[i + 1].a <= segs[i].unit_end
+            && segs[i + 1].parent == segs[i].name;
+        if header_only {
+            let a = segs[i].a;
+            segs.remove(i);
+            segs[i].a = a;
+        }
+        i += 1;
     }
     // Runs of one- and two-line units — prototypes in a C header, a block
     // of `#define`s, typedefs — merge into chunks of up to `RUN_LINES`

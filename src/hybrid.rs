@@ -85,6 +85,7 @@ pub fn merge_retrieve(
 /// Like [`merge_retrieve`], but the encoder side probes IVF cluster lists
 /// (the same inverted-file shape as BM25 postings) instead of scanning
 /// every vector. `nprobe == 0` uses the index default.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_retrieve_ivf(
     bm25_hits: &[SearchHit],
     embeddings: &EmbeddingStore,
@@ -96,11 +97,30 @@ pub fn merge_retrieve_ivf(
     nprobe: usize,
     pq: Option<&PqIndex>,
 ) -> Vec<HybridHit> {
+    merge_retrieve_ivf_filtered(bm25_hits, embeddings, query, fusion, k, pool, ivf, nprobe, pq, None)
+}
+
+/// As [`merge_retrieve_ivf`], with the encoder pool restricted to documents
+/// `accept`ed (the query scope). The BM25 hits are expected to be in scope
+/// already, so fusion normalizes over in-scope candidates only.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_retrieve_ivf_filtered(
+    bm25_hits: &[SearchHit],
+    embeddings: &EmbeddingStore,
+    query: &[f32],
+    fusion: Fusion,
+    k: usize,
+    pool: usize,
+    ivf: Option<&IvfIndex>,
+    nprobe: usize,
+    pq: Option<&PqIndex>,
+    accept: Option<&dyn Fn(u32) -> bool>,
+) -> Vec<HybridHit> {
     if k == 0 {
         return Vec::new();
     }
     let pool = pool.max(k);
-    let sem_hits = semantic_pool(embeddings, query, pool, ivf, nprobe, pq);
+    let sem_hits = semantic_pool_filtered(embeddings, query, pool, ivf, nprobe, pq, accept);
 
     // Union keyed by doc_id. Ranks are positions in each original list
     // (0 = not on that list), which is what RRF needs.
@@ -230,6 +250,19 @@ pub fn semantic_pool(
     nprobe: usize,
     pq: Option<&PqIndex>,
 ) -> Vec<HybridHit> {
+    semantic_pool_filtered(embeddings, query, pool, ivf, nprobe, pq, None)
+}
+
+/// As [`semantic_pool`], considering only documents `accept`ed.
+pub fn semantic_pool_filtered(
+    embeddings: &EmbeddingStore,
+    query: &[f32],
+    pool: usize,
+    ivf: Option<&IvfIndex>,
+    nprobe: usize,
+    pq: Option<&PqIndex>,
+    accept: Option<&dyn Fn(u32) -> bool>,
+) -> Vec<HybridHit> {
     let docs: Vec<u32> = if let Some(ivf) = ivf {
         ivf.probe(query, nprobe)
     } else {
@@ -238,6 +271,7 @@ pub fn semantic_pool(
     let adc = pq.map(|p| p.prepare(query));
     let mut rows: Vec<HybridHit> = docs
         .into_iter()
+        .filter(|&doc_id| accept.is_none_or(|f| f(doc_id)))
         .map(|doc_id| {
             let sem = match (pq, adc.as_ref()) {
                 (Some(p), Some(t)) => p.adc(t, doc_id),

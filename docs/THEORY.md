@@ -391,6 +391,28 @@ length, df summed across segments), so a document scores the same
 regardless of which segment holds it. The one deviation, shared with
 Lucene: df counts tombstoned documents until merge.
 
+**Query scopes reuse the tombstone hook — and drive the skipping.** A
+caller-supplied path filter (`src/scope.rs`) is resolved into a
+per-segment bitmap of eligible live documents and presented to the
+evaluators through the same `is_deleted` check that hides tombstones, plus
+a `next_live(doc)` successor query answered from the bitmap. Hiding a
+document can only remove a candidate — no score and no block bound
+changes — so Block-Max WAND and MaxScore stay rank-safe and return the
+exact top-k among in-scope documents. The successor query is what makes
+the filter pay for itself: when the WAND pivot (or the MaxScore candidate)
+is hidden, every document up to the next admitted one is either hidden or
+already bounded below the threshold, so every cursor at or before the
+pivot seeks straight to that admitted document. A scope keeping one file
+in a thousand turns into a few seeks per posting list rather than a full
+evaluation with a threshold that never rises. This is Lucene's filtered
+query led by the sparser iterator (the live-docs bitset), and it is why
+the filter can be exact without a post-filter over an over-fetched global
+list. Resolving the filter is kept sublinear in the chunk count too:
+chunks of one file are appended together, so a file is a few runs of
+consecutive doc ids, and a per-index map from file to runs (built once per
+opened reader) turns a glob into one match per file and word-wise bit
+fills rather than a pass over every chunk.
+
 ## 12. Query typo correction: Symmetric Delete (SymSpell)
 
 **Where:** `src/spell.rs`, wired in `src/searcher.rs`

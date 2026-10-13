@@ -156,3 +156,42 @@ fn unknown_extensions_fall_back_to_the_heuristic() {
     assert_eq!(chunks[0].name.as_deref(), Some("keyword_only"));
     assert!(chunks[0].kind.is_none(), "heuristic chunks carry no kind");
 }
+
+#[test]
+fn impl_headers_fold_into_their_first_method() {
+    // `impl Tokenizer {` used to be a one-line chunk of its own — a tiny
+    // document carrying the type name in its title, which outranked the
+    // real code for that name. It now opens the first method's chunk.
+    let text = "/// A widget.\npub struct Widget { width: u32 }\n\nimpl Widget {\n    /// Draw it.\n    pub fn render(&self) -> u32 { self.width * 2 }\n\n    pub fn area(&self) -> u32 { 1 }\n}\n\nimpl std::fmt::Display for Widget {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"w\")\n    }\n}\n";
+    let chunks = chunk_source("w.rs", text);
+    let ids: Vec<String> = chunks.iter().map(|c| format!("{} {}", c.id(), c.title())).collect();
+    assert!(chunks.iter().all(|c| c.body.trim() != "impl Widget {"), "{ids:?}");
+    let render = chunks.iter().find(|c| c.name.as_deref() == Some("render")).unwrap();
+    assert_eq!(render.start_line, 4, "{ids:?}");
+    assert!(render.body.starts_with("impl Widget {"));
+    assert_eq!(render.title(), "w.rs::Widget::render");
+    let fmt = chunks.iter().find(|c| c.name.as_deref() == Some("fmt")).unwrap();
+    assert!(fmt.body.starts_with("impl std::fmt::Display for Widget {"), "{}", fmt.body);
+    // The struct, with its own fields, is still its own chunk.
+    let widget = chunks.iter().find(|c| c.name.as_deref() == Some("Widget")).unwrap();
+    assert_eq!(widget.kind.as_deref(), Some("class"));
+    // Coverage is intact.
+    let mut next = 1;
+    for c in &chunks {
+        assert!(c.start_line >= next, "overlap at {}", c.id());
+        next = c.end_line + 1;
+    }
+}
+
+#[test]
+fn bodyless_module_and_type_one_liners_merge_into_runs() {
+    let mods: String = (0..30).map(|i| format!("pub mod m{i};\n")).collect();
+    let text = format!("//! Crate root.\n{mods}\npub type Alias = u32;\npub type Other = u64;\n\npub fn real() {{ }}\n");
+    let chunks = chunk_source("lib.rs", &text);
+    let one_liners = chunks.iter().filter(|c| c.end_line == c.start_line).count();
+    assert!(one_liners <= 1, "{:?}", chunks.iter().map(|c| c.id()).collect::<Vec<_>>());
+    // Runs are capped, so the 30 modules take two chunks, not one or thirty.
+    let module_chunks = chunks.iter().filter(|c| c.kind.as_deref() == Some("module")).count();
+    assert!(module_chunks >= 2 && module_chunks <= 3, "{module_chunks}");
+    assert!(chunks.iter().any(|c| c.name.as_deref() == Some("real")));
+}

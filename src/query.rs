@@ -15,7 +15,7 @@ use clap::ValueEnum;
 
 use crate::searcher;
 #[cfg(feature = "semantic")]
-use crate::storage;
+use crate::scope::DocScope;
 
 /// Query encoders share the document model's vector space. Static word lookups
 /// are experimental approximations, not exact query-cache entries.
@@ -190,8 +190,8 @@ pub fn run_ranked(
 /// thread (the GPU context stays where the model was warmed up) and run WAND on a
 /// helper thread; IVF/fusion still wait for the vector.
 #[cfg(feature = "semantic")]
-fn embed_and_bm25(
-    disk: &storage::DiskIndex,
+fn embed_and_bm25<I: crate::indexer::SearchableIndex + ?Sized>(
+    disk: &I,
     embedder: &dyn QueryEncoder,
     query: &str,
     k: usize,
@@ -231,10 +231,26 @@ pub fn run_ranked_with(
     top_k: usize,
     opts: &SearchOpts,
 ) -> anyhow::Result<RankedRun> {
+    run_ranked_scoped(index, embedder, query, top_k, opts, None)
+}
+
+/// As [`run_ranked_with`], restricted to a [`DocScope`] built by
+/// [`searcher::AnyIndex::scope`] on this same index. The scope is applied
+/// inside BM25 and the vector pool, so the fused top-k is exact within the
+/// scope and score normalization sees in-scope candidates only.
+#[cfg(feature = "semantic")]
+pub fn run_ranked_scoped(
+    index: &searcher::AnyIndex,
+    embedder: &dyn QueryEncoder,
+    query: &str,
+    top_k: usize,
+    opts: &SearchOpts,
+    scope: Option<&DocScope>,
+) -> anyhow::Result<RankedRun> {
     use crate::hybrid;
     use crate::indexer::SearchableIndex as _;
     if index.as_single().is_none() {
-        return run_ranked_segmented(index, embedder, query, top_k, opts);
+        return run_ranked_segmented(index, embedder, query, top_k, opts, scope);
     }
     let embeddings = index
         .embeddings()
@@ -243,6 +259,16 @@ pub fn run_ranked_with(
     let disk = index
         .as_single()
         .context("hybrid/semantic modes currently support a single (non-segmented) index")?;
+    let scoped = scope.map(|s| crate::scope::Scoped {
+        inner: disk,
+        allowed: s.segment_bits(0),
+    });
+    let accept = scope.map(|s| move |doc: u32| s.contains(0, doc));
+    let accept_ref: Option<&dyn Fn(u32) -> bool> = accept.as_ref().map(|f| f as &dyn Fn(u32) -> bool);
+    let bm25_index: &dyn crate::indexer::SearchableIndex = match &scoped {
+        Some(view) => view,
+        None => disk,
+    };
 
     let total = Instant::now();
 
@@ -251,9 +277,9 @@ pub fn run_ranked_with(
         RankMode::Hybrid => {
             let pool = opts.semantic_candidates.max(top_k);
             let (qvec, bm25_hits, stats, bm25_ms, embed_ms) =
-                embed_and_bm25(disk, embedder, query, pool)?;
+                embed_and_bm25(bm25_index, embedder, query, pool)?;
             let t_score = Instant::now();
-            let fused = hybrid::merge_retrieve_ivf(
+            let fused = hybrid::merge_retrieve_ivf_filtered(
                 &bm25_hits,
                 embeddings,
                 &qvec,
@@ -267,6 +293,7 @@ pub fn run_ranked_with(
                 },
                 opts.nprobe,
                 choose_pq(index, opts, top_k),
+                accept_ref,
             );
             let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
             (fused, stats, bm25_ms, embed_ms, score_ms)
@@ -274,7 +301,7 @@ pub fn run_ranked_with(
         RankMode::Rerank => {
             let candidates = opts.semantic_candidates.max(top_k);
             let (qvec, bm25_hits, stats, bm25_ms, embed_ms) =
-                embed_and_bm25(disk, embedder, query, candidates)?;
+                embed_and_bm25(bm25_index, embedder, query, candidates)?;
             let t_score = Instant::now();
             let fused = hybrid::rerank(&bm25_hits, embeddings, &qvec, fusion_from(opts), top_k);
             let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
@@ -285,7 +312,7 @@ pub fn run_ranked_with(
             let qvec = embedder.embed_query(query)?;
             let embed_ms = t_embed.elapsed().as_secs_f64() * 1000.0;
             let t_score = Instant::now();
-            let fused = hybrid::semantic_pool(
+            let fused = hybrid::semantic_pool_filtered(
                 embeddings,
                 &qvec,
                 top_k,
@@ -296,6 +323,7 @@ pub fn run_ranked_with(
                 },
                 opts.nprobe,
                 choose_pq(index, opts, top_k),
+                accept_ref,
             );
             let score_ms = t_score.elapsed().as_secs_f64() * 1000.0;
             (
@@ -344,6 +372,7 @@ fn run_ranked_segmented(
     query: &str,
     top_k: usize,
     opts: &SearchOpts,
+    scope: Option<&DocScope>,
 ) -> anyhow::Result<RankedRun> {
     use crate::hybrid;
 
@@ -368,7 +397,7 @@ fn run_ranked_segmented(
         let (hits, stats) = if opts.mode == RankMode::Semantic {
             (Vec::new(), crate::block_max_wand::SearchStats::default())
         } else {
-            seg.search_hits_raw_with_stats(query, pool)
+            seg.search_hits_raw_scoped(query, pool, scope)
         };
         (hits, stats, t.elapsed().as_secs_f64() * 1000.0)
     };
@@ -396,7 +425,9 @@ fn run_ranked_segmented(
         };
 
     let t_score = Instant::now();
-    let live = |si: usize, doc: u32| seg.is_live(si, doc);
+    let live = |si: usize, doc: u32| {
+        seg.is_live(si, doc) && scope.is_none_or(|s| s.contains(si, doc))
+    };
     let mut vector_stats = None;
     let hits = match opts.mode {
         RankMode::Semantic => {

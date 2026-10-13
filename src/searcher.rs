@@ -3,12 +3,13 @@
 //! Block-Max WAND for short queries, MaxScore for long ones. Both return
 //! provably exact top-k; there is no approximate mode.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::block_max_wand::{self, SearchStats};
 use crate::indexer::SearchableIndex;
 use crate::maxscore;
+use crate::scope::{DocScope, Scoped};
 use crate::spell::SpellCorrector;
 use crate::tokenizer::Tokenizer;
 
@@ -17,6 +18,9 @@ use crate::tokenizer::Tokenizer;
 /// the threshold, while MaxScore's essential/non-essential split keeps
 /// skipping effective. Both are exact.
 const MAXSCORE_MIN_TERMS: usize = 5;
+
+/// Globs whose scopes a handle remembers; an agent's burst rarely uses more.
+const SCOPE_CACHE_ENTRIES: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -64,6 +68,12 @@ pub struct AnyIndex {
     /// Built on the first query that contains an unmatched term; clean
     /// workloads never pay for it.
     spell: OnceLock<SpellCorrector>,
+    /// File -> doc-id runs, built on the first scoped query (see
+    /// [`Self::scope`]); unscoped workloads never pay for it.
+    paths: OnceLock<crate::scope::PathIndex>,
+    /// Scopes of the globs most recently resolved on this handle, oldest
+    /// first (see [`Self::scope_for_glob`]).
+    scopes: Mutex<Vec<(String, Arc<DocScope>)>>,
     /// Optional CodeRankEmbed sidecar; hybrid search no-ops without it.
     embeddings: Option<crate::embeddings::EmbeddingStore>,
     /// Optional IVF cluster inverted file (same doc_ids as postings).
@@ -139,6 +149,8 @@ impl AnyIndex {
             seg_stores,
             invalid_key_segments,
             spell: OnceLock::new(),
+            paths: OnceLock::new(),
+            scopes: Mutex::new(Vec::new()),
             embeddings,
             ivf,
             pq,
@@ -244,6 +256,13 @@ impl AnyIndex {
     }
 
     pub fn search(&self, query: &str, k: usize) -> SearchOutcome {
+        self.search_scoped(query, k, None)
+    }
+
+    /// As [`Self::search`], restricted to a [`DocScope`] built by
+    /// [`Self::scope`] on this same index: the exact top-k among in-scope
+    /// documents, not a global top-k filtered afterwards.
+    pub fn search_scoped(&self, query: &str, k: usize, scope: Option<&DocScope>) -> SearchOutcome {
         // Rewrite only terms that match nothing, correcting toward the
         // closest known vocabulary term. Clean queries pay one df lookup
         // per term and never build the corrector.
@@ -269,19 +288,75 @@ impl AnyIndex {
 
         if changed {
             let new_query = rewritten.join(" ");
-            let mut outcome = self.search_raw(&new_query, k);
+            let mut outcome = self.search_raw_scoped(&new_query, k, scope);
             outcome.corrected = Some(new_query);
             outcome
         } else {
-            self.search_raw(query, k)
+            self.search_raw_scoped(query, k, scope)
         }
     }
 
     pub(crate) fn search_raw(&self, query: &str, k: usize) -> SearchOutcome {
-        match &self.kind {
-            IndexKind::Single(index) => search(index.as_ref(), query, k),
-            IndexKind::Segmented(index) => index.search(query, k),
+        self.search_raw_scoped(query, k, None)
+    }
+
+    fn search_raw_scoped(&self, query: &str, k: usize, scope: Option<&DocScope>) -> SearchOutcome {
+        match (&self.kind, scope) {
+            (IndexKind::Single(index), None) => search(index.as_ref(), query, k),
+            (IndexKind::Single(index), Some(scope)) => search(
+                &Scoped {
+                    inner: index.as_ref(),
+                    allowed: scope.segment_bits(0),
+                },
+                query,
+                k,
+            ),
+            (IndexKind::Segmented(index), _) => index.search_scoped(query, k, scope),
         }
+    }
+
+    /// The scope of every live document whose path `accept`s. The
+    /// predicate sees repo-relative paths such as `src/searcher.rs`.
+    ///
+    /// The first scoped query on this handle pays one pass over the doc
+    /// store to learn where each file's chunks live; every later scope is
+    /// one predicate call per file plus bit fills. The evaluators then seek
+    /// past hidden documents, so a scoped query does less work than an
+    /// unscoped one. The handle is reopened whenever the index changes,
+    /// which discards the map with it.
+    pub fn scope(&self, accept: &(dyn Fn(&str) -> bool + Sync)) -> DocScope {
+        let paths = self.paths.get_or_init(|| match &self.kind {
+            IndexKind::Single(index) => {
+                use crate::indexer::SearchableIndex as _;
+                let n = index.num_docs() as u32;
+                crate::scope::PathIndex::build(&[n], &|_, range, f| index.for_each_doc_id_in(range, f))
+            }
+            IndexKind::Segmented(index) => index.path_index(),
+        });
+        match &self.kind {
+            IndexKind::Single(_) => paths.scope(accept, &|_| &[]),
+            IndexKind::Segmented(index) => index.scope_with(paths, accept),
+        }
+    }
+
+    /// [`Self::scope`] for a path glob (`src/**`, `**/*.{tex,rs}`), resolved
+    /// once per handle: an agent's burst of scoped queries repeats one glob,
+    /// and matching it against every file is most of a scoped query's
+    /// remaining cost. Returns whether the scope was already resolved.
+    pub fn scope_for_glob(&self, glob: &str) -> (Arc<DocScope>, bool) {
+        let mut cache = self.scopes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = cache.iter().position(|(g, _)| g == glob) {
+            let entry = cache.remove(pos);
+            let scope = entry.1.clone();
+            cache.push(entry);
+            return (scope, true);
+        }
+        let scope = Arc::new(self.scope(&|path: &str| crate::repo::path_glob_match(glob, path)));
+        if cache.len() >= SCOPE_CACHE_ENTRIES {
+            cache.remove(0);
+        }
+        cache.push((glob.to_string(), scope.clone()));
+        (scope, false)
     }
 
     pub(crate) fn query_postings(&self, query: &str) -> u64 {

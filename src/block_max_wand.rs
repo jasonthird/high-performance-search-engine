@@ -370,6 +370,21 @@ pub fn search<I: SearchableIndex + ?Sized>(
         if pivot_doc == u32::MAX {
             break;
         }
+        // A hidden pivot (out of the query scope) can never be returned, and
+        // neither can any hidden document between it and the next admitted
+        // one. Every cursor at or before the pivot may therefore leap to that
+        // next admitted document: documents in between either are hidden or
+        // match only cursors beyond the pivot prefix, whose bound is already
+        // known not to clear the threshold. For a scope that keeps one file
+        // in a thousand, this is what turns a filter into less work rather
+        // than more.
+        let admitted = index.next_live(pivot_doc);
+        if admitted != pivot_doc {
+            for cursor in &mut cursors[..=p] {
+                cursor.seek(admitted, &mut stats);
+            }
+            continue;
+        }
         // Extend the pivot prefix over every cursor already positioned on
         // pivot_doc. Their contributions are part of pivot_doc's upper bound;
         // leaving them out would make the block-max skip below unsafe.
